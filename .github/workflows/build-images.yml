@@ -1,0 +1,190 @@
+name: Build & Push Images
+
+on:
+  workflow_dispatch:          # 手动触发：强制重建（忽略幂等跳过）
+  schedule:
+    - cron: '0 5 * * 0'       # 周日 UTC 5:00，比 sync(4:00) 晚 1 小时（版本未变则跳过）
+  workflow_run:
+    workflows: ["Sync from Upstream"]   # 上游同步成功后自动触发
+    types: [completed]
+
+concurrency:
+  group: build-images
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 解析最新稳定版 + 决定是否需要构建（幂等）。结果传给后续 job。
+  # ---------------------------------------------------------------------------
+  prepare:
+    # 定时/手动总是构建；由 sync 触发时，仅在 sync 成功后构建。
+    if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    outputs:
+      ref: ${{ steps.meta.outputs.ref }}
+      version: ${{ steps.meta.outputs.version }}
+      repo: ${{ steps.meta.outputs.repo }}
+      skip: ${{ steps.meta.outputs.skip }}
+    steps:
+      - name: Checkout repo (with tags)
+        uses: actions/checkout@v5
+        with:
+          ref: master
+          fetch-depth: 0   # 需要全部 tag 来解析最新 release 版本
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve version & decide whether to build
+        id: meta
+        run: |
+          set -euo pipefail
+          repo="ghcr.io/${GITHUB_REPOSITORY,,}"
+
+          # VPP 采用日期版本（vYY.MM，如 v26.02，点版本 v22.10.1）。
+          # 取最高的正式 release tag；grep 过滤掉预发布（-rcN），只留 vX.Y(.Z)。
+          # 已对 FDio/vpp 全部 tag 实测：能正确选出最新稳定版并排除所有 rc。
+          ref="$(git tag -l 'v*' \
+                 | grep -E '^v[0-9]+\.[0-9]+(\.[0-9]+)?$' \
+                 | sort -V | tail -1)"
+          if [ -z "$ref" ]; then
+            echo "::error::No release tag (vYY.MM) found. Run 'Sync from Upstream' first." >&2
+            exit 1
+          fi
+          version="${ref#v}"                 # v26.02 -> 26.02
+
+          # 幂等：若该精确版本已发布，则跳过（手动 dispatch 例外，强制重建）。
+          skip="false"
+          if [ "${{ github.event_name }}" != "workflow_dispatch" ] \
+             && docker manifest inspect "${repo}:${version}" >/dev/null 2>&1; then
+            echo "::notice::${repo}:${version} already published — skipping."
+            skip="true"
+          fi
+
+          {
+            echo "ref=$ref"
+            echo "version=$version"
+            echo "repo=$repo"
+            echo "skip=$skip"
+          } >> "$GITHUB_OUTPUT"
+          echo "ref=$ref version=$version skip=$skip"
+
+  # ---------------------------------------------------------------------------
+  # 每个架构在各自的原生 runner 上构建并按 digest 推送（不打 tag）。
+  # 不用 QEMU 模拟：VPP 源码构建很重，跨架构模拟会慢到数小时甚至超时。
+  # ---------------------------------------------------------------------------
+  build:
+    needs: prepare
+    if: needs.prepare.outputs.skip != 'true'
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+            arch: amd64
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm   # GitHub 原生 arm64 runner（公开仓库免费）
+            arch: arm64
+    steps:
+      # Dockerfile 用 `COPY .` 从工作树构建（不像 BIRD 在 Dockerfile 内 clone），
+      # 因此直接 checkout 到目标 release tag，让构建上下文就是该版本的源码。
+      - name: Checkout release source
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.prepare.outputs.ref }}
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: build/docker/Dockerfile
+          platforms: ${{ matrix.platform }}
+          provenance: false
+          build-args: |
+            BUILD_TYPE=release
+            VERSION=${{ needs.prepare.outputs.version }}
+          labels: |
+            org.opencontainers.image.title=vpp
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.version=${{ needs.prepare.outputs.version }}
+            org.opencontainers.image.description=FD.io VPP ${{ needs.prepare.outputs.version }} built from source
+          # 按 digest 推送、不打 tag；tag 由 merge job 统一创建 manifest list。
+          outputs: type=image,name=${{ needs.prepare.outputs.repo }},push-by-digest=true,name-canonical=true,push=true
+
+      - name: Export digest
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ matrix.arch }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  # ---------------------------------------------------------------------------
+  # 把各架构的 digest 合并成一个 multi-arch manifest list，并打上版本 / latest。
+  # ---------------------------------------------------------------------------
+  merge:
+    needs: [prepare, build]
+    if: needs.prepare.outputs.skip != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Create & push manifest list
+        working-directory: /tmp/digests
+        run: |
+          set -euo pipefail
+          repo="${{ needs.prepare.outputs.repo }}"
+          version="${{ needs.prepare.outputs.version }}"
+          # 镜像 tag：精确版本 :26.02 + :latest，指向同一个 manifest list。
+          docker buildx imagetools create \
+            -t "${repo}:${version}" \
+            -t "${repo}:latest" \
+            $(printf "${repo}@sha256:%s " *)
+
+      - name: Inspect
+        run: |
+          docker buildx imagetools inspect \
+            "${{ needs.prepare.outputs.repo }}:${{ needs.prepare.outputs.version }}"

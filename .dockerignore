@@ -1,0 +1,98 @@
+# .dockerignore — keep the build context small for build/docker/Dockerfile.
+#
+# The Dockerfile does `COPY . /vpp` and then runs the full VPP build INSIDE the
+# container, so we must keep all committed source (src/, build/, build-data/,
+# Makefile, build-root/scripts/, ...) but exclude:
+#   - the .git history (large, not needed to build)
+#   - previously generated build output / downloads (rebuilt in the container)
+#   - editor / IDE / OS cruft
+#
+# Paths mirror the generated entries in .gitignore.
+
+# --- VCS ---
+# 注意：不要忽略 .git！VPP 的版本号来自 `git describe`（src/scripts/version），
+# 且 `make install-dep` 末尾会执行 `git config`（Makefile:495）。容器内缺少 .git
+# 会导致 install-dep 报 "not in a git directory"、打包阶段算不出版本号而失败。
+# .git 仅约 122M，相对整个构建可忽略。
+.gitignore
+.gitreview
+
+# --- generated build output (build-root/) ---
+build-root/.ccache
+build-root/build-*/
+build-root/install-*/
+build-root/tools
+build-root/dpdk-includes/
+build-root/dpdk_mlx_default.sh
+build-root/packages-vpp/
+build-root/path_setup
+build-root/deb/
+build-root/debs
+build-root/rpmbuild/
+build-root/test-coverage*/
+build-root/test/
+build-root/docs
+build-root/*.deb
+build-root/*.rpm
+build-root/*.tar.xz
+build-root/*.changes
+build-root/*.buildinfo
+
+# --- external/optional dep downloads & build output (build/) ---
+build/external/*.tar.gz
+build/external/*.tar.xz
+build/external/vpp-*
+build/external/downloads/
+build/external/deb/_build/
+build/external/deb/debian/tmp/
+build/external/deb/debian/.debhelper/
+build/optional/downloads/
+build/optional/*.tar.gz
+build/optional/*.tar.xz
+build/optional/vpp-*
+build/optional/deb/_build/
+
+# --- top-level ./configure / cmake output ---
+/CMakeFiles
+/CMakeCache.txt
+/CMakeFiles/
+/bin
+/lib
+/.ninja_deps
+/.ninja_log
+/.cmake
+/build.ninja
+/cmake_install.cmake
+/install_manifest.txt
+/path_setup
+/tools/
+/archives
+build-config.mk
+compile_commands.json
+cmake-build*/
+
+# --- test / framework artifacts ---
+test/hs-test/hs-test
+test/hs-test/http_server
+test/hs-test/vpp-data
+test/hs-test/.go_cache/
+extras/kube-test/vpp-data
+
+# --- docs venv & generated docs ---
+docs/venv
+
+# --- Python / language-server caches ---
+**/__pycache__
+*.pyc
+.clangd
+.cache
+.deps.ok
+
+# --- IDE / OS ---
+.idea/
+.vscode/
+*.iml
+.DS_Store
+
+# --- this docker dir itself is not needed in the build context ---
+build/docker/startup.conf

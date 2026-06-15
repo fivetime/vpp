@@ -1,0 +1,25 @@
+services:
+  vpp:
+    # 在 vpp 仓库根目录构建：build context 必须是仓库根（Dockerfile 用 COPY .）
+    build:
+      context: ../..
+      dockerfile: build/docker/Dockerfile
+      args:
+        BUILD_TYPE: release
+    image: vpp:dev
+    container_name: vpp
+    # VPP 直接操作底层网络/内存，需要较高权限。privileged 最省心；
+    # 若要收紧，可改成显式 cap_add: [NET_ADMIN, SYS_NICE, IPC_LOCK, SYS_PTRACE]
+    privileged: true
+    # VPP 使用 hugepages，需要把宿主机的 hugetlbfs 暴露进来
+    volumes:
+      - /dev/hugepages:/dev/hugepages
+      - /lib/modules:/lib/modules:ro
+      # 挂载你自己的配置；镜像内自带 /etc/vpp/startup.conf 可作参考
+      - ./startup.conf:/etc/vpp/startup.conf:ro
+    # DPDK / VPP 需要锁定大量内存
+    ulimits:
+      memlock: -1
+    # 共享内存段（vpp 主进程与 vppctl/api 客户端通过 /dev/shm 通信）
+    shm_size: "1gb"
+    restart: always

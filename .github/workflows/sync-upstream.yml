@@ -1,0 +1,47 @@
+name: Sync from Upstream
+
+on:
+  schedule:
+    - cron: '0 4 * * 0'  # 每周日 UTC 4:00 自动执行
+  workflow_dispatch:     # 允许手动触发
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout your repo
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Set up git user
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream remote
+        run: git remote add upstream https://github.com/FDio/vpp.git
+
+      - name: Fetch upstream (incl. all tags)
+        run: git fetch --tags upstream
+
+      - name: Merge upstream/master into master
+        run: git merge --no-edit upstream/master
+
+      - name: Set push URL to use token
+        run: |
+          git remote set-url origin \
+            https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git
+
+      - name: Push to your repo
+        run: |
+          git push origin master
+          # 推送上游全部 release tag（vYY.MM，如 v25.06 / v25.06.1）。
+          # 这是镜像构建的源码依据：build-images 会 checkout 最新 tag 后用
+          # `COPY .` 从该 tag 的工作树构建，因此 push tag 让这些版本可被构建。
+          git push origin --tags
