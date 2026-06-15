@@ -33,10 +33,21 @@ jobs:
       - name: Merge upstream/master into master
         run: git merge --no-edit upstream/master
 
+      # 必须用带 workflow scope 的 PAT，不能用 GITHUB_TOKEN：上游 tag 内含
+      # .github/workflows/*.yml，GitHub 拒绝任何缺少 `workflows` 权限的 token 推送/
+      # 修改 workflow 文件，而 GITHUB_TOKEN 无法被授予该权限。
+      # 创建一个 classic PAT（勾选 repo + workflow）或 fine-grained PAT
+      # （Contents + Workflows 写权限），加为仓库 secret：SYNC_PAT。
       - name: Set push URL to use token
+        env:
+          SYNC_PAT: ${{ secrets.SYNC_PAT }}
         run: |
+          if [ -z "$SYNC_PAT" ]; then
+            echo "::error::Secret SYNC_PAT is not set. Create a PAT with 'repo' + 'workflow' scopes (classic) or Contents+Workflows write (fine-grained) and add it as repo secret SYNC_PAT. GITHUB_TOKEN cannot push the .github/workflows/* contained in upstream tags."
+            exit 1
+          fi
           git remote set-url origin \
-            https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git
+            "https://x-access-token:${SYNC_PAT}@github.com/${{ github.repository }}.git"
 
       - name: Push to your repo
         run: |
