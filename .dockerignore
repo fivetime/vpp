@@ -94,5 +94,6 @@ docs/venv
 *.iml
 .DS_Store
 
-# --- this docker dir itself is not needed in the build context ---
+# --- runtime configs are not needed in the build context ---
 build/docker/startup.conf
+build/docker/startup.conf.example

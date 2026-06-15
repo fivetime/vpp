@@ -1,0 +1,44 @@
+## Example VPP startup config for the container image.
+##
+## The image already ships VPP's full default /etc/vpp/startup.conf; this is a
+## slimmer, container-oriented starting point. Copy it to `startup.conf` and
+## mount it over /etc/vpp/startup.conf (see build/docker/compose.yml), then edit
+## to taste.
+
+unix {
+  nodaemon                       # 必须：容器里 vpp 以前台运行（CMD: vpp -c ...）
+  log /var/log/vpp/vpp.log
+  cli-listen /run/vpp/cli.sock   # vppctl 通过这个 socket 连接
+  gid vpp
+}
+
+api-segment {
+  gid vpp
+}
+
+cpu {
+  ## 绑定主线程到一个核；要跑 worker 线程可加 corelist-workers
+  main-core 0
+  # corelist-workers 1-3
+}
+
+memory {
+  main-heap-size 256M
+}
+
+buffers {
+  buffers-per-numa 16000
+}
+
+plugins {
+  ## DPDK 需要真正的 hugetlbfs（挂载在 /dev/hugepages）。在 Docker Desktop(WSL2)
+  ## 上 /dev/hugepages 是 devtmpfs，DPDK EAL 会启动失败——这类环境取消下面这行注释
+  ## 禁用它（VPP 核心仍会用 hugepages 做 buffer pool）。
+  ## 在真实 Linux 主机上保持启用，即可使用物理网卡 / DPDK。
+  # plugin dpdk_plugin.so { disable }
+}
+
+## 启用 dpdk 时的设备配置示例（按需取消注释并填写网卡 PCI 地址）：
+# dpdk {
+#   dev 0000:00:08.0
+# }

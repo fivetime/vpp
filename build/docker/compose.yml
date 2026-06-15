@@ -15,8 +15,8 @@ services:
     volumes:
       - /dev/hugepages:/dev/hugepages
       - /lib/modules:/lib/modules:ro
-      # 镜像已自带默认 /etc/vpp/startup.conf，可直接运行。
-      # 要用自己的配置时，在 compose.yml 同级放一个 startup.conf 并取消下面这行注释：
+      # 镜像已自带默认 /etc/vpp/startup.conf，可直接运行。要用自己的配置时，
+      # 复制 startup.conf.example 为 startup.conf（同级目录）并取消下面这行注释：
       # - ./startup.conf:/etc/vpp/startup.conf:ro
     # DPDK / VPP 需要锁定大量内存
     ulimits:

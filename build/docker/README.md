@@ -62,6 +62,26 @@ override it. Make sure the host has hugepages reserved, e.g.:
 echo 1024 | sudo tee /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages
 ```
 
+### Custom startup config
+
+A documented, container-oriented example lives at
+[`startup.conf.example`](./startup.conf.example). To use it, copy it next to
+`compose.yml` and enable the mount:
+
+```bash
+cp build/docker/startup.conf.example build/docker/startup.conf
+# then uncomment the startup.conf bind mount in compose.yml
+docker compose -f build/docker/compose.yml up -d
+```
+
+> **Docker Desktop (WSL2):** `/dev/hugepages` there is `devtmpfs`, not
+> `hugetlbfs`, so DPDK's EAL fails to start. Uncomment
+> `plugin dpdk_plugin.so { disable }` in the config — VPP's core still uses
+> hugepages for its buffer pool, only the DPDK driver is turned off. On a real
+> Linux host with a `hugetlbfs` mount, leave DPDK enabled. Verified: with this
+> example VPP comes up `healthy` and `vppctl show physmem` shows the buffer
+> arena backed by 2M hugepages.
+
 ### Talking to the daemon
 
 VPP is controlled with `vppctl` over the CLI socket
