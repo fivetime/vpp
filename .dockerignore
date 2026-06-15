@@ -93,7 +93,3 @@ docs/venv
 .vscode/
 *.iml
 .DS_Store
-
-# --- runtime configs are not needed in the build context ---
-build/docker/startup.conf
-build/docker/startup.conf.example
