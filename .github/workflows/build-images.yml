@@ -96,12 +96,21 @@ jobs:
             runner: ubuntu-24.04-arm   # GitHub 原生 arm64 runner（公开仓库免费）
             arch: arm64
     steps:
-      # Dockerfile 用 `COPY .` 从工作树构建（不像 BIRD 在 Dockerfile 内 clone），
-      # 因此直接 checkout 到目标 release tag，让构建上下文就是该版本的源码。
-      - name: Checkout release source
+      # 构建基建（build/docker、.dockerignore）只在 master，而 release tag 是上游
+      # commit、不含这些文件。所以：checkout master（带全部历史和 tag），切到目标
+      # release tag 拿到该版本源码，再把 build/docker 和 .dockerignore 从 master 叠加
+      # 上去。Dockerfile 用 `COPY .` 构建该工作树，`git describe` 仍解析到 release tag。
+      - name: Checkout (master + tags)
         uses: actions/checkout@v5
         with:
-          ref: ${{ needs.prepare.outputs.ref }}
+          ref: master
+          fetch-depth: 0
+
+      - name: Switch to release source, overlay build infra from master
+        run: |
+          set -eux
+          git checkout "${{ needs.prepare.outputs.ref }}"
+          git checkout master -- build/docker .dockerignore
 
       - name: Login to GHCR
         uses: docker/login-action@v3
