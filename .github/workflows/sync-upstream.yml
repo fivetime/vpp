@@ -52,7 +52,12 @@ jobs:
       - name: Push to your repo
         run: |
           git push origin master
-          # 推送上游全部 release tag（vYY.MM，如 v25.06 / v25.06.1）。
-          # 这是镜像构建的源码依据：build-images 会 checkout 最新 tag 后用
-          # `COPY .` 从该 tag 的工作树构建，因此 push tag 让这些版本可被构建。
-          git push origin --tags
+          # 只推稳定 release tag（vYY.MM / vYY.MM.P），用与 build-images 相同的正则
+          # 过滤掉 -rcN 候选版——否则 `--tags` 会把上游上百个 rc 也镜像过来污染 tag 列表。
+          # 这些 tag 是镜像构建的源码依据：build-images 会 checkout 最新稳定 tag 构建。
+          stable_tags=$(git tag -l 'v[0-9]*' | grep -E '^v[0-9]+\.[0-9]+(\.[0-9]+)?$' || true)
+          if [ -n "$stable_tags" ]; then
+            git push origin $stable_tags
+          else
+            echo "::warning::No stable vYY.MM tags found to push."
+          fi
