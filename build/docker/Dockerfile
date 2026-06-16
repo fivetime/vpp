@@ -93,7 +93,7 @@ COPY --from=builder /pkg /
 ###############################################################################
 # Stage 2: runtime —— 仅安装运行所需的 VPP 包
 ###############################################################################
-FROM debian:trixie-slim
+FROM debian:trixie-slim AS runtime
 
 ARG DEBIAN_FRONTEND=noninteractive
 ARG VERSION="dev"
@@ -141,3 +141,25 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
 
 # 前台运行(startup.conf 里已配置 nodaemon)，挂载/覆盖 /etc/vpp/startup.conf 自定义
 CMD ["/usr/bin/vpp", "-c", "/etc/vpp/startup.conf"]
+
+###############################################################################
+# Stage 3: dev —— runtime + VPP 开发头文件(vapi headers)。BUILD-ONLY，不部署。
+#
+#   仅供下游(如 bird-vpp)`./configure --with-vpp=/usr` 编译时取头文件用,故在
+#   runtime 之上加装 vpp-dev / libvppinfra-dev(含 /usr/include/vapi 等头 + .so
+#   开发链接符号)。它继承 runtime 的全部层 → 与 :master 共享底层,只多一层头。
+#
+#   注意:dev 是本 Dockerfile 的最后一个 stage = 默认 target,所以 CI 构建 runtime
+#   镜像(:master)时必须显式 --target runtime,否则会错建成 dev。
+###############################################################################
+FROM runtime AS dev
+
+RUN --mount=type=bind,from=builder,source=/pkg,target=/tmp/pkg \
+    set -eux \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+        /tmp/pkg/vpp-dev_*.deb \
+        /tmp/pkg/libvppinfra-dev_*.deb \
+    && rm -rf /var/lib/apt/lists/* \
+    # 构建期自检:vapi 头必须就位(下游 --with-vpp 靠它)
+    && test -f /usr/include/vapi/vapi.h
