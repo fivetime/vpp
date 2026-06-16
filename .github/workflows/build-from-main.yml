@@ -31,6 +31,10 @@ permissions:
   contents: read
   packages: write
 
+env:
+  # 强制所有 JS action 跑 Node 24(GitHub 弃用 Node 20)。
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
 jobs:
   # ---------------------------------------------------------------------------
   # 解析构建矩阵（可由 workflow_dispatch 的 platforms 收窄）+ 镜像名 + 短 SHA。
@@ -90,7 +94,7 @@ jobs:
           fetch-depth: 0   # VPP 版本号来自 git describe，需要历史和 tag
 
       - name: Login to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -178,7 +182,7 @@ jobs:
           merge-multiple: true
 
       - name: Login to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}

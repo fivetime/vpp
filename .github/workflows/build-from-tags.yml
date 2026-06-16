@@ -16,6 +16,10 @@ permissions:
   contents: read
   packages: write
 
+env:
+  # 强制所有 JS action 跑 Node 24(GitHub 弃用 Node 20)。
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
 jobs:
   # ---------------------------------------------------------------------------
   # 解析最新稳定版 + 决定是否需要构建（幂等）。结果传给后续 job。
@@ -37,7 +41,7 @@ jobs:
           fetch-depth: 0   # 需要全部 tag 来解析最新 release 版本
 
       - name: Login to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -113,7 +117,7 @@ jobs:
           git checkout master -- build/docker .dockerignore
 
       - name: Login to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -174,7 +178,7 @@ jobs:
           merge-multiple: true
 
       - name: Login to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
