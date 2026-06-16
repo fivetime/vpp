@@ -93,3 +93,14 @@ docs/venv
 .vscode/
 *.iml
 .DS_Store
+
+# --- docker docs/config/examples: for humans, not the image build ---
+# These are read/run by people (cloning the repo, ./run.sh), never by
+# `docker build`. Excluding them keeps editing docs from busting the `COPY .`
+# VPP source cache (a ~30min rebuild). This only affects the build context —
+# the files themselves stay in git/GitHub, fully visible and usable.
+build/docker/README.md
+build/docker/compose.yml
+build/docker/startup.conf
+build/docker/startup.conf.example
+build/docker/examples/
