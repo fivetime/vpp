@@ -1,4 +1,4 @@
-name: Build & Push Images
+name: "Build image from tags"
 
 on:
   workflow_dispatch:          # 手动触发：强制重建（忽略幂等跳过）

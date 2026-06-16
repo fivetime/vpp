@@ -1,0 +1,176 @@
+name: "Build image from master"
+
+on:
+  push:
+    branches:
+      - master
+    # 文档/配置/示例不影响镜像，跳过以免触发 ~30min 的 VPP 重编。
+    # （Dockerfile / .dockerignore / 源码改动仍会触发。）
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'build/docker/README.md'
+      - 'build/docker/compose.yml'
+      - 'build/docker/startup.conf'
+      - 'build/docker/startup.conf.example'
+      - 'build/docker/examples/**'
+  workflow_dispatch:
+    inputs:
+      platforms:
+        description: 'Which platforms to build'
+        required: false
+        default: all
+        type: choice
+        options: [all, amd64, arm64]
+
+concurrency:
+  group: build-from-main-${{ github.ref }}
+  cancel-in-progress: true     # dev 构建：同分支新 push 取消旧构建
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 解析构建矩阵（可由 workflow_dispatch 的 platforms 收窄）+ 镜像名 + 短 SHA。
+  # ---------------------------------------------------------------------------
+  discover:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.gen.outputs.matrix }}
+      image: ${{ steps.gen.outputs.image }}
+      short_sha: ${{ steps.gen.outputs.short_sha }}
+    steps:
+      - id: gen
+        run: |
+          set -euo pipefail
+          # 原生 runner，不用 QEMU：VPP 源码构建很重，跨架构模拟会慢到超时。
+          all='[
+            {"platform":"linux/amd64","arch":"amd64","runner":"ubuntu-latest"},
+            {"platform":"linux/arm64","arch":"arm64","runner":"ubuntu-24.04-arm"}
+          ]'
+          p="${{ inputs.platforms }}"
+          [ -z "$p" ] && p=all
+          case "$p" in
+            all)   m="$all" ;;
+            amd64) m=$(jq -c '[.[]|select(.arch=="amd64")]' <<<"$all") ;;
+            arm64) m=$(jq -c '[.[]|select(.arch=="arm64")]' <<<"$all") ;;
+            *) echo "::error::unknown platforms input: $p"; exit 1 ;;
+          esac
+          m=$(jq -c <<<"$m")
+          {
+            echo "matrix=$m"
+            echo "image=ghcr.io/${GITHUB_REPOSITORY,,}"
+            echo "short_sha=${GITHUB_SHA:0:8}"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "## Build plan (from master)"
+            echo "| event | platforms | sha |"
+            echo "|---|---|---|"
+            echo "| ${{ github.event_name }} | ${p} | ${GITHUB_SHA:0:8} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  # 每个架构在原生 runner 上构建 master 源码，按 digest 推送（不打 tag）。
+  # master 本身就含全部源码 + build/docker，无需像 tags 那样切 tag/overlay。
+  # ---------------------------------------------------------------------------
+  build:
+    needs: discover
+    name: Build (${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.discover.outputs.matrix) }}
+    steps:
+      - name: Checkout master (full history for git describe)
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0   # VPP 版本号来自 git describe，需要历史和 tag
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: build/docker/Dockerfile
+          platforms: ${{ matrix.platform }}
+          provenance: false
+          build-args: |
+            BUILD_TYPE=release
+            VERSION=${{ needs.discover.outputs.short_sha }}
+          labels: |
+            org.opencontainers.image.title=vpp
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.description=FD.io VPP built from master (${{ needs.discover.outputs.short_sha }})
+          cache-from: type=gha,scope=main-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=main-${{ matrix.arch }}
+          # 按 digest 推送、不打 tag；tag 由 merge job 统一创建 manifest list。
+          outputs: type=image,name=${{ needs.discover.outputs.image }},push-by-digest=true,name-canonical=true,push=true
+
+      - name: Export digest
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-main-${{ matrix.arch }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  # ---------------------------------------------------------------------------
+  # 合并多架构 digest，打 :master + :master-<sha>。不动 :latest（那是 release 的）。
+  # ---------------------------------------------------------------------------
+  merge:
+    needs: [discover, build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digests-main-*
+          merge-multiple: true
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Create & push manifest list
+        working-directory: /tmp/digests
+        run: |
+          set -euo pipefail
+          image="${{ needs.discover.outputs.image }}"
+          sha="${{ needs.discover.outputs.short_sha }}"
+          # :master 永远滚动指向最新 master；:<sha> 固定可追溯到具体提交
+          # （看 sha 即知是 master 的某次提交，git 对比历史就知道改了什么）。
+          docker buildx imagetools create \
+            -t "${image}:master" \
+            -t "${image}:${sha}" \
+            $(printf "${image}@sha256:%s " *)
+
+      - name: Inspect
+        run: docker buildx imagetools inspect "${{ needs.discover.outputs.image }}:master"
