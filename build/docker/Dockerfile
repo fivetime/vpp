@@ -82,6 +82,15 @@ RUN set -eux \
     && ls -l /pkg
 
 ###############################################################################
+# （可选）packages —— 仅含 .deb 的导出阶段。BuildKit 在普通构建时会跳过它，
+# 仅在显式 --target packages 时构建，用于把 .deb 导出到本地：
+#   docker build -f build/docker/Dockerfile --target packages \
+#     --output type=local,dest=./debs --build-arg VERSION=26.02 .
+###############################################################################
+FROM scratch AS packages
+COPY --from=builder /pkg /
+
+###############################################################################
 # Stage 2: runtime —— 仅安装运行所需的 VPP 包
 ###############################################################################
 FROM debian:trixie-slim

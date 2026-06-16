@@ -1,0 +1,33 @@
+# Minimal memif PoC: two VPP instances linked over a shared-memory memif channel.
+# No Kubernetes, no shared netns, no NIC — just a shared unix socket (named volume).
+# Run with ./run.sh (brings these up, wires the memif link, and pings across).
+#
+# VPP_IMAGE defaults to the locally-built vpp:dev; override to use the published
+# image, e.g.  VPP_IMAGE=ghcr.io/fivetime/vpp:latest ./run.sh
+services:
+  vpp-a:                                   # memif master
+    image: ${VPP_IMAGE:-vpp:dev}
+    container_name: memif-poc-a
+    privileged: true
+    volumes:
+      - /dev/hugepages:/dev/hugepages
+      - memif-sock:/run/memif             # shared memif control socket
+      - ./startup.conf:/etc/vpp/startup.conf:ro
+    ulimits:
+      memlock: -1
+    shm_size: "512m"
+
+  vpp-b:                                   # memif slave
+    image: ${VPP_IMAGE:-vpp:dev}
+    container_name: memif-poc-b
+    privileged: true
+    volumes:
+      - /dev/hugepages:/dev/hugepages
+      - memif-sock:/run/memif
+      - ./startup.conf:/etc/vpp/startup.conf:ro
+    ulimits:
+      memlock: -1
+    shm_size: "512m"
+
+volumes:
+  memif-sock:                              # shared between vpp-a and vpp-b

@@ -35,6 +35,22 @@ docker build -f build/docker/Dockerfile \
 > **Tip:** add a `.dockerignore` at the repo root that ignores `build-root/`
 > (and other large/generated dirs) so the build context stays small.
 
+The resulting runtime image is ~243 MB (the `.deb`s are installed via a
+BuildKit bind mount, so they don't add a layer).
+
+### Extracting the .deb packages
+
+The builder stage produces the `.deb`s under `/pkg`. The Dockerfile has a tiny
+`packages` (scratch) stage holding just those, so you can export them to a local
+dir without spinning up a container:
+
+```bash
+docker build -f build/docker/Dockerfile --target packages \
+  --output type=local,dest=./debs \
+  --build-arg VERSION=26.02 .
+ls ./debs/   # vpp_*.deb, libvppinfra_*.deb, vpp-plugin-*_*.deb, ...
+```
+
 ## Running
 
 VPP needs elevated privileges and hugepages. The simplest way is Compose:
@@ -92,6 +108,12 @@ docker exec -it vpp vppctl show version
 docker exec -it vpp vppctl show interface
 docker exec -it vpp vppctl show runtime
 ```
+
+## Examples
+
+- [`examples/memif-poc/`](./examples/memif-poc/) — connect two VPP containers
+  over a shared-memory **memif** link (no K8s, no NIC). Validates the
+  "per-node VPP + memif clients" userspace datapath locally.
 
 ## Notes
 
