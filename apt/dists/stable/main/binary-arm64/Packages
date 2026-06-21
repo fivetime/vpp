@@ -1,0 +1,171 @@
+Package: libvppinfra
+Source: vpp
+Version: 26.02-release
+Architecture: arm64
+Maintainer: fd.io VPP Packaging Team <vpp-dev@fd.io>
+Installed-Size: 592
+Depends: libc6 (>= 2.38), libunwind8
+Filename: pool/main/libvppinfra_26.02-release_arm64.deb
+Size: 162472
+MD5sum: 20d1f3b93088e8045ae002bfe409b6ba
+SHA1: 5641717c2ec14439ccda6d9086aaf4553d86f1ce
+SHA256: 74571fb7bb3da3066c2b9489d09f95f733c17b350754431ac9eb24dd084e7373
+Section: net
+Priority: extra
+Description: Vector Packet Processing--runtime libraries
+ This package contains the VPP shared libraries, including:
+
+Package: libvppinfra-dev
+Source: vpp
+Version: 26.02-release
+Architecture: arm64
+Maintainer: fd.io VPP Packaging Team <vpp-dev@fd.io>
+Installed-Size: 948
+Filename: pool/main/libvppinfra-dev_26.02-release_arm64.deb
+Size: 163352
+MD5sum: d1b5762799186eb2e93fb5d399517e8e
+SHA1: 60791e2d7370d1ef0ce7d6f9eb06bea697605355
+SHA256: fbfa40b5c702848f3167dd0cf55175caf02f1d00c8d0b5ecbb9a75be6ccc134e
+Section: net
+Priority: extra
+Description: Vector Packet Processing--runtime libraries
+ This package contains the VPP shared libraries, including:
+
+Package: python3-vpp-api
+Source: vpp
+Version: 26.02-release
+Architecture: arm64
+Maintainer: fd.io VPP Packaging Team <vpp-dev@fd.io>
+Installed-Size: 239
+Depends: vpp (= 26.02-release), python3:any
+Filename: pool/main/python3-vpp-api_26.02-release_arm64.deb
+Size: 36292
+MD5sum: 09367df67d069f46c0378610915c5bc0
+SHA1: 919e0f93af437026c6bd8c2e125b2e287a9ff419
+SHA256: 1721509ed0eabe80ebe4e986a849f4c87769ac44aeca0005cb3389bed22db214
+Section: net
+Priority: extra
+Description: VPP Python3 API bindings
+ This package contains VPP python api bindings
+
+Package: vpp
+Version: 26.02-release
+Architecture: arm64
+Maintainer: fd.io VPP Packaging Team <vpp-dev@fd.io>
+Installed-Size: 42919
+Depends: libvppinfra (= 26.02-release), libc6 (>= 2.38), libnl-3-200 (>= 3.2.7), libnl-route-3-200 (>= 3.2.26), libssl3t64 (>= 3.0.0), libunwind8
+Filename: pool/main/vpp_26.02-release_arm64.deb
+Size: 4588280
+MD5sum: 0857c44e44571289aab31ae8c4493c67
+SHA1: 870f3e0d4d6aae80ccbbec35703596b0447fe5b7
+SHA256: 7554cdb9a7fb2765ee213ec16848b6eccc440431da22d60075d0302e5e374f57
+Section: net
+Priority: extra
+Description: Vector Packet Processing--executables
+ This package provides VPP executables: vpp, vpp_api_test, vpp_json_test
+ vpp - the vector packet engine
+ vpp_api_test - vector packet engine API test tool
+ vpp_json_test - vector packet engine JSON test tool
+
+Package: vpp-crypto-engines
+Source: vpp
+Version: 26.02-release
+Architecture: arm64
+Maintainer: fd.io VPP Packaging Team <vpp-dev@fd.io>
+Installed-Size: 919
+Depends: vpp (= 26.02-release), libc6 (>= 2.17), libssl3t64 (>= 3.0.0)
+Filename: pool/main/vpp-crypto-engines_26.02-release_arm64.deb
+Size: 114120
+MD5sum: 18112e6efe20aa73660d836467e21e95
+SHA1: ea7b4427f11142afffb93d0921533388bf85468e
+SHA256: 0f24d546b39e75c9ee44913c27a8218eaacaa72b388bf54411090da9e3150f0e
+Section: net
+Priority: extra
+Description: Vector Packet Processing--runtime crypto engines
+ This package contains VPP crypto engines
+
+Package: vpp-dev
+Source: vpp
+Version: 26.02-release
+Architecture: arm64
+Maintainer: fd.io VPP Packaging Team <vpp-dev@fd.io>
+Installed-Size: 21905
+Depends: libvppinfra-dev (= 26.02-release)
+Filename: pool/main/vpp-dev_26.02-release_arm64.deb
+Size: 1512468
+MD5sum: e5b4d8ae46d82bb6fb21daf970ba5660
+SHA1: 74d972f8926f0d5be471c897a0881f78ef4f4f54
+SHA256: cffae3436a3f78397382aaab2c30d878a254734a1c6836193138fd7e15235264
+Section: net
+Priority: extra
+Description: Vector Packet Processing--development support
+ This package contains development support files for the VPP libraries
+
+Package: vpp-drivers
+Source: vpp
+Version: 26.02-release
+Architecture: arm64
+Maintainer: fd.io VPP Packaging Team <vpp-dev@fd.io>
+Installed-Size: 1620
+Depends: vpp (= 26.02-release), libc6 (>= 2.17)
+Filename: pool/main/vpp-drivers_26.02-release_arm64.deb
+Size: 175968
+MD5sum: 4b56eeedb4ac4aef9f52c0a7a003a00c
+SHA1: b15b09f0433fc8d92d4f5bf57daf3abffb4f07a1
+SHA256: 1a786795f408fe492d58d78114f391294de864e8eae8908bc536b5596e46dcce
+Section: net
+Priority: extra
+Description: Vector Packet Processing--runtime device drivers
+ This package contains VPP device drivers
+
+Package: vpp-plugin-core
+Source: vpp
+Version: 26.02-release
+Architecture: arm64
+Maintainer: fd.io VPP Packaging Team <vpp-dev@fd.io>
+Installed-Size: 30191
+Depends: vpp (= 26.02-release), libc6 (>= 2.38), libelf1t64 (>= 0.144), libnl-3-200 (>= 3.2.21), libnl-route-3-200 (>= 3.7.0), libpcap0.8t64 (>= 1.0.0), libssl3t64 (>= 3.0.0), libunwind8, libvppinfra, zlib1g (>= 1:1.2.3.4)
+Filename: pool/main/vpp-plugin-core_26.02-release_arm64.deb
+Size: 4065824
+MD5sum: 9be77037091d79d13b2bd64b35e92e72
+SHA1: 851da714c964621559e528b59483d0e70aefb004
+SHA256: edf41a002c0ba2f6ca285b54637fe70409961db73f7b1f9c7a12e3a89e8261f0
+Section: net
+Priority: extra
+Description: Vector Packet Processing--runtime core plugins
+ This package contains VPP core plugins
+
+Package: vpp-plugin-devtools
+Source: vpp
+Version: 26.02-release
+Architecture: arm64
+Maintainer: fd.io VPP Packaging Team <vpp-dev@fd.io>
+Installed-Size: 1645
+Depends: vpp (= 26.02-release), libc6 (>= 2.34), libunwind8, libvppinfra
+Filename: pool/main/vpp-plugin-devtools_26.02-release_arm64.deb
+Size: 282884
+MD5sum: 27caa8d0bbf6ed8ff6081eb7f712d839
+SHA1: 6e5e33ad95d0e986a135e0a5f5c0f1d5cd42d8c2
+SHA256: 10b7eb1057bdae13f43da2cb568c3cc72c5cfc8d9d96a5f1d291d3412ac04300
+Section: net
+Priority: extra
+Description: Vector Packet Processing--runtime developer tool plugins
+ This package contains VPP developer tool plugins
+
+Package: vpp-plugin-dpdk
+Source: vpp
+Version: 26.02-release
+Architecture: arm64
+Maintainer: fd.io VPP Packaging Team <vpp-dev@fd.io>
+Installed-Size: 16513
+Depends: vpp (= 26.02-release), libc6 (>= 2.38), libnuma1 (>= 2.0.11), libssl3t64 (>= 3.0.0)
+Filename: pool/main/vpp-plugin-dpdk_26.02-release_arm64.deb
+Size: 3963812
+MD5sum: c31de83faa91cfeeaa511217df50c1c9
+SHA1: 71c336f8a8c9ae75d2278ac3ea3804c3e1c6c385
+SHA256: daf73a140a314c0004ae1f1bf48c21b6eda897e559ef9709235eab0d946d0111
+Section: net
+Priority: extra
+Description: Vector Packet Processing--runtime dpdk plugin
+ This package contains the VPP dpdk plugin
+
