@@ -1,0 +1,6 @@
+Archive: stable
+Suite: stable
+Component: main
+Origin: VPP community packages
+Label: VPP
+Architecture: amd64
