@@ -26,9 +26,16 @@ ARG MAKE_PARALLEL_JOBS="16"
 ARG VERSION="dev"
 
 # install-dep / pkg-rpm 之前需要的最小工具集；其余 RHEL 构建依赖由 install-dep 装。
+# 不装真 sudo：容器内以 root 运行,但 VPP 的 install-dep 写死了 `sudo -E dnf ...`,
+# 而 Rocky 精简镜像里的 sudo 走 PAM 会失败("PAM account management error /
+# a password is required")。我们本就是 root、无需提权,用一个透传 shim 顶替 sudo:
+# 吃掉前导的 sudo 选项(-E/-H/-n...),直接 exec 后面的真实命令。
 RUN set -eux \
-    && dnf -y install make git sudo which python3 ca-certificates \
-    && dnf clean all
+    && dnf -y install make git which python3 ca-certificates \
+    && dnf clean all \
+    && printf '#!/bin/sh\nwhile [ $# -gt 0 ]; do case "$1" in -*) shift;; *) break;; esac; done\nexec "$@"\n' \
+         > /usr/local/bin/sudo \
+    && chmod 0755 /usr/local/bin/sudo
 
 COPY . /vpp
 WORKDIR /vpp
