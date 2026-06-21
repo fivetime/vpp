@@ -130,6 +130,12 @@ jobs:
           set -eux
           git checkout "${{ needs.prepare.outputs.tag }}"
           git checkout master -- build/docker build/packages .dockerignore
+          # 上游在 release 之后把 intel-ipsec-mb 从不稳定的 GitHub 归档 v2.0 升到了
+          # v2.0.2:GitHub 会重新生成 archive tarball,导致 v2.0 的 sha 漂移(下载到的
+          # 包与 release 内置的期望 sha 不符 → "Bad Checksum",fresh 的 install-ext-deps
+          # 必崩,之前只是被 ext-deps 缓存层掩盖)。叠加 master 上已修正的这个 mk
+          # (改用字节稳定的 v2.0.2 + 有效 sha),deb/rpm 两条都能过。
+          git checkout master -- build/external/packages/ipsec-mb.mk
 
       - uses: docker/setup-buildx-action@v3
 
