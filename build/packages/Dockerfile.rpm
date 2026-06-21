@@ -46,14 +46,24 @@ WORKDIR /vpp
 # 在 Linux CI 上 checkout 本就正确，这步是空操作；仅 Windows 本地构建需要。
 RUN git -c core.autocrlf=false -c core.eol=lf -c core.symlinks=true checkout-index -f -a
 
-# 版本推导：vpp.spec/dist 经 `git describe` 取版本。CI checkout 的是 release tag，
-# describe 正常；本地无 tag 工作树构建时 describe 为空、打包会失败。故 HEAD 不可达
-# 任何 v* tag 时，用 VERSION 打一个带注解的 tag（轻量 tag 会被 describe 忽略）。
+# 一步搞定「放宽 -Werror + 版本 tag」,因为 `make dist` 用 `git archive HEAD` 打 tar
+# (取的是 HEAD 的提交快照,不是工作树),所以源码改动必须 commit 进 HEAD 才会进包。
+#
+# 为什么去掉 -Werror:Rocky 9 的 clang 比 VPP 该 release 测试的工具链新,会默认打开
+# 额外诊断(如 -Wdefault-const-init-field-unsafe),把已发布、已知可编译的源码判成
+# 错误。我们是下游打包、不是开发 VPP,故移除 src 树里唯一一处(全局继承)的 -Werror,
+# 让新编译器的警告保持为警告。deb 构建用 Debian 的 clang-19、与上游匹配,不受影响。
+#
+# 版本:CI checkout 的是 release tag,describe 正常;本地无 tag 工作树用 VERSION 回退。
+# 改完 commit 会让 HEAD 前移,故把版本 tag 强制重指到新 HEAD,使 describe 仍得干净版本号。
 RUN set -eux \
-    && if ! git describe --abbrev=0 --match 'v[0-9]*' >/dev/null 2>&1 ; then \
-           v="${VERSION}" ; case "$v" in dev|"") v="0.0" ;; esac ; \
-           git -c user.email=build@vpp.local -c user.name=vpp-build tag -a "v${v}" -m "v${v}" ; \
-       fi
+    && v="$(git describe --tags --abbrev=0 --match 'v[0-9]*' 2>/dev/null || true)" \
+    && case "$v" in v[0-9]*) v="${v#v}" ;; *) v="${VERSION}" ; case "$v" in dev|"") v="0.0" ;; esac ;; esac \
+    && sed -i 's/add_compile_options(-g -Werror -Wall)/add_compile_options(-g -Wall)/' src/CMakeLists.txt \
+    && grep -q 'add_compile_options(-g -Wall)' src/CMakeLists.txt \
+    && git -c user.email=build@vpp.local -c user.name=vpp-build commit -aqm "ci(packaging): drop -Werror for newer distro clang" \
+    && git -c user.email=build@vpp.local -c user.name=vpp-build tag -fa "v${v}" -m "v${v}" \
+    && git describe --tags
 
 # 拆成独立 RUN 便于 BuildKit 分层缓存（改 pkg-rpm 不会让最耗时的 ext-deps 失效）。
 RUN make UNATTENDED=yes install-dep
