@@ -1,0 +1,65 @@
+# syntax=docker/dockerfile:1.7
+###############################################################################
+# RPM builder — build VPP .rpm packages from THIS repo's source on Rocky Linux 9.
+#
+# Why Rocky 9 (not AlmaLinux): VPP's `make install-dep` has an explicit
+# `OS_ID=rocky` branch (Makefile) that enables the CRB + EPEL repos and installs
+# the RHEL-family build dependencies. There is NO `almalinux` branch in
+# install-dep's redhat subtree, so an AlmaLinux base would silently install no
+# deps and fail. Rocky 9 → el9 rpms (x86_64 on amd64 runners, aarch64 on arm64).
+#
+# This Dockerfile only PRODUCES packages; it builds no runtime image (the
+# container image lives in build/docker/Dockerfile). Export the rpms locally:
+#
+#   docker build -f build/packages/Dockerfile.rpm --target packages \
+#     --output type=local,dest=./rpms --build-arg VERSION=26.02 .
+#   ls ./rpms/   # vpp-*.rpm, vpp-plugins-*.rpm, vpp-devel-*.rpm, ...
+#
+# Like the deb image it does `COPY .`, so build from the repo root with a
+# .dockerignore that keeps .git (version comes from `git describe`).
+###############################################################################
+# quay.io avoids Docker Hub pull-rate limits on GitHub runners; image is multi-arch.
+FROM quay.io/rockylinux/rockylinux:9 AS builder
+
+# make 并行度 / 仅用于无 tag 时的版本回退
+ARG MAKE_PARALLEL_JOBS="16"
+ARG VERSION="dev"
+
+# install-dep / pkg-rpm 之前需要的最小工具集；其余 RHEL 构建依赖由 install-dep 装。
+RUN set -eux \
+    && dnf -y install make git sudo which python3 ca-certificates \
+    && dnf clean all
+
+COPY . /vpp
+WORKDIR /vpp
+
+# 与 build/docker/Dockerfile 相同的 Windows checkout 规范化：
+#   1) 行尾 CRLF → LF（否则 shebang 脚本错乱）
+#   2) symlinks 还原（Windows core.symlinks=false 会把 86 个符号链接变成文本文件）
+# 在 Linux CI 上 checkout 本就正确，这步是空操作；仅 Windows 本地构建需要。
+RUN git -c core.autocrlf=false -c core.eol=lf -c core.symlinks=true checkout-index -f -a
+
+# 版本推导：vpp.spec/dist 经 `git describe` 取版本。CI checkout 的是 release tag，
+# describe 正常；本地无 tag 工作树构建时 describe 为空、打包会失败。故 HEAD 不可达
+# 任何 v* tag 时，用 VERSION 打一个带注解的 tag（轻量 tag 会被 describe 忽略）。
+RUN set -eux \
+    && if ! git describe --abbrev=0 --match 'v[0-9]*' >/dev/null 2>&1 ; then \
+           v="${VERSION}" ; case "$v" in dev|"") v="0.0" ;; esac ; \
+           git -c user.email=build@vpp.local -c user.name=vpp-build tag -a "v${v}" -m "v${v}" ; \
+       fi
+
+# 拆成独立 RUN 便于 BuildKit 分层缓存（改 pkg-rpm 不会让最耗时的 ext-deps 失效）。
+RUN make UNATTENDED=yes install-dep
+RUN make UNATTENDED=yes install-ext-deps
+RUN set -eux \
+    && make UNATTENDED=yes MAKE_PARALLEL_JOBS="${MAKE_PARALLEL_JOBS}" pkg-rpm \
+    # 收拢产出的 .rpm 到干净目录，方便导出（排除 src.rpm/debuginfo 由 spec 决定）
+    && mkdir -p /pkg \
+    && find build-root -maxdepth 1 -name '*.rpm' -exec cp {} /pkg/ \; \
+    && ls -l /pkg
+
+###############################################################################
+# packages —— 仅含 .rpm 的导出阶段。普通构建会被跳过，仅 `--target packages` 时构建。
+###############################################################################
+FROM scratch AS packages
+COPY --from=builder /pkg /

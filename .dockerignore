@@ -104,3 +104,9 @@ build/docker/compose.yml
 build/docker/startup.conf
 build/docker/startup.conf.example
 build/docker/examples/
+
+# --- bare-metal package pipeline: docs/scripts, never used inside the build ---
+# Dockerfile.rpm is read via `-f` (not COPY), build-repo.sh runs in the publish
+# job, README is for humans. Excluding the dir keeps editing them from busting
+# the `COPY .` VPP source cache in either Dockerfile.
+build/packages/
