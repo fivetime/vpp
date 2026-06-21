@@ -40,6 +40,26 @@ gpg_pass=()
 [ -n "$GPG_PASSPHRASE" ] && gpg_pass=(--pinentry-mode loopback --passphrase "$GPG_PASSPHRASE")
 gpg_sign() { gpg --batch --yes "${gpg_pass[@]}" -u "$KEYID" "$@"; }
 
+# Copy a package into the hosted pool, but NOT debug-symbol packages (vpp-dbg is
+# ~112MB) and nothing over GitHub's 100MB per-file git limit — a single oversized
+# file makes the whole gh-pages push fail (pre-receive hook). Debug packages stay
+# available via the GitHub Release (2GB limit), just not in the apt/yum repo.
+MAX_MB="${MAX_PKG_MB:-99}"
+copy_pkg() {  # copy_pkg <dest_dir> <file>
+  local dest="$1" f="$2" base sz
+  base="$(basename "$f")"
+  case "$base" in
+    *-dbg_*.deb|*-dbgsym_*.deb|*-debuginfo-*.rpm|*-debugsource-*.rpm)
+      echo "   skip debug pkg (kept off the repo): $base"; return 0 ;;
+  esac
+  sz=$(( $(stat -c%s "$f") / 1048576 ))
+  if [ "$sz" -gt "$MAX_MB" ]; then
+    echo "::warning::skip $base (${sz}MB > ${MAX_MB}MB GitHub per-file limit) — NOT in repo"
+    return 0
+  fi
+  cp -f "$f" "$dest"/
+}
+
 ###############################################################################
 # APT repository:  <site>/apt/{pool/main, dists/<suite>/main/binary-<arch>}
 ###############################################################################
@@ -48,7 +68,7 @@ apt_root="$SITE/apt"
 pool="$apt_root/pool/$COMPONENT"
 mkdir -p "$pool"
 if compgen -G "$INCOMING/deb/*.deb" >/dev/null; then
-  cp -f "$INCOMING"/deb/*.deb "$pool"/
+  for f in "$INCOMING"/deb/*.deb; do copy_pkg "$pool" "$f"; done
 fi
 
 if compgen -G "$pool/*.deb" >/dev/null; then
@@ -111,7 +131,7 @@ for arch in $ARCHES_RPM; do
   d="$SITE/rpm/el9/$arch"
   mkdir -p "$d"
   if compgen -G "$INCOMING/rpm/$arch/*.rpm" >/dev/null; then
-    cp -f "$INCOMING/rpm/$arch"/*.rpm "$d"/
+    for f in "$INCOMING/rpm/$arch"/*.rpm; do copy_pkg "$d" "$f"; done
   fi
   if compgen -G "$d/*.rpm" >/dev/null; then
     rpm --addsign "$d"/*.rpm            # re-signing is idempotent
