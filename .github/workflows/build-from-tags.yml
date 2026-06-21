@@ -115,6 +115,11 @@ jobs:
           set -eux
           git checkout "${{ needs.prepare.outputs.ref }}"
           git checkout master -- build/docker .dockerignore
+          # 上游在 release 之后把 intel-ipsec-mb 从不稳定的 GitHub 归档 v2.0 升到了
+          # v2.0.2:GitHub 会重新生成 archive tarball、导致 v2.0 的 sha 漂移,fresh 的
+          # install-ext-deps 会 "Bad Checksum" 而崩(只是被 ext-deps 缓存层掩盖)。叠加
+          # master 上已修正的这个 mk(改用字节稳定的 v2.0.2 + 有效 sha）。
+          git checkout master -- build/external/packages/ipsec-mb.mk
 
       - name: Login to GHCR
         uses: docker/login-action@v4
