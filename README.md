@@ -16,6 +16,56 @@ For more information on VPP and its features please visit the
 [What is VPP?](https://wiki.fd.io/view/VPP/What_is_VPP%3F) pages.
 
 
+## Prebuilt packages & container image (this fork)
+
+This fork publishes **community builds of VPP from source** — no need to compile
+it yourself. Built for `amd64` and `arm64`.
+
+### Bare metal — signed apt / yum repositories
+
+Hosted on GitHub Pages at **<https://fivetime.github.io/vpp/>** (GPG-signed).
+
+**Debian / Ubuntu**
+
+```bash
+curl -fsSL https://fivetime.github.io/vpp/vpp-archive-keyring.asc \
+  | sudo gpg --dearmor -o /usr/share/keyrings/vpp-archive-keyring.gpg
+echo "deb [signed-by=/usr/share/keyrings/vpp-archive-keyring.gpg] https://fivetime.github.io/vpp/apt stable main" \
+  | sudo tee /etc/apt/sources.list.d/vpp.list
+sudo apt-get update && sudo apt-get install vpp vpp-plugin-core
+```
+
+**RHEL / Rocky / AlmaLinux 9**
+
+```bash
+sudo rpm --import https://fivetime.github.io/vpp/RPM-GPG-KEY-vpp
+sudo tee /etc/yum.repos.d/vpp.repo >/dev/null <<'EOF'
+[vpp]
+name=VPP packages
+baseurl=https://fivetime.github.io/vpp/rpm/el9/$basearch
+enabled=1
+gpgcheck=1
+repo_gpgcheck=1
+gpgkey=https://fivetime.github.io/vpp/RPM-GPG-KEY-vpp
+EOF
+sudo dnf install vpp vpp-plugins
+```
+
+Individual `.deb`/`.rpm` files (including debug packages) are also attached to each
+[GitHub Release](https://github.com/fivetime/vpp/releases). See
+[`build/packages/README.md`](build/packages/README.md) for details.
+
+### Container image
+
+```bash
+docker pull ghcr.io/fivetime/vpp:latest    # newest release (also :26.02)
+docker pull ghcr.io/fivetime/vpp:master    # latest master build
+```
+
+See [`build/docker/README.md`](build/docker/README.md) for running, configuration,
+and a memif example.
+
+
 ## Changes
 
 Details of the changes leading up to this version of VPP can be found under
