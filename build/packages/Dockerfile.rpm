@@ -68,6 +68,19 @@ RUN set -eux \
 # 拆成独立 RUN 便于 BuildKit 分层缓存（改 pkg-rpm 不会让最耗时的 ext-deps 失效）。
 RUN make UNATTENDED=yes install-dep
 RUN make UNATTENDED=yes install-ext-deps
+
+# 放宽 rpmbuild 的两处严格检查,适配「上游 spec 与该 release 源码文件集漂移」:
+#   1) _unpackaged_files_terminate_build=0:容忍源码新增、但 spec %files 未收录的文件
+#      (如示例程序 /usr/bin/selog_client_example),让其被丢弃而非整包失败。运行所需的
+#      vpp/插件/库都在 %files 里,丢掉的只是示例/边角文件。
+#   2) debug_package=%{nil}:跳过 debuginfo 子包。VPP 多个字节几乎相同的插件
+#      (det44 与 nat44_ei 等 test plugin)共享 build-id,会触发 ".build-id File listed
+#      twice / Duplicate build-ids" 而失败;二进制仓库本就不需要 debuginfo。
+# extras/rpm/Makefile 直接拷贝工作树里的 vpp.spec(不经 git archive),故改工作树即生效、
+# 无需 commit。两行 %global 置于 spec 顶部即对整个构建生效。
+RUN sed -i '1i %global _unpackaged_files_terminate_build 0\n%global debug_package %{nil}' extras/rpm/vpp.spec \
+    && head -3 extras/rpm/vpp.spec
+
 RUN set -eux \
     && make UNATTENDED=yes MAKE_PARALLEL_JOBS="${MAKE_PARALLEL_JOBS}" pkg-rpm \
     # 收拢产出的 .rpm 到干净目录，方便导出（排除 src.rpm/debuginfo 由 spec 决定）
