@@ -83,22 +83,27 @@ RUN make UNATTENDED=yes install-dep
 RUN sed -i 's#-C \.\./\.\.#-C %{_topdir}/..#' build/external/rpm/vpp-ext-deps.spec \
     && grep -n '_make_args' build/external/rpm/vpp-ext-deps.spec
 
-# Newer distro clang (e.g. Rocky 10's clang 21) ignores the gcc-only `-specs=` flags
-# that redhat-rpm-config injects into the build flags and warns
-# -Wunused-command-line-argument. DPDK's meson probes compiler arguments WITH -Werror,
-# so those warnings become errors and meson wrongly concludes the compiler "does not
-# support -march=corei7" -> the DPDK ext-dep aborts. Strip the `-specs=` tokens from
-# the ext-deps build flags at the top of the spec's %install (clang never uses them;
-# el9 builds the same without them). A `%global` redefine would recurse, so do it in
+# Sanitize the gcc-oriented build flags that redhat-rpm-config injects, for the
+# ext-deps build (which compiles C with clang). Two reasons:
+#   - `-specs=…` (redhat-hardened/annobin): clang ignores them and warns
+#     -Wunused-command-line-argument; DPDK's meson probes args WITH -Werror, so it
+#     wrongly reports "compiler does not support -march=corei7" and DPDK aborts.
+#   - `-flto=auto -ffat-lto-objects` (el10/RHEL10 default): fat-LTO keeps BOTH bitcode
+#     and machine code in every object (≈2× size); across DPDK's hundreds of objects
+#     this exhausts the hosted runner's ~14GB disk and the LTO link spikes memory →
+#     "runner received a shutdown signal". LTO isn't needed for these packages.
+# Strip all three from CFLAGS/CXXFLAGS/LDFLAGS at the top of the spec's %install
+# (el9 builds the same without them). A `%global` redefine would recurse, so do it in
 # shell at scriptlet runtime.
 RUN python3 - <<'PYEOF'
 p = "build/external/rpm/vpp-ext-deps.spec"
 s = open(p).read()
+sed = "sed 's/-specs=[^ ]*//g;s/-flto[^ ]*//g;s/-ffat-lto-objects//g'"
 strip = (
-    'export CFLAGS="$(echo "$CFLAGS" | sed \'s/-specs=[^ ]*//g\')"\n'
-    'export CXXFLAGS="$(echo "$CXXFLAGS" | sed \'s/-specs=[^ ]*//g\')"\n'
-    'export LDFLAGS="$(echo "$LDFLAGS" | sed \'s/-specs=[^ ]*//g\')"\n'
-)
+    'export CFLAGS="$(echo "$CFLAGS" | %s)"\n'
+    'export CXXFLAGS="$(echo "$CXXFLAGS" | %s)"\n'
+    'export LDFLAGS="$(echo "$LDFLAGS" | %s)"\n'
+) % (sed, sed, sed)
 assert "%install\n" in s, "no %install in ext-deps spec"
 s = s.replace("%install\n", "%install\n" + strip, 1)
 open(p, "w").write(s)
