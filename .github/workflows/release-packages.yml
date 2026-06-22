@@ -218,10 +218,19 @@ jobs:
           echo "keyid=$keyid" >> "$GITHUB_OUTPUT"
           echo "imported key $keyid"
 
-      - name: Download all package artifacts
+      # Pattern-based (not "download everything") — the latter intermittently fails
+      # with "Artifact download failed after 5 retries" even when each artifact already
+      # downloaded fine. Each artifact lands in dl/<name>/ (no merge-multiple).
+      - name: Download deb artifacts
         uses: actions/download-artifact@v4
         with:
-          path: dl                  # 每个 artifact 落到 dl/<name>/ (deb-<suite>-<arch>, rpm-<elver>-<arch>)
+          path: dl
+          pattern: deb-*
+      - name: Download rpm artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dl
+          pattern: rpm-*
 
       - name: Arrange incoming packages (per suite / per el<N>+arch)
         run: |
