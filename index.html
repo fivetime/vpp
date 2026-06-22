@@ -3,7 +3,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>VPP packages (apt / yum)</title>
 <style>
- body{font:15px/1.5 system-ui,sans-serif;max-width:820px;margin:2.5rem auto;padding:0 1rem;color:#1a1a1a}
+ body{font:15px/1.5 system-ui,sans-serif;max-width:860px;margin:2.5rem auto;padding:0 1rem;color:#1a1a1a}
  h1{margin-bottom:.2rem} h2{margin-top:2rem;border-bottom:1px solid #eee;padding-bottom:.3rem}
  code,pre{font-family:ui-monospace,Menlo,Consolas,monospace}
  pre{background:#0d1117;color:#e6edf3;padding:1rem;border-radius:8px;overflow:auto}
@@ -14,23 +14,30 @@
 signed apt &amp; yum repositories. Built for <code>amd64</code> and <code>arm64</code>.</p>
 
 <h2>Debian / Ubuntu (apt)</h2>
+<p>Pick the <b>suite</b> matching your release — available: <code>trixie</code> <code>bookworm</code> <code>jammy</code> <br>
+<span class="muted">trixie=Debian&nbsp;13, bookworm=Debian&nbsp;12, jammy=Ubuntu&nbsp;22.04.
+Ubuntu&nbsp;24.04+ works with <code>trixie</code>.</span></p>
 <pre>curl -fsSL https://fivetime.github.io/vpp/vpp-archive-keyring.asc \
   | sudo gpg --dearmor -o /usr/share/keyrings/vpp-archive-keyring.gpg
 
-echo "deb [signed-by=/usr/share/keyrings/vpp-archive-keyring.gpg] https://fivetime.github.io/vpp/apt stable main" \
+# replace trixie with your suite from the list above
+echo "deb [signed-by=/usr/share/keyrings/vpp-archive-keyring.gpg] https://fivetime.github.io/vpp/apt trixie main" \
   | sudo tee /etc/apt/sources.list.d/vpp.list
 
 sudo apt-get update
 sudo apt-get install vpp vpp-plugin-core</pre>
-<p class="muted">Built on Debian 13 (trixie); compatible glibc-based distros work too.</p>
 
-<h2>RHEL / Rocky / AlmaLinux 9 (yum/dnf)</h2>
+<h2>RHEL / Rocky / AlmaLinux (yum/dnf)</h2>
+<p>Available: <code>el9</code> <span class="muted">(el9 = RHEL/Rocky/Alma/CentOS-Stream/Oracle 9;
+its glibc 2.34 is forward-compatible, so it also installs on RHEL 10).</span></p>
 <pre>sudo rpm --import https://fivetime.github.io/vpp/RPM-GPG-KEY-vpp
 
-sudo tee /etc/yum.repos.d/vpp.repo >/dev/null <<'REPO'
+# set EL to your major version: el9 or el10
+EL=el9
+sudo tee /etc/yum.repos.d/vpp.repo >/dev/null <<REPO
 [vpp]
 name=VPP packages
-baseurl=https://fivetime.github.io/vpp/rpm/el9/$basearch
+baseurl=https://fivetime.github.io/vpp/rpm/$EL/\$basearch
 enabled=1
 gpgcheck=1
 repo_gpgcheck=1
@@ -38,12 +45,11 @@ gpgkey=https://fivetime.github.io/vpp/RPM-GPG-KEY-vpp
 REPO
 
 sudo dnf install vpp vpp-plugins</pre>
-<p class="muted">Built on Rocky Linux 9 (el9).</p>
 
 <h2>Available versions</h2>
-<ul><li><code>26.02-release</code></li></ul>
+<ul><li>(none yet)</li></ul>
 
 <p class="muted">Signing key: <a href="https://fivetime.github.io/vpp/vpp-archive-keyring.asc">vpp-archive-keyring.asc</a>
-&middot; key id <code>F8D7D9A51F2565191559D5B9178D9CEE828B739F</code>. Per-version package files are also attached to the
+&middot; key id <code>F8D7D9A51F2565191559D5B9178D9CEE828B739F</code>. Per-version package files (incl. debug) are also attached to the
 <a href="https://github.com/fivetime/vpp/releases">GitHub Releases</a>.</p>
 </body></html>
