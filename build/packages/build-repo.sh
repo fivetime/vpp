@@ -179,23 +179,52 @@ cat > "$SITE/index.html" <<EOF
 <!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>VPP packages (apt / yum)</title>
+<title>FD.io VPP — prebuilt apt / yum packages</title>
 <style>
- body{font:15px/1.5 system-ui,sans-serif;max-width:860px;margin:2.5rem auto;padding:0 1rem;color:#1a1a1a}
- h1{margin-bottom:.2rem} h2{margin-top:2rem;border-bottom:1px solid #eee;padding-bottom:.3rem}
- code,pre{font-family:ui-monospace,Menlo,Consolas,monospace}
- pre{background:#0d1117;color:#e6edf3;padding:1rem;border-radius:8px;overflow:auto}
- .muted{color:#666}
+ *{box-sizing:border-box}
+ body{margin:0;font:15px/1.65 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;color:#1f2328;background:#f6f8fa}
+ a{color:#0969da;text-decoration:none} a:hover{text-decoration:underline}
+ .wrap{max-width:900px;margin:0 auto;padding:0 1.1rem}
+ header{background:linear-gradient(135deg,#0b1f3a 0%,#10325c 55%,#1f6feb 100%);color:#eaf1fb}
+ header .wrap{padding:2.6rem 1.1rem 2.2rem}
+ header h1{margin:0;font-size:2rem;letter-spacing:-.5px;font-weight:700}
+ header h1 span{color:#7ab7ff}
+ header p{margin:.55rem 0 0;color:#bcd2f2;max-width:40rem}
+ .badges{margin-top:1.1rem;display:flex;gap:.45rem;flex-wrap:wrap}
+ .badge{background:rgba(255,255,255,.12);border:1px solid rgba(255,255,255,.2);padding:.18rem .65rem;border-radius:999px;font-size:.78rem;letter-spacing:.2px}
+ main{padding:1.6rem 0 .5rem}
+ .card{background:#fff;border:1px solid #d0d7de;border-radius:12px;padding:1.3rem 1.45rem;margin:1.15rem 0;box-shadow:0 1px 3px rgba(27,31,36,.06)}
+ .card h2{margin:0 0 .25rem;font-size:1.22rem;display:flex;align-items:center;gap:.5rem}
+ .hint{color:#57606a;font-size:.92rem;margin:.15rem 0 .85rem}
+ .pills{display:flex;gap:.4rem;flex-wrap:wrap;margin:.1rem 0 .95rem}
+ .pills code,.vers code{background:#ddf4ff;color:#0550ae;border:1px solid #b6e3ff;padding:.12rem .6rem;border-radius:999px;font:600 .82rem ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+ .codewrap{position:relative}
+ pre{background:#0d1117;color:#e6edf3;padding:1rem 1.1rem;border-radius:9px;overflow:auto;margin:0;font:12.5px/1.6 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+ .copy{position:absolute;top:.55rem;right:.55rem;background:#21262d;color:#c9d1d9;border:1px solid #444c56;border-radius:6px;padding:.22rem .6rem;font-size:.75rem;cursor:pointer;transition:.15s}
+ .copy:hover{background:#30363d;color:#fff}
+ .copy.ok{background:#238636;border-color:#238636;color:#fff}
+ code{background:#eff1f3;border-radius:5px;padding:.05rem .35rem;font:.88em ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+ pre code{background:none;padding:0;border:0}
+ .vers{display:flex;gap:.45rem;flex-wrap:wrap;list-style:none;padding:0;margin:.3rem 0}
+ footer{border-top:1px solid #d0d7de;color:#57606a;font-size:.86rem}
+ footer .wrap{padding:1.4rem 1.1rem 2.6rem}
+ @media(max-width:560px){header h1{font-size:1.55rem}}
 </style></head><body>
-<h1>VPP packages</h1>
-<p class="muted">Community builds of <a href="https://fd.io/">FD.io VPP</a> from source —
-signed apt &amp; yum repositories. Built for <code>amd64</code> and <code>arm64</code>.</p>
+<header><div class="wrap">
+ <h1>FD.io <span>VPP</span> — prebuilt packages</h1>
+ <p>Community builds of <a href="https://fd.io/" style="color:#cfe2ff">Vector Packet Processing</a>
+ compiled from source, served as GPG-signed <b>apt</b> &amp; <b>yum</b> repositories. Just add the repo and install.</p>
+ <div class="badges"><span class="badge">amd64</span><span class="badge">arm64</span><span class="badge">GPG-signed</span><span class="badge">auto-updated</span></div>
+</div></header>
+<main class="wrap">
 
-<h2>Debian / Ubuntu (apt)</h2>
-<p>Pick the <b>suite</b> matching your release — available: ${apt_suite_list}<br>
-<span class="muted">${default_suite}=Debian&nbsp;13, bookworm=Debian&nbsp;12, jammy=Ubuntu&nbsp;22.04.
-Ubuntu&nbsp;24.04+ works with <code>${default_suite}</code>.</span></p>
-<pre>curl -fsSL $REPO_URL/vpp-archive-keyring.asc \\
+ <section class="card">
+  <h2>🐧 Debian / Ubuntu · apt</h2>
+  <p class="hint">Pick the suite matching your release —
+  <code>${default_suite}</code> = Debian&nbsp;13 (also Ubuntu&nbsp;24.04+),
+  <code>bookworm</code> = Debian&nbsp;12, <code>jammy</code> = Ubuntu&nbsp;22.04.</p>
+  <div class="pills">${apt_suite_list}</div>
+  <div class="codewrap"><button class="copy" onclick="cp(this)">Copy</button><pre>curl -fsSL $REPO_URL/vpp-archive-keyring.asc \\
   | sudo gpg --dearmor -o /usr/share/keyrings/vpp-archive-keyring.gpg
 
 # replace ${default_suite} with your suite from the list above
@@ -203,33 +232,46 @@ echo "deb [signed-by=/usr/share/keyrings/vpp-archive-keyring.gpg] $REPO_URL/apt 
   | sudo tee /etc/apt/sources.list.d/vpp.list
 
 sudo apt-get update
-sudo apt-get install vpp vpp-plugin-core</pre>
+sudo apt-get install vpp vpp-plugin-core</pre></div>
+ </section>
 
-<h2>RHEL / Rocky / AlmaLinux (yum/dnf)</h2>
-<p>Available: ${el_list}<span class="muted">(el9 = RHEL/Rocky/Alma/CentOS-Stream/Oracle 9;
-its glibc 2.34 is forward-compatible, so it also installs on RHEL 10).</span></p>
-<pre>sudo rpm --import $REPO_URL/RPM-GPG-KEY-vpp
+ <section class="card">
+  <h2>🎩 RHEL / Rocky / AlmaLinux · yum/dnf</h2>
+  <p class="hint"><code>el9</code> covers RHEL / Rocky / Alma / CentOS&nbsp;Stream / Oracle&nbsp;9 — and,
+  glibc&nbsp;2.34 being forward-compatible, it installs on RHEL&nbsp;10 too.</p>
+  <div class="pills">${el_list}</div>
+  <div class="codewrap"><button class="copy" onclick="cp(this)">Copy</button><pre>sudo rpm --import $REPO_URL/RPM-GPG-KEY-vpp
 
-# set EL to your major version: el9 or el10
-EL=el9
-sudo tee /etc/yum.repos.d/vpp.repo >/dev/null <<REPO
+sudo tee /etc/yum.repos.d/vpp.repo >/dev/null <<'REPO'
 [vpp]
 name=VPP packages
-baseurl=$REPO_URL/rpm/\$EL/\\\$basearch
+baseurl=$REPO_URL/rpm/el9/\$basearch
 enabled=1
 gpgcheck=1
 repo_gpgcheck=1
 gpgkey=$REPO_URL/RPM-GPG-KEY-vpp
 REPO
 
-sudo dnf install vpp vpp-plugins</pre>
+sudo dnf install vpp vpp-plugins</pre></div>
+ </section>
 
-<h2>Available versions</h2>
-<ul>$ver_items</ul>
+ <section class="card">
+  <h2>📦 Available versions</h2>
+  <ul class="vers">$ver_items</ul>
+  <p class="hint">Individual <code>.deb</code> / <code>.rpm</code> files (incl. debug packages) are also
+  attached to each <a href="https://github.com/${GITHUB_REPOSITORY:-fivetime/vpp}/releases">GitHub&nbsp;Release</a>.</p>
+ </section>
 
-<p class="muted">Signing key: <a href="$REPO_URL/vpp-archive-keyring.asc">vpp-archive-keyring.asc</a>
-&middot; key id <code>$KEYID</code>. Per-version package files (incl. debug) are also attached to the
-<a href="https://github.com/${GITHUB_REPOSITORY:-fivetime/vpp}/releases">GitHub Releases</a>.</p>
+</main>
+<footer><div class="wrap">
+ Signing key <a href="$REPO_URL/vpp-archive-keyring.asc">vpp-archive-keyring.asc</a>
+ · id <code>$KEYID</code> &nbsp;·&nbsp; built from source by
+ <a href="https://github.com/${GITHUB_REPOSITORY:-fivetime/vpp}">${GITHUB_REPOSITORY:-fivetime/vpp}</a>.
+ Community packages — not an official FD.io distribution.
+</div></footer>
+<script>
+function cp(b){var p=b.parentElement.querySelector('pre');navigator.clipboard.writeText(p.innerText).then(function(){b.textContent='Copied';b.classList.add('ok');setTimeout(function(){b.textContent='Copy';b.classList.remove('ok')},1400)})}
+</script>
 </body></html>
 EOF
 
