@@ -5,7 +5,7 @@
 # publish; pass the base as a build-arg:
 #
 #   quay.io/rockylinux/rockylinux:9   -> rpm/el9   (RHEL 9 family; glibc 2.34)
-#   quay.io/rockylinux/rockylinux:10  -> rpm/el10  (RHEL 10 family; glibc 2.39)
+#   quay.io/rockylinux/rockylinux:10  -> (el10: parameterizable but NOT shipped — see below)
 #
 # Why Rocky (not AlmaLinux): VPP's `make install-dep` has an explicit `OS_ID=rocky`
 # branch (enables CRB + EPEL); there is NO `almalinux` branch, so an AlmaLinux base
@@ -13,11 +13,17 @@
 # whole el<N> family (Rocky/AlmaLinux/RHEL/CentOS Stream/Oracle) — only the build
 # host must be Rocky.
 #
-# Scope note: el8, Fedora and openSUSE-Leap were evaluated and dropped. el8 and
-# openSUSE-Leap-15 ship Python 3.6, too old for VPP 26.02's build tooling (ply on a
-# split interpreter / setuptools>=61); Fedora's bleeding-edge rpm/dnf5/clang stack is
-# a porting-level effort that re-breaks each release. el9 + el10 cover current and
-# next RHEL. (See git history / memory for the full diagnosis.)
+# Scope note — only el9 is SHIPPED (its glibc 2.34 is forward-compatible, so the el9
+# rpm also installs on RHEL 10). Evaluated and dropped:
+#   - el8 / openSUSE-Leap-15: ship Python 3.6, too old for VPP 26.02's build tooling
+#     (split-interpreter ply / setuptools>=61).
+#   - Fedora / el10: too NEW. el10 builds all the way through the main VPP compile but
+#     fails there — VPP 26.02's tlsopenssl plugin uses OpenSSL's ENGINE API, which
+#     RHEL 10's OpenSSL 3 removed (el9's OpenSSL 3 still ships it, deprecated). That's a
+#     source-level port (upstream VPP v26.06+ territory), likely more than one plugin.
+# The el10 build-prep fixes below (LTO strip, QA_RPATHS, systemd) are kept — harmless
+# for el9, and they get el10 to the one remaining upstream OpenSSL-3 issue. (See git
+# history / memory for the full diagnosis.)
 #
 # Produces packages only (no runtime image — that lives in build/docker/Dockerfile).
 # Export locally:
@@ -110,7 +116,11 @@ open(p, "w").write(s)
 print(s)
 PYEOF
 
-RUN make UNATTENDED=yes install-ext-deps
+# QA_RPATHS makes rpmbuild's check-rpaths non-fatal. RHEL 10's rpmbuild enforces it
+# strictly and the DPDK *test* binaries (dpdk-test-gpudev/…, which VPP never ships or
+# runs) carry a RUNPATH into the build's BUILDROOT -> "ERROR 0002: invalid runpath"
+# aborts the ext-deps rpm. el9 doesn't enforce it; setting QA_RPATHS is harmless there.
+RUN export QA_RPATHS=0xffff && make UNATTENDED=yes install-ext-deps
 
 # Relax two rpmbuild strictness checks to tolerate spec/source drift in the release
 # tree:
@@ -123,6 +133,11 @@ RUN make UNATTENDED=yes install-ext-deps
 # so editing the worktree spec is enough — no commit needed.
 RUN sed -i '1i %global _unpackaged_files_terminate_build 0\n%global debug_package %{nil}' extras/rpm/vpp.spec \
     && head -3 extras/rpm/vpp.spec
+
+# vpp.spec `BuildRequires: systemd` (for the unit dir + systemd rpm macros) is not
+# pulled by install-dep; minimal Rocky 10 lacks it (el9 had it incidentally), so
+# rpmbuild aborts with "Failed build dependencies: systemd". Install it for the build.
+RUN dnf -y install systemd && dnf clean all
 
 RUN set -eux \
     && make UNATTENDED=yes MAKE_PARALLEL_JOBS="${MAKE_PARALLEL_JOBS}" pkg-rpm \

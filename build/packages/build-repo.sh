@@ -34,7 +34,7 @@ REPO_URL="${REPO_URL:?set REPO_URL, e.g. https://owner.github.io/repo}"
 REPO_URL="${REPO_URL%/}"
 
 SUITES="${SUITES:-trixie bookworm jammy}"
-EL_VERS="${EL_VERS:-el9 el10}"
+EL_VERS="${EL_VERS:-el9}"
 COMPONENT="${COMPONENT:-main}"
 ARCHES_DEB="${ARCHES_DEB:-amd64 arm64}"
 ARCHES_RPM="${ARCHES_RPM:-x86_64 aarch64}"
@@ -206,7 +206,8 @@ sudo apt-get update
 sudo apt-get install vpp vpp-plugin-core</pre>
 
 <h2>RHEL / Rocky / AlmaLinux (yum/dnf)</h2>
-<p>Available: ${el_list}<span class="muted">(el9 = RHEL/Rocky/Alma 9, el10 = RHEL/Rocky 10).</span></p>
+<p>Available: ${el_list}<span class="muted">(el9 = RHEL/Rocky/Alma/CentOS-Stream/Oracle 9;
+its glibc 2.34 is forward-compatible, so it also installs on RHEL 10).</span></p>
 <pre>sudo rpm --import $REPO_URL/RPM-GPG-KEY-vpp
 
 # set EL to your major version: el9 or el10

@@ -37,15 +37,15 @@ echo "deb [signed-by=/usr/share/keyrings/vpp-archive-keyring.gpg] https://fiveti
 sudo apt-get update && sudo apt-get install vpp vpp-plugin-core
 ```
 
-**RHEL / Rocky / AlmaLinux** — `el9` (RHEL/Rocky/Alma 9) or `el10` (RHEL/Rocky 10).
+**RHEL / Rocky / AlmaLinux** — `el9` covers RHEL/Rocky/Alma/CentOS-Stream/Oracle 9,
+and (glibc 2.34 being forward-compatible) installs on RHEL 10 too.
 
 ```bash
-EL=el9   # or el10
 sudo rpm --import https://fivetime.github.io/vpp/RPM-GPG-KEY-vpp
-sudo tee /etc/yum.repos.d/vpp.repo >/dev/null <<EOF
+sudo tee /etc/yum.repos.d/vpp.repo >/dev/null <<'EOF'
 [vpp]
 name=VPP packages
-baseurl=https://fivetime.github.io/vpp/rpm/$EL/\$basearch
+baseurl=https://fivetime.github.io/vpp/rpm/el9/$basearch
 enabled=1
 gpgcheck=1
 repo_gpgcheck=1

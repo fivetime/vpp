@@ -19,8 +19,7 @@ Dockerfiles take the base as `--build-arg BASE_IMAGE=…`.
 | `.deb` | `debian:trixie-slim` | `apt … trixie` | Debian 13, Ubuntu 24.04+ (glibc ≥ 2.38) |
 | `.deb` | `debian:bookworm-slim` | `apt … bookworm` | Debian 12 |
 | `.deb` | `ubuntu:22.04` | `apt … jammy` | Ubuntu 22.04 |
-| `.rpm` | `quay.io/rockylinux/rockylinux:9` | `rpm/el9` | RHEL/Rocky/Alma/CentOS-Stream/Oracle 9 |
-| `.rpm` | `quay.io/rockylinux/rockylinux:10` | `rpm/el10` | RHEL/Rocky 10 |
+| `.rpm` | `quay.io/rockylinux/rockylinux:9` | `rpm/el9` | RHEL/Rocky/Alma/CentOS-Stream/Oracle 9 — and RHEL 10 (glibc 2.34 forward-compat) |
 
 Built for **amd64 + arm64** on native runners (no QEMU — VPP source builds are too
 heavy to emulate). `.deb` via `build/packages/Dockerfile.deb`, `.rpm` via
@@ -30,11 +29,17 @@ heavy to emulate). `.deb` via `build/packages/Dockerfile.deb`, `.rpm` via
 > `rocky` branch in its RHEL-family subtree — AlmaLinux installs no deps. The rpm
 > still installs across the whole el\<N\> family.
 >
-> **Evaluated and dropped:** el8 and openSUSE-Leap-15 ship Python 3.6, too old for
-> VPP 26.02's build tooling (split-interpreter `ply` / `setuptools>=61`); Fedora's
-> bleeding-edge rpm-4.20/dnf5/clang stack needs a porting-level effort that re-breaks
-> each release. el9 + el10 cover current and next RHEL. See `Dockerfile.rpm` header
-> and the per-distro fix comments for the full diagnosis.
+> **Evaluated and dropped** (only `el9` is shipped on the RPM side; its glibc 2.34 is
+> forward-compatible so the el9 rpm also installs on RHEL 10):
+> - **el8 / openSUSE-Leap-15** — Python 3.6, too old for VPP 26.02's build tooling
+>   (split-interpreter `ply` / `setuptools>=61`).
+> - **Fedora / el10** — too NEW. el10 builds through the entire main VPP compile but
+>   fails there: VPP 26.02's `tlsopenssl` plugin uses OpenSSL's ENGINE API, which
+>   RHEL 10's OpenSSL 3 removed (el9's still ships it, deprecated). That's a
+>   source-level port — upstream VPP v26.06+ territory. Fedora's rpm-4.20/dnf5/clang
+>   stack is the same class of moving target.
+>
+> See the `Dockerfile.rpm` header and the per-distro fix comments for the full diagnosis.
 
 ## One-time setup (required before the first run)
 
@@ -80,7 +85,7 @@ Site URL: `https://<owner>.github.io/<repo>/`.
 `release-packages.yml`:
 
 1. **prepare** — resolve the newest stable `vYY.MM[.P]` tag (same regex as the
-   container build), build a `deb×{trixie,bookworm,jammy} + rpm×{el9,el10}` × arch
+   container build), build a `deb×{trixie,bookworm,jammy} + rpm×{el9}` × arch
    matrix, and **skip** if a `pkg-v<ver>` GitHub Release already exists (idempotent).
 2. **build** — each `(kind, suite/el, arch)` compiles on a native runner from the
    release tag's source (with `build/docker`, `build/packages`, `.dockerignore`
@@ -117,15 +122,15 @@ sudo apt-get update && sudo apt-get install vpp vpp-plugin-core
 
 ### RHEL / Rocky / AlmaLinux
 
-`EL` = `el9` (RHEL/Rocky/Alma 9) or `el10` (RHEL/Rocky 10).
+`el9` covers RHEL/Rocky/Alma/CentOS-Stream/Oracle 9, and (glibc 2.34 forward-compat)
+installs on RHEL 10 too.
 
 ```bash
-EL=el9
 sudo rpm --import https://<owner>.github.io/<repo>/RPM-GPG-KEY-vpp
-sudo tee /etc/yum.repos.d/vpp.repo >/dev/null <<EOF
+sudo tee /etc/yum.repos.d/vpp.repo >/dev/null <<'EOF'
 [vpp]
 name=VPP packages
-baseurl=https://<owner>.github.io/<repo>/rpm/$EL/\$basearch
+baseurl=https://<owner>.github.io/<repo>/rpm/el9/$basearch
 enabled=1
 gpgcheck=1
 repo_gpgcheck=1

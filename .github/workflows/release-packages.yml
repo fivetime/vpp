@@ -87,7 +87,9 @@ jobs:
           # 每个发行版按自身 glibc/ABI 单独构建并发布到对应 suite(apt,按代号)或
           # el<N>(yum)。Dockerfile 用 BASE_IMAGE 参数化:deb->Dockerfile.deb,
           # rpm->Dockerfile.rpm。原生 runner(VPP 源码构建很重,不用 QEMU)。
-          # 砍掉的目标见 Dockerfile.rpm 头注释(el8/fedora/opensuse:python/工具链不匹配)。
+          # 砍掉的目标见 Dockerfile.rpm 头注释:el8/opensuse(python 3.6 太老)、
+          # fedora/el10(太新 — el10 的主 VPP 编译撞 RHEL10 OpenSSL-3 删了 ENGINE API,
+          # 属源码级移植,交上游 VPP v26.06+)。el9 向前兼容 RHEL 10。
           all='[
             {"kind":"deb","id":"trixie","base":"debian:trixie-slim","arch":"amd64","platform":"linux/amd64","runner":"ubuntu-latest"},
             {"kind":"deb","id":"trixie","base":"debian:trixie-slim","arch":"arm64","platform":"linux/arm64","runner":"ubuntu-24.04-arm"},
@@ -96,9 +98,7 @@ jobs:
             {"kind":"deb","id":"jammy","base":"ubuntu:22.04","arch":"amd64","platform":"linux/amd64","runner":"ubuntu-latest"},
             {"kind":"deb","id":"jammy","base":"ubuntu:22.04","arch":"arm64","platform":"linux/arm64","runner":"ubuntu-24.04-arm"},
             {"kind":"rpm","id":"el9","base":"quay.io/rockylinux/rockylinux:9","arch":"amd64","platform":"linux/amd64","runner":"ubuntu-latest"},
-            {"kind":"rpm","id":"el9","base":"quay.io/rockylinux/rockylinux:9","arch":"arm64","platform":"linux/arm64","runner":"ubuntu-24.04-arm"},
-            {"kind":"rpm","id":"el10","base":"quay.io/rockylinux/rockylinux:10","arch":"amd64","platform":"linux/amd64","runner":"ubuntu-latest"},
-            {"kind":"rpm","id":"el10","base":"quay.io/rockylinux/rockylinux:10","arch":"arm64","platform":"linux/arm64","runner":"ubuntu-24.04-arm"}
+            {"kind":"rpm","id":"el9","base":"quay.io/rockylinux/rockylinux:9","arch":"arm64","platform":"linux/arm64","runner":"ubuntu-24.04-arm"}
           ]'
           p="${{ inputs.platforms }}"; [ -z "$p" ] && p=all
           case "$p" in
@@ -260,7 +260,7 @@ jobs:
           GPG_KEY_ID: ${{ steps.gpg.outputs.keyid }}
           GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
           SUITES: "trixie bookworm jammy"   # apt suites, keep in sync with prepare matrix
-          EL_VERS: "el9 el10"               # yum el<N> repos, keep in sync with prepare matrix
+          EL_VERS: "el9"                    # yum el<N> repos, keep in sync with prepare matrix
         run: |
           # owner.github.io/repo — computed from GITHUB_REPOSITORY so it's correct
           # on every event (github.event.repository.* is empty on schedule).
