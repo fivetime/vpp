@@ -9,13 +9,32 @@ It is intentionally **separate from the container pipeline** — the
 are untouched. This pipeline is the `release-packages.yml` workflow plus the two
 files here.
 
-| Output | Built on | Arches | Layout on Pages |
-|--------|----------|--------|-----------------|
-| `.deb` | Debian 13 (trixie), via `build/docker/Dockerfile --target packages` | amd64, arm64 | `/apt/{pool,dists}` |
-| `.rpm` | Rocky Linux 9 (el9), via `build/packages/Dockerfile.rpm` | x86_64, aarch64 | `/rpm/el9/$basearch` |
+Each distro is built on its **own base image** (a package is linked against its
+build distro's libraries) and published under its own apt **suite** (by codename)
+or yum **el\<N\>** tree; apt/dnf then pick the one matching the user's distro. Both
+Dockerfiles take the base as `--build-arg BASE_IMAGE=…`.
 
-> Rocky (not AlmaLinux) is the RPM base because VPP's `make install-dep` only
-> has a `rocky` branch in its RHEL-family subtree — AlmaLinux installs no deps.
+| Output | Built on (`BASE_IMAGE`) | Suite / repo | Covers |
+|--------|-------------------------|--------------|--------|
+| `.deb` | `debian:trixie-slim` | `apt … trixie` | Debian 13, Ubuntu 24.04+ (glibc ≥ 2.38) |
+| `.deb` | `debian:bookworm-slim` | `apt … bookworm` | Debian 12 |
+| `.deb` | `ubuntu:22.04` | `apt … jammy` | Ubuntu 22.04 |
+| `.rpm` | `quay.io/rockylinux/rockylinux:9` | `rpm/el9` | RHEL/Rocky/Alma/CentOS-Stream/Oracle 9 |
+| `.rpm` | `quay.io/rockylinux/rockylinux:10` | `rpm/el10` | RHEL/Rocky 10 |
+
+Built for **amd64 + arm64** on native runners (no QEMU — VPP source builds are too
+heavy to emulate). `.deb` via `build/packages/Dockerfile.deb`, `.rpm` via
+`build/packages/Dockerfile.rpm`.
+
+> Rocky (not AlmaLinux) is the RPM base because VPP's `make install-dep` only has a
+> `rocky` branch in its RHEL-family subtree — AlmaLinux installs no deps. The rpm
+> still installs across the whole el\<N\> family.
+>
+> **Evaluated and dropped:** el8 and openSUSE-Leap-15 ship Python 3.6, too old for
+> VPP 26.02's build tooling (split-interpreter `ply` / `setuptools>=61`); Fedora's
+> bleeding-edge rpm-4.20/dnf5/clang stack needs a porting-level effort that re-breaks
+> each release. el9 + el10 cover current and next RHEL. See `Dockerfile.rpm` header
+> and the per-distro fix comments for the full diagnosis.
 
 ## One-time setup (required before the first run)
 
@@ -61,12 +80,12 @@ Site URL: `https://<owner>.github.io/<repo>/`.
 `release-packages.yml`:
 
 1. **prepare** — resolve the newest stable `vYY.MM[.P]` tag (same regex as the
-   container build), build a `deb+rpm × arch` matrix, and **skip** if a
-   `pkg-v<ver>` GitHub Release already exists (idempotent).
-2. **build** — each `(kind, arch)` compiles on a native runner from the release
-   tag's source (with `build/docker`, `build/packages`, `.dockerignore` overlaid
-   from `master`), exporting packages as artifacts. No QEMU — VPP source builds
-   are too heavy to emulate.
+   container build), build a `deb×{trixie,bookworm,jammy} + rpm×{el9,el10}` × arch
+   matrix, and **skip** if a `pkg-v<ver>` GitHub Release already exists (idempotent).
+2. **build** — each `(kind, suite/el, arch)` compiles on a native runner from the
+   release tag's source (with `build/docker`, `build/packages`, `.dockerignore`
+   overlaid from `master`) using `Dockerfile.<kind>` + `BASE_IMAGE`, exporting
+   packages as artifacts. No QEMU — VPP source builds are too heavy to emulate.
 3. **publish** — import the key, **accumulate** the new packages onto whatever is
    already on `gh-pages`, regenerate signed apt (`dpkg-scanpackages` +
    `apt-ftparchive`) and yum (`createrepo_c`) metadata, push `gh-pages`, and
@@ -83,24 +102,30 @@ schedule (skips if unchanged), or manually via **Run workflow** (with optional
 
 ### Debian / Ubuntu
 
+`SUITE` = `trixie` (Debian 13 / Ubuntu 24.04+), `bookworm` (Debian 12), or `jammy` (Ubuntu 22.04).
+
 ```bash
+SUITE=trixie
 curl -fsSL https://<owner>.github.io/<repo>/vpp-archive-keyring.asc \
   | sudo gpg --dearmor -o /usr/share/keyrings/vpp-archive-keyring.gpg
 
-echo "deb [signed-by=/usr/share/keyrings/vpp-archive-keyring.gpg] https://<owner>.github.io/<repo>/apt stable main" \
+echo "deb [signed-by=/usr/share/keyrings/vpp-archive-keyring.gpg] https://<owner>.github.io/<repo>/apt $SUITE main" \
   | sudo tee /etc/apt/sources.list.d/vpp.list
 
 sudo apt-get update && sudo apt-get install vpp vpp-plugin-core
 ```
 
-### RHEL / Rocky / AlmaLinux 9
+### RHEL / Rocky / AlmaLinux
+
+`EL` = `el9` (RHEL/Rocky/Alma 9) or `el10` (RHEL/Rocky 10).
 
 ```bash
+EL=el9
 sudo rpm --import https://<owner>.github.io/<repo>/RPM-GPG-KEY-vpp
-sudo tee /etc/yum.repos.d/vpp.repo >/dev/null <<'EOF'
+sudo tee /etc/yum.repos.d/vpp.repo >/dev/null <<EOF
 [vpp]
 name=VPP packages
-baseurl=https://<owner>.github.io/<repo>/rpm/el9/$basearch
+baseurl=https://<owner>.github.io/<repo>/rpm/$EL/\$basearch
 enabled=1
 gpgcheck=1
 repo_gpgcheck=1
@@ -115,11 +140,13 @@ your actual URL and the list of available versions.
 ## Building packages locally
 
 ```bash
-# .deb (reuses the container image's builder stage)
-docker build -f build/docker/Dockerfile   --target packages \
-  --output type=local,dest=./debs --build-arg VERSION=26.02 .
+# .deb — pass the target distro as BASE_IMAGE (debian:trixie-slim / debian:bookworm-slim / ubuntu:22.04)
+docker build -f build/packages/Dockerfile.deb --target packages \
+  --build-arg BASE_IMAGE=debian:trixie-slim --build-arg VERSION=26.02 \
+  --output type=local,dest=./debs .
 
-# .rpm
+# .rpm — BASE_IMAGE = quay.io/rockylinux/rockylinux:9 or :10
 docker build -f build/packages/Dockerfile.rpm --target packages \
-  --output type=local,dest=./rpms --build-arg VERSION=26.02 .
+  --build-arg BASE_IMAGE=quay.io/rockylinux/rockylinux:9 --build-arg VERSION=26.02 \
+  --output type=local,dest=./rpms .
 ```

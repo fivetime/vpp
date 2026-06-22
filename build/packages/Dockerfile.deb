@@ -1,0 +1,74 @@
+# syntax=docker/dockerfile:1.7
+###############################################################################
+# DEB builder — build VPP .deb packages from THIS repo's source, on a
+# PARAMETERIZABLE Debian/Ubuntu base. Unlike build/docker/Dockerfile (which is
+# the container-image build and is pinned to debian:trixie-slim), this file only
+# PRODUCES packages and takes the base image as a build-arg so one Dockerfile
+# covers every apt-family suite we publish:
+#
+#   debian:trixie-slim   -> suite "trixie"   (glibc 2.41; also serves noble+)
+#   debian:bookworm-slim -> suite "bookworm" (glibc 2.36)
+#   ubuntu:22.04         -> suite "jammy"    (glibc 2.35)
+#
+# A .deb is linked against the build distro's libraries, so each suite MUST be
+# built on its own base and published under its own codename — apt then picks the
+# matching one for the user's distro.
+#
+#   docker build -f build/packages/Dockerfile.deb --target packages \
+#     --build-arg BASE_IMAGE=ubuntu:22.04 --build-arg VERSION=26.02 \
+#     --output type=local,dest=./debs .
+#
+# Builds the whole worktree via `COPY .`, so build from the repo root with a
+# .dockerignore that keeps .git (version comes from `git describe`).
+###############################################################################
+ARG BASE_IMAGE=debian:trixie-slim
+FROM ${BASE_IMAGE} AS builder
+
+ARG DEBIAN_FRONTEND=noninteractive
+ARG BUILD_TYPE="release"
+ARG MAKE_PARALLEL_JOBS="16"
+ARG VERSION="dev"
+
+# install-dep / install-ext-deps internally need these base tools.
+RUN set -eux \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+        make \
+        git \
+        sudo \
+        ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY . /vpp
+WORKDIR /vpp
+
+# Normalize a Windows checkout (CRLF -> LF, restore symlinks). No-op on Linux CI.
+RUN git -c core.autocrlf=false -c core.eol=lf -c core.symlinks=true checkout-index -f -a
+
+# Tag HEAD for version derivation when no reachable v* tag exists (local builds).
+RUN set -eux \
+    && if ! git describe --abbrev=0 --match 'v[0-9]*' >/dev/null 2>&1 ; then \
+           v="${VERSION}" ; case "$v" in dev|"") v="0.0" ;; esac ; \
+           echo "tagging HEAD as v${v} (no reachable git tag for version derivation)" ; \
+           git -c user.email=build@vpp.local -c user.name=vpp-build tag -a "v${v}" -m "v${v}" ; \
+       fi
+
+# Separate RUNs so editing pkg-deb doesn't bust the costly install-ext-deps layer.
+RUN make UNATTENDED=yes install-dep
+RUN make UNATTENDED=yes install-ext-deps
+RUN set -eux \
+    && if [ "$BUILD_TYPE" = "debug" ] ; then \
+           make UNATTENDED=yes MAKE_PARALLEL_JOBS="${MAKE_PARALLEL_JOBS}" pkg-deb-debug ; \
+       else \
+           make UNATTENDED=yes MAKE_PARALLEL_JOBS="${MAKE_PARALLEL_JOBS}" pkg-deb ; \
+       fi \
+    && mkdir -p /pkg \
+    && find build-root -maxdepth 1 -name '*.deb' -exec cp {} /pkg/ \; \
+    && ls -l /pkg
+
+###############################################################################
+# packages — .deb-only export stage. Skipped on normal builds; built only with
+# `--target packages`.
+###############################################################################
+FROM scratch AS packages
+COPY --from=builder /pkg /

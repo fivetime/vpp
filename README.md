@@ -25,24 +25,27 @@ it yourself. Built for `amd64` and `arm64`.
 
 Hosted on GitHub Pages at **<https://fivetime.github.io/vpp/>** (GPG-signed).
 
-**Debian / Ubuntu**
+**Debian / Ubuntu** — pick the `SUITE` matching your release: `trixie` (Debian 13,
+also Ubuntu 24.04+), `bookworm` (Debian 12), `jammy` (Ubuntu 22.04).
 
 ```bash
+SUITE=trixie   # or bookworm / jammy
 curl -fsSL https://fivetime.github.io/vpp/vpp-archive-keyring.asc \
   | sudo gpg --dearmor -o /usr/share/keyrings/vpp-archive-keyring.gpg
-echo "deb [signed-by=/usr/share/keyrings/vpp-archive-keyring.gpg] https://fivetime.github.io/vpp/apt stable main" \
+echo "deb [signed-by=/usr/share/keyrings/vpp-archive-keyring.gpg] https://fivetime.github.io/vpp/apt $SUITE main" \
   | sudo tee /etc/apt/sources.list.d/vpp.list
 sudo apt-get update && sudo apt-get install vpp vpp-plugin-core
 ```
 
-**RHEL / Rocky / AlmaLinux 9**
+**RHEL / Rocky / AlmaLinux** — `el9` (RHEL/Rocky/Alma 9) or `el10` (RHEL/Rocky 10).
 
 ```bash
+EL=el9   # or el10
 sudo rpm --import https://fivetime.github.io/vpp/RPM-GPG-KEY-vpp
-sudo tee /etc/yum.repos.d/vpp.repo >/dev/null <<'EOF'
+sudo tee /etc/yum.repos.d/vpp.repo >/dev/null <<EOF
 [vpp]
 name=VPP packages
-baseurl=https://fivetime.github.io/vpp/rpm/el9/$basearch
+baseurl=https://fivetime.github.io/vpp/rpm/$EL/\$basearch
 enabled=1
 gpgcheck=1
 repo_gpgcheck=1

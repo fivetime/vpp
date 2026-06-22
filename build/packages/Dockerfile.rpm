@@ -1,37 +1,47 @@
 # syntax=docker/dockerfile:1.7
 ###############################################################################
-# RPM builder — build VPP .rpm packages from THIS repo's source on Rocky Linux 9.
+# RPM builder — build VPP .rpm packages from THIS repo's source, on a
+# PARAMETERIZABLE RHEL-family base. One Dockerfile covers every yum/dnf repo we
+# publish; pass the base as a build-arg:
 #
-# Why Rocky 9 (not AlmaLinux): VPP's `make install-dep` has an explicit
-# `OS_ID=rocky` branch (Makefile) that enables the CRB + EPEL repos and installs
-# the RHEL-family build dependencies. There is NO `almalinux` branch in
-# install-dep's redhat subtree, so an AlmaLinux base would silently install no
-# deps and fail. Rocky 9 → el9 rpms (x86_64 on amd64 runners, aarch64 on arm64).
+#   quay.io/rockylinux/rockylinux:9   -> rpm/el9   (RHEL 9 family; glibc 2.34)
+#   quay.io/rockylinux/rockylinux:10  -> rpm/el10  (RHEL 10 family; glibc 2.39)
 #
-# This Dockerfile only PRODUCES packages; it builds no runtime image (the
-# container image lives in build/docker/Dockerfile). Export the rpms locally:
+# Why Rocky (not AlmaLinux): VPP's `make install-dep` has an explicit `OS_ID=rocky`
+# branch (enables CRB + EPEL); there is NO `almalinux` branch, so an AlmaLinux base
+# silently installs no deps and fails. The PRODUCED rpm still installs across the
+# whole el<N> family (Rocky/AlmaLinux/RHEL/CentOS Stream/Oracle) — only the build
+# host must be Rocky.
 #
+# Scope note: el8, Fedora and openSUSE-Leap were evaluated and dropped. el8 and
+# openSUSE-Leap-15 ship Python 3.6, too old for VPP 26.02's build tooling (ply on a
+# split interpreter / setuptools>=61); Fedora's bleeding-edge rpm/dnf5/clang stack is
+# a porting-level effort that re-breaks each release. el9 + el10 cover current and
+# next RHEL. (See git history / memory for the full diagnosis.)
+#
+# Produces packages only (no runtime image — that lives in build/docker/Dockerfile).
+# Export locally:
 #   docker build -f build/packages/Dockerfile.rpm --target packages \
-#     --output type=local,dest=./rpms --build-arg VERSION=26.02 .
-#   ls ./rpms/   # vpp-*.rpm, vpp-plugins-*.rpm, vpp-devel-*.rpm, ...
+#     --build-arg BASE_IMAGE=quay.io/rockylinux/rockylinux:10 \
+#     --build-arg VERSION=26.02 --output type=local,dest=./rpms .
 #
-# Like the deb image it does `COPY .`, so build from the repo root with a
+# Builds the whole worktree via `COPY .`, so build from the repo root with a
 # .dockerignore that keeps .git (version comes from `git describe`).
 ###############################################################################
-# quay.io avoids Docker Hub pull-rate limits on GitHub runners; image is multi-arch.
-FROM quay.io/rockylinux/rockylinux:9 AS builder
+ARG BASE_IMAGE=quay.io/rockylinux/rockylinux:9
+FROM ${BASE_IMAGE} AS builder
 
-# make 并行度 / 仅用于无 tag 时的版本回退
 ARG MAKE_PARALLEL_JOBS="16"
 ARG VERSION="dev"
 
-# install-dep / pkg-rpm 之前需要的最小工具集；其余 RHEL 构建依赖由 install-dep 装。
-# 不装真 sudo：容器内以 root 运行,但 VPP 的 install-dep 写死了 `sudo -E dnf ...`,
-# 而 Rocky 精简镜像里的 sudo 走 PAM 会失败("PAM account management error /
-# a password is required")。我们本就是 root、无需提权,用一个透传 shim 顶替 sudo:
-# 吃掉前导的 sudo 选项(-E/-H/-n...),直接 exec 后面的真实命令。
+# Bootstrap the minimal tools install-dep needs. `openssl` (CLI) is used by
+# install-ext-deps to checksum downloads (not always present on minimal images).
+# Then a passthrough `sudo` shim: VPP's install-dep runs `sudo -E dnf ...`, but the
+# minimal images' real sudo fails under PAM even as root ("a password is required" /
+# "PAM account management error"). We're already root and need no privilege
+# escalation, so the shim strips sudo flags and execs the rest.
 RUN set -eux \
-    && dnf -y install make git which python3 ca-certificates \
+    && dnf -y install make git which python3 ca-certificates openssl \
     && dnf clean all \
     && printf '#!/bin/sh\nwhile [ $# -gt 0 ]; do case "$1" in -*) shift;; *) break;; esac; done\nexec "$@"\n' \
          > /usr/local/bin/sudo \
@@ -40,22 +50,18 @@ RUN set -eux \
 COPY . /vpp
 WORKDIR /vpp
 
-# 与 build/docker/Dockerfile 相同的 Windows checkout 规范化：
-#   1) 行尾 CRLF → LF（否则 shebang 脚本错乱）
-#   2) symlinks 还原（Windows core.symlinks=false 会把 86 个符号链接变成文本文件）
-# 在 Linux CI 上 checkout 本就正确，这步是空操作；仅 Windows 本地构建需要。
+# Normalize a Windows checkout (CRLF -> LF, restore symlinks). No-op on Linux CI.
 RUN git -c core.autocrlf=false -c core.eol=lf -c core.symlinks=true checkout-index -f -a
 
-# 一步搞定「放宽 -Werror + 版本 tag」,因为 `make dist` 用 `git archive HEAD` 打 tar
-# (取的是 HEAD 的提交快照,不是工作树),所以源码改动必须 commit 进 HEAD 才会进包。
+# Drop the sole global -Werror + re-point the version tag, in one commit.
 #
-# 为什么去掉 -Werror:Rocky 9 的 clang 比 VPP 该 release 测试的工具链新,会默认打开
-# 额外诊断(如 -Wdefault-const-init-field-unsafe),把已发布、已知可编译的源码判成
-# 错误。我们是下游打包、不是开发 VPP,故移除 src 树里唯一一处(全局继承)的 -Werror,
-# 让新编译器的警告保持为警告。deb 构建用 Debian 的 clang-19、与上游匹配,不受影响。
-#
-# 版本:CI checkout 的是 release tag,describe 正常;本地无 tag 工作树用 VERSION 回退。
-# 改完 commit 会让 HEAD 前移,故把版本 tag 强制重指到新 HEAD,使 describe 仍得干净版本号。
+# `make dist` uses `git archive HEAD`, so any source change must be COMMITTED to
+# reach the tarball. We drop -Werror because newer distro clang enables extra
+# diagnostics (e.g. -Wdefault-const-init-field-unsafe) the release's tested toolchain
+# never saw, turning warnings on already-shipped code into errors. We're packaging a
+# release, not developing VPP, so silencing them is correct. Committing moves HEAD, so
+# we force-move the version tag onto the new HEAD to keep `git describe` clean. If no
+# v* tag is reachable (local build), fall back to VERSION.
 RUN set -eux \
     && v="$(git describe --tags --abbrev=0 --match 'v[0-9]*' 2>/dev/null || true)" \
     && case "$v" in v[0-9]*) v="${v#v}" ;; *) v="${VERSION}" ; case "$v" in dev|"") v="0.0" ;; esac ;; esac \
@@ -65,31 +71,63 @@ RUN set -eux \
     && git -c user.email=build@vpp.local -c user.name=vpp-build tag -fa "v${v}" -m "v${v}" \
     && git describe --tags
 
-# 拆成独立 RUN 便于 BuildKit 分层缓存（改 pkg-rpm 不会让最耗时的 ext-deps 失效）。
+# Separate RUNs so editing pkg-rpm doesn't bust the costly ext-deps layer.
 RUN make UNATTENDED=yes install-dep
+
+# vpp-ext-deps.spec runs its build via `make -C ../..` relative to the rpmbuild
+# %install cwd. Older rpm (el9, rpm 4.16) runs %install from %{_builddir}, so `../..`
+# reaches build/external. Newer rpm (rpm 4.20, e.g. Rocky 10) may nest an extra
+# `<name>-build/` dir, so `../..` would land one level short (in build/external/rpm)
+# -> "No rule to make target 'config'". Anchor it on the already-defined %{_topdir}
+# (= build/external/rpm): %{_topdir}/.. is build/external on every rpm layout.
+RUN sed -i 's#-C \.\./\.\.#-C %{_topdir}/..#' build/external/rpm/vpp-ext-deps.spec \
+    && grep -n '_make_args' build/external/rpm/vpp-ext-deps.spec
+
+# Newer distro clang (e.g. Rocky 10's clang 21) ignores the gcc-only `-specs=` flags
+# that redhat-rpm-config injects into the build flags and warns
+# -Wunused-command-line-argument. DPDK's meson probes compiler arguments WITH -Werror,
+# so those warnings become errors and meson wrongly concludes the compiler "does not
+# support -march=corei7" -> the DPDK ext-dep aborts. Strip the `-specs=` tokens from
+# the ext-deps build flags at the top of the spec's %install (clang never uses them;
+# el9 builds the same without them). A `%global` redefine would recurse, so do it in
+# shell at scriptlet runtime.
+RUN python3 - <<'PYEOF'
+p = "build/external/rpm/vpp-ext-deps.spec"
+s = open(p).read()
+strip = (
+    'export CFLAGS="$(echo "$CFLAGS" | sed \'s/-specs=[^ ]*//g\')"\n'
+    'export CXXFLAGS="$(echo "$CXXFLAGS" | sed \'s/-specs=[^ ]*//g\')"\n'
+    'export LDFLAGS="$(echo "$LDFLAGS" | sed \'s/-specs=[^ ]*//g\')"\n'
+)
+assert "%install\n" in s, "no %install in ext-deps spec"
+s = s.replace("%install\n", "%install\n" + strip, 1)
+open(p, "w").write(s)
+print(s)
+PYEOF
+
 RUN make UNATTENDED=yes install-ext-deps
 
-# 放宽 rpmbuild 的两处严格检查,适配「上游 spec 与该 release 源码文件集漂移」:
-#   1) _unpackaged_files_terminate_build=0:容忍源码新增、但 spec %files 未收录的文件
-#      (如示例程序 /usr/bin/selog_client_example),让其被丢弃而非整包失败。运行所需的
-#      vpp/插件/库都在 %files 里,丢掉的只是示例/边角文件。
-#   2) debug_package=%{nil}:跳过 debuginfo 子包。VPP 多个字节几乎相同的插件
-#      (det44 与 nat44_ei 等 test plugin)共享 build-id,会触发 ".build-id File listed
-#      twice / Duplicate build-ids" 而失败;二进制仓库本就不需要 debuginfo。
-# extras/rpm/Makefile 直接拷贝工作树里的 vpp.spec(不经 git archive),故改工作树即生效、
-# 无需 commit。两行 %global 置于 spec 顶部即对整个构建生效。
+# Relax two rpmbuild strictness checks to tolerate spec/source drift in the release
+# tree:
+#   1) _unpackaged_files_terminate_build=0: allow files present in the source but not
+#      listed in the spec's %files (e.g. /usr/bin/selog_client_example, a demo) to be
+#      dropped instead of failing the whole build.
+#   2) debug_package=%{nil}: skip the debuginfo subpackage. Byte-identical VPP test
+#      plugins (det44 vs nat44_ei) share a build-id and trip "Duplicate build-ids".
+# extras/rpm/Makefile reads vpp.spec straight from the worktree (not git archive),
+# so editing the worktree spec is enough — no commit needed.
 RUN sed -i '1i %global _unpackaged_files_terminate_build 0\n%global debug_package %{nil}' extras/rpm/vpp.spec \
     && head -3 extras/rpm/vpp.spec
 
 RUN set -eux \
     && make UNATTENDED=yes MAKE_PARALLEL_JOBS="${MAKE_PARALLEL_JOBS}" pkg-rpm \
-    # 收拢产出的 .rpm 到干净目录，方便导出（排除 src.rpm/debuginfo 由 spec 决定）
     && mkdir -p /pkg \
     && find build-root -maxdepth 1 -name '*.rpm' -exec cp {} /pkg/ \; \
     && ls -l /pkg
 
 ###############################################################################
-# packages —— 仅含 .rpm 的导出阶段。普通构建会被跳过，仅 `--target packages` 时构建。
+# packages — .rpm-only export stage. Skipped on normal builds; built only with
+# `--target packages`.
 ###############################################################################
 FROM scratch AS packages
 COPY --from=builder /pkg /

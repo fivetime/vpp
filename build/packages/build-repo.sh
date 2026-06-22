@@ -4,20 +4,26 @@
 # from the packages in $INCOMING_DIR, accumulating on top of whatever is already
 # published (the caller checks out the existing gh-pages tree into $SITE_DIR).
 #
-# The repos are fully reproducible from the package pool — no stateful DB:
-#   apt: dpkg-scanpackages (per-arch Packages) + apt-ftparchive (signed Release)
-#   yum: createrepo_c over the pool + detached-signed repomd.xml
-# so re-running over the accumulated pool always yields a correct, signed repo.
+# Multi-suite / multi-distro: a .deb/.rpm is linked against its build distro's
+# libraries, so each distro is published under its own apt SUITE (by codename) or
+# yum el<N> tree, and apt/dnf then pick the one matching the user's distro.
+#
+#   apt: per-suite pool + dists/<suite> via dpkg-scanpackages + apt-ftparchive
+#        (signed InRelease/Release.gpg)
+#   yum: per-el<N>/<arch> via createrepo_c + detached-signed repomd.xml
+#
+# Everything is rebuilt from the package pool — no stateful DB — so re-running over
+# the accumulated pool always yields a correct, signed repo.
 #
 # Required env:
 #   SITE_DIR      gh-pages working tree (output root, served by GitHub Pages)
-#   INCOMING_DIR  has deb/*.deb and rpm/<rpm_arch>/*.rpm (e.g. rpm/x86_64/...)
+#   INCOMING_DIR  has deb/<suite>/*.deb and rpm/<elver>/<rpm_arch>/*.rpm
 #   GPG_KEY_ID    fingerprint/key id of the imported signing key
 #   REPO_URL      public base URL, e.g. https://owner.github.io/repo
 # Optional env:
-#   GPG_PASSPHRASE, SUITE(=stable), COMPONENT(=main),
-#   ARCHES_DEB(="amd64 arm64"), ARCHES_RPM(="x86_64 aarch64"),
-#   ORIGIN, LABEL
+#   GPG_PASSPHRASE,
+#   SUITES(="trixie bookworm jammy"), EL_VERS(="el9 el10"), COMPONENT(=main),
+#   ARCHES_DEB(="amd64 arm64"), ARCHES_RPM(="x86_64 aarch64"), ORIGIN, LABEL
 ###############################################################################
 set -euo pipefail
 
@@ -27,7 +33,8 @@ KEYID="${GPG_KEY_ID:?set GPG_KEY_ID}"
 REPO_URL="${REPO_URL:?set REPO_URL, e.g. https://owner.github.io/repo}"
 REPO_URL="${REPO_URL%/}"
 
-SUITE="${SUITE:-stable}"
+SUITES="${SUITES:-trixie bookworm jammy}"
+EL_VERS="${EL_VERS:-el9 el10}"
 COMPONENT="${COMPONENT:-main}"
 ARCHES_DEB="${ARCHES_DEB:-amd64 arm64}"
 ARCHES_RPM="${ARCHES_RPM:-x86_64 aarch64}"
@@ -61,28 +68,30 @@ copy_pkg() {  # copy_pkg <dest_dir> <file>
 }
 
 ###############################################################################
-# APT repository:  <site>/apt/{pool/main, dists/<suite>/main/binary-<arch>}
+# APT:  <site>/apt/{pool/<suite>/main, dists/<suite>/main/binary-<arch>}
+# One independent pool + dists per suite (codename), since the same package
+# name/version is a DIFFERENT binary per distro.
 ###############################################################################
-echo "==> apt: assembling pool + metadata"
 apt_root="$SITE/apt"
-pool="$apt_root/pool/$COMPONENT"
-mkdir -p "$pool"
-if compgen -G "$INCOMING/deb/*.deb" >/dev/null; then
-  for f in "$INCOMING"/deb/*.deb; do copy_pkg "$pool" "$f"; done
-fi
+for suite in $SUITES; do
+  pool="$apt_root/pool/$suite/$COMPONENT"
+  mkdir -p "$pool"
+  if compgen -G "$INCOMING/deb/$suite/*.deb" >/dev/null; then
+    echo "==> apt[$suite]: adding $(ls "$INCOMING/deb/$suite"/*.deb | wc -l) incoming .deb"
+    for f in "$INCOMING/deb/$suite"/*.deb; do copy_pkg "$pool" "$f"; done
+  fi
+  compgen -G "$pool/*.deb" >/dev/null || { echo "   (apt[$suite]: empty, skipping)"; continue; }
 
-if compgen -G "$pool/*.deb" >/dev/null; then
   ( cd "$apt_root"
     for arch in $ARCHES_DEB; do
-      bindir="dists/$SUITE/$COMPONENT/binary-$arch"
+      bindir="dists/$suite/$COMPONENT/binary-$arch"
       mkdir -p "$bindir"
-      # -a <arch> keeps this arch + Architecture:all packages; paths stay
-      # relative to apt_root (pool/main/...), which is what apt expects.
-      dpkg-scanpackages -a "$arch" "pool/$COMPONENT" > "$bindir/Packages" 2>/dev/null
+      # -a <arch> keeps this arch + Architecture:all; paths stay relative to apt_root.
+      dpkg-scanpackages -a "$arch" "pool/$suite/$COMPONENT" > "$bindir/Packages" 2>/dev/null
       gzip -9kf "$bindir/Packages"
       cat > "$bindir/Release" <<EOF
-Archive: $SUITE
-Suite: $SUITE
+Archive: $suite
+Suite: $suite
 Component: $COMPONENT
 Origin: $ORIGIN
 Label: $LABEL
@@ -94,28 +103,26 @@ EOF
     cat > "$relconf" <<EOF
 APT::FTPArchive::Release::Origin "$ORIGIN";
 APT::FTPArchive::Release::Label "$LABEL";
-APT::FTPArchive::Release::Suite "$SUITE";
-APT::FTPArchive::Release::Codename "$SUITE";
+APT::FTPArchive::Release::Suite "$suite";
+APT::FTPArchive::Release::Codename "$suite";
 APT::FTPArchive::Release::Architectures "$ARCHES_DEB";
 APT::FTPArchive::Release::Components "$COMPONENT";
-APT::FTPArchive::Release::Description "$ORIGIN";
+APT::FTPArchive::Release::Description "$ORIGIN ($suite)";
 EOF
-    apt-ftparchive -c="$relconf" release "dists/$SUITE" > "dists/$SUITE/Release"
+    apt-ftparchive -c="$relconf" release "dists/$suite" > "dists/$suite/Release"
     rm -f "$relconf"
 
     # InRelease (inline sig) + Release.gpg (detached) — apt accepts either.
-    rm -f "dists/$SUITE/InRelease" "dists/$SUITE/Release.gpg"
-    gpg_sign --clearsign  -o "dists/$SUITE/InRelease"   "dists/$SUITE/Release"
-    gpg_sign --detach-sign -a -o "dists/$SUITE/Release.gpg" "dists/$SUITE/Release"
+    rm -f "dists/$suite/InRelease" "dists/$suite/Release.gpg"
+    gpg_sign --clearsign  -o "dists/$suite/InRelease"   "dists/$suite/Release"
+    gpg_sign --detach-sign -a -o "dists/$suite/Release.gpg" "dists/$suite/Release"
   )
-else
-  echo "   (no .deb in pool yet — skipping apt metadata)"
-fi
+  echo "   apt[$suite]: signed"
+done
 
 ###############################################################################
-# YUM repository:  <site>/rpm/el9/<basearch>/{*.rpm, repodata/}
+# YUM:  <site>/rpm/<elver>/<basearch>/{*.rpm, repodata/}
 ###############################################################################
-echo "==> yum: signing rpms + repodata"
 # rpm --addsign drives gpg through these macros; loopback passes the passphrase.
 {
   echo "%_signature gpg"
@@ -127,20 +134,24 @@ echo "==> yum: signing rpms + repodata"
   fi
 } > "$HOME/.rpmmacros"
 
-for arch in $ARCHES_RPM; do
-  d="$SITE/rpm/el9/$arch"
-  mkdir -p "$d"
-  if compgen -G "$INCOMING/rpm/$arch/*.rpm" >/dev/null; then
-    for f in "$INCOMING/rpm/$arch"/*.rpm; do copy_pkg "$d" "$f"; done
-  fi
-  if compgen -G "$d/*.rpm" >/dev/null; then
-    rpm --addsign "$d"/*.rpm            # re-signing is idempotent
-    createrepo_c --update "$d"
-    rm -f "$d/repodata/repomd.xml.asc"
-    gpg_sign --detach-sign -a "$d/repodata/repomd.xml"   # repo_gpgcheck=1 gate
-  else
-    echo "   ($arch: no .rpm yet — skipping)"
-  fi
+for elver in $EL_VERS; do
+  for arch in $ARCHES_RPM; do
+    d="$SITE/rpm/$elver/$arch"
+    mkdir -p "$d"
+    if compgen -G "$INCOMING/rpm/$elver/$arch/*.rpm" >/dev/null; then
+      echo "==> yum[$elver/$arch]: adding $(ls "$INCOMING/rpm/$elver/$arch"/*.rpm | wc -l) incoming .rpm"
+      for f in "$INCOMING/rpm/$elver/$arch"/*.rpm; do copy_pkg "$d" "$f"; done
+    fi
+    if compgen -G "$d/*.rpm" >/dev/null; then
+      rpm --addsign "$d"/*.rpm            # re-signing is idempotent
+      createrepo_c --update "$d"
+      rm -f "$d/repodata/repomd.xml.asc"
+      gpg_sign --detach-sign -a "$d/repodata/repomd.xml"   # repo_gpgcheck=1 gate
+      echo "   yum[$elver/$arch]: signed"
+    else
+      echo "   (yum[$elver/$arch]: empty, skipping)"
+    fi
+  done
 done
 
 ###############################################################################
@@ -151,11 +162,18 @@ gpg --batch --export --armor "$KEYID" > "$SITE/vpp-archive-keyring.asc"
 cp "$SITE/vpp-archive-keyring.asc" "$SITE/RPM-GPG-KEY-vpp"   # conventional rpm name
 touch "$SITE/.nojekyll"                                       # serve _/dotted paths verbatim
 
-# Distinct VPP versions currently in the apt pool (for display only).
-versions="$(ls "$pool"/vpp_*.deb 2>/dev/null | sed -E 's#.*/vpp_([^_]+)_.*#\1#' | sort -uV || true)"
+# Distinct VPP versions currently in any apt pool (for display only).
+versions="$(ls "$apt_root"/pool/*/"$COMPONENT"/vpp_*.deb 2>/dev/null | sed -E 's#.*/vpp_([^_]+)_.*#\1#' | sort -uV || true)"
 ver_items=""
 for v in $versions; do ver_items="${ver_items}<li><code>${v}</code></li>"; done
 [ -z "$ver_items" ] && ver_items="<li>(none yet)</li>"
+
+# Per-suite apt snippet (first suite shown inline; the rest listed as alternatives).
+apt_suite_list=""
+for s in $SUITES; do apt_suite_list="${apt_suite_list}<code>${s}</code> "; done
+default_suite="$(echo $SUITES | awk '{print $1}')"
+el_list=""
+for e in $EL_VERS; do el_list="${el_list}<code>${e}</code> "; done
 
 cat > "$SITE/index.html" <<EOF
 <!doctype html>
@@ -163,7 +181,7 @@ cat > "$SITE/index.html" <<EOF
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>VPP packages (apt / yum)</title>
 <style>
- body{font:15px/1.5 system-ui,sans-serif;max-width:820px;margin:2.5rem auto;padding:0 1rem;color:#1a1a1a}
+ body{font:15px/1.5 system-ui,sans-serif;max-width:860px;margin:2.5rem auto;padding:0 1rem;color:#1a1a1a}
  h1{margin-bottom:.2rem} h2{margin-top:2rem;border-bottom:1px solid #eee;padding-bottom:.3rem}
  code,pre{font-family:ui-monospace,Menlo,Consolas,monospace}
  pre{background:#0d1117;color:#e6edf3;padding:1rem;border-radius:8px;overflow:auto}
@@ -174,23 +192,29 @@ cat > "$SITE/index.html" <<EOF
 signed apt &amp; yum repositories. Built for <code>amd64</code> and <code>arm64</code>.</p>
 
 <h2>Debian / Ubuntu (apt)</h2>
+<p>Pick the <b>suite</b> matching your release — available: ${apt_suite_list}<br>
+<span class="muted">${default_suite}=Debian&nbsp;13, bookworm=Debian&nbsp;12, jammy=Ubuntu&nbsp;22.04.
+Ubuntu&nbsp;24.04+ works with <code>${default_suite}</code>.</span></p>
 <pre>curl -fsSL $REPO_URL/vpp-archive-keyring.asc \\
   | sudo gpg --dearmor -o /usr/share/keyrings/vpp-archive-keyring.gpg
 
-echo "deb [signed-by=/usr/share/keyrings/vpp-archive-keyring.gpg] $REPO_URL/apt $SUITE $COMPONENT" \\
+# replace ${default_suite} with your suite from the list above
+echo "deb [signed-by=/usr/share/keyrings/vpp-archive-keyring.gpg] $REPO_URL/apt ${default_suite} $COMPONENT" \\
   | sudo tee /etc/apt/sources.list.d/vpp.list
 
 sudo apt-get update
 sudo apt-get install vpp vpp-plugin-core</pre>
-<p class="muted">Built on Debian 13 (trixie); compatible glibc-based distros work too.</p>
 
-<h2>RHEL / Rocky / AlmaLinux 9 (yum/dnf)</h2>
+<h2>RHEL / Rocky / AlmaLinux (yum/dnf)</h2>
+<p>Available: ${el_list}<span class="muted">(el9 = RHEL/Rocky/Alma 9, el10 = RHEL/Rocky 10).</span></p>
 <pre>sudo rpm --import $REPO_URL/RPM-GPG-KEY-vpp
 
-sudo tee /etc/yum.repos.d/vpp.repo >/dev/null <<'REPO'
+# set EL to your major version: el9 or el10
+EL=el9
+sudo tee /etc/yum.repos.d/vpp.repo >/dev/null <<REPO
 [vpp]
 name=VPP packages
-baseurl=$REPO_URL/rpm/el9/\$basearch
+baseurl=$REPO_URL/rpm/\$EL/\\\$basearch
 enabled=1
 gpgcheck=1
 repo_gpgcheck=1
@@ -198,13 +222,12 @@ gpgkey=$REPO_URL/RPM-GPG-KEY-vpp
 REPO
 
 sudo dnf install vpp vpp-plugins</pre>
-<p class="muted">Built on Rocky Linux 9 (el9).</p>
 
 <h2>Available versions</h2>
 <ul>$ver_items</ul>
 
 <p class="muted">Signing key: <a href="$REPO_URL/vpp-archive-keyring.asc">vpp-archive-keyring.asc</a>
-&middot; key id <code>$KEYID</code>. Per-version package files are also attached to the
+&middot; key id <code>$KEYID</code>. Per-version package files (incl. debug) are also attached to the
 <a href="https://github.com/${GITHUB_REPOSITORY:-fivetime/vpp}/releases">GitHub Releases</a>.</p>
 </body></html>
 EOF

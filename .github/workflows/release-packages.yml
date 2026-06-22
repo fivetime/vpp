@@ -84,11 +84,21 @@ jobs:
           fi
 
           # 构建矩阵:deb+rpm × 选定架构。原生 runner(VPP 源码构建很重,不用 QEMU)。
+          # 每个发行版按自身 glibc/ABI 单独构建并发布到对应 suite(apt,按代号)或
+          # el<N>(yum)。Dockerfile 用 BASE_IMAGE 参数化:deb->Dockerfile.deb,
+          # rpm->Dockerfile.rpm。原生 runner(VPP 源码构建很重,不用 QEMU)。
+          # 砍掉的目标见 Dockerfile.rpm 头注释(el8/fedora/opensuse:python/工具链不匹配)。
           all='[
-            {"kind":"deb","arch":"amd64","platform":"linux/amd64","runner":"ubuntu-latest","file":"build/docker/Dockerfile"},
-            {"kind":"deb","arch":"arm64","platform":"linux/arm64","runner":"ubuntu-24.04-arm","file":"build/docker/Dockerfile"},
-            {"kind":"rpm","arch":"amd64","platform":"linux/amd64","runner":"ubuntu-latest","file":"build/packages/Dockerfile.rpm"},
-            {"kind":"rpm","arch":"arm64","platform":"linux/arm64","runner":"ubuntu-24.04-arm","file":"build/packages/Dockerfile.rpm"}
+            {"kind":"deb","id":"trixie","base":"debian:trixie-slim","arch":"amd64","platform":"linux/amd64","runner":"ubuntu-latest"},
+            {"kind":"deb","id":"trixie","base":"debian:trixie-slim","arch":"arm64","platform":"linux/arm64","runner":"ubuntu-24.04-arm"},
+            {"kind":"deb","id":"bookworm","base":"debian:bookworm-slim","arch":"amd64","platform":"linux/amd64","runner":"ubuntu-latest"},
+            {"kind":"deb","id":"bookworm","base":"debian:bookworm-slim","arch":"arm64","platform":"linux/arm64","runner":"ubuntu-24.04-arm"},
+            {"kind":"deb","id":"jammy","base":"ubuntu:22.04","arch":"amd64","platform":"linux/amd64","runner":"ubuntu-latest"},
+            {"kind":"deb","id":"jammy","base":"ubuntu:22.04","arch":"arm64","platform":"linux/arm64","runner":"ubuntu-24.04-arm"},
+            {"kind":"rpm","id":"el9","base":"quay.io/rockylinux/rockylinux:9","arch":"amd64","platform":"linux/amd64","runner":"ubuntu-latest"},
+            {"kind":"rpm","id":"el9","base":"quay.io/rockylinux/rockylinux:9","arch":"arm64","platform":"linux/arm64","runner":"ubuntu-24.04-arm"},
+            {"kind":"rpm","id":"el10","base":"quay.io/rockylinux/rockylinux:10","arch":"amd64","platform":"linux/amd64","runner":"ubuntu-latest"},
+            {"kind":"rpm","id":"el10","base":"quay.io/rockylinux/rockylinux:10","arch":"arm64","platform":"linux/arm64","runner":"ubuntu-24.04-arm"}
           ]'
           p="${{ inputs.platforms }}"; [ -z "$p" ] && p=all
           case "$p" in
@@ -111,7 +121,7 @@ jobs:
   build:
     needs: prepare
     if: needs.prepare.outputs.skip != 'true'
-    name: build ${{ matrix.kind }}/${{ matrix.arch }}
+    name: build ${{ matrix.kind }}/${{ matrix.id }}/${{ matrix.arch }}
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -139,23 +149,25 @@ jobs:
 
       - uses: docker/setup-buildx-action@v3
 
-      - name: Build packages (${{ matrix.kind }}/${{ matrix.arch }})
+      - name: Build packages (${{ matrix.kind }}/${{ matrix.id }}/${{ matrix.arch }})
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: ${{ matrix.file }}
+          # deb -> build/packages/Dockerfile.deb, rpm -> build/packages/Dockerfile.rpm
+          file: build/packages/Dockerfile.${{ matrix.kind }}
           target: packages
           platforms: ${{ matrix.platform }}
           # 只导出包,不出镜像、不 push。
           outputs: type=local,dest=out
           build-args: |
+            BASE_IMAGE=${{ matrix.base }}
             VERSION=${{ needs.prepare.outputs.version }}
-          cache-from: type=gha,scope=pkg-${{ matrix.kind }}-${{ matrix.arch }}
-          cache-to: type=gha,mode=max,scope=pkg-${{ matrix.kind }}-${{ matrix.arch }}
+          cache-from: type=gha,scope=pkg-${{ matrix.kind }}-${{ matrix.id }}-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=pkg-${{ matrix.kind }}-${{ matrix.id }}-${{ matrix.arch }}
 
       - uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.kind }}-${{ matrix.arch }}
+          name: ${{ matrix.kind }}-${{ matrix.id }}-${{ matrix.arch }}
           path: out/*.${{ matrix.kind }}
           if-no-files-found: error
           retention-days: 3
@@ -200,25 +212,31 @@ jobs:
           echo "keyid=$keyid" >> "$GITHUB_OUTPUT"
           echo "imported key $keyid"
 
-      - name: Download deb artifacts
+      - name: Download all package artifacts
         uses: actions/download-artifact@v4
         with:
-          path: dl-deb
-          pattern: deb-*
-          merge-multiple: true       # 各架构 .deb 摊平到一个目录
-      - name: Download rpm artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: dl-rpm
-          pattern: rpm-*             # 不合并:保留 rpm-amd64/ rpm-arm64/ 子目录
+          path: dl                  # 每个 artifact 落到 dl/<name>/ (deb-<suite>-<arch>, rpm-<elver>-<arch>)
 
-      - name: Arrange incoming packages
+      - name: Arrange incoming packages (per suite / per el<N>+arch)
         run: |
           set -eux
-          mkdir -p incoming/deb incoming/rpm/x86_64 incoming/rpm/aarch64
-          cp dl-deb/*.deb            incoming/deb/          2>/dev/null || true
-          cp dl-rpm/rpm-amd64/*.rpm  incoming/rpm/x86_64/   2>/dev/null || true
-          cp dl-rpm/rpm-arm64/*.rpm  incoming/rpm/aarch64/  2>/dev/null || true
+          # deb-<suite>-<arch> -> incoming/deb/<suite>/  (两个架构合到同一 suite 目录,
+          # dpkg-scanpackages -a <arch> 再按架构筛)
+          for d in dl/deb-*; do
+            [ -d "$d" ] || continue
+            suite=$(basename "$d" | cut -d- -f2)
+            mkdir -p "incoming/deb/$suite"
+            cp "$d"/*.deb "incoming/deb/$suite/" 2>/dev/null || true
+          done
+          # rpm-<elver>-<arch> -> incoming/rpm/<elver>/<rpm_arch>/  (amd64->x86_64, arm64->aarch64)
+          for d in dl/rpm-*; do
+            [ -d "$d" ] || continue
+            elver=$(basename "$d" | cut -d- -f2)
+            arch=$(basename "$d" | cut -d- -f3)
+            case "$arch" in amd64) ra=x86_64;; arm64) ra=aarch64;; *) ra="$arch";; esac
+            mkdir -p "incoming/rpm/$elver/$ra"
+            cp "$d"/*.rpm "incoming/rpm/$elver/$ra/" 2>/dev/null || true
+          done
           find incoming -type f | sort
 
       - name: Fetch existing gh-pages tree (accumulate)
@@ -237,6 +255,8 @@ jobs:
           INCOMING_DIR: incoming
           GPG_KEY_ID: ${{ steps.gpg.outputs.keyid }}
           GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+          SUITES: "trixie bookworm jammy"   # apt suites, keep in sync with prepare matrix
+          EL_VERS: "el9 el10"               # yum el<N> repos, keep in sync with prepare matrix
         run: |
           # owner.github.io/repo — computed from GITHUB_REPOSITORY so it's correct
           # on every event (github.event.repository.* is empty on schedule).
@@ -273,7 +293,8 @@ jobs:
           base="https://${GITHUB_REPOSITORY%%/*}.github.io/${GITHUB_REPOSITORY#*/}"
           {
             echo "## Published VPP ${VERSION}"
-            echo "- apt: \`deb [signed-by=…] ${base}/apt stable main\`"
-            echo "- yum: \`${base}/rpm/el9/\$basearch\`"
+            echo "- apt suites: \`trixie\` (Debian 13 / Ubuntu 24.04+), \`bookworm\` (Debian 12), \`jammy\` (Ubuntu 22.04)"
+            echo "  - e.g. \`deb [signed-by=…] ${base}/apt trixie main\`"
+            echo "- yum: \`${base}/rpm/el9/\$basearch\` and \`${base}/rpm/el10/\$basearch\`"
             echo "- Release: pkg-${TAG}"
           } >> "$GITHUB_STEP_SUMMARY"
