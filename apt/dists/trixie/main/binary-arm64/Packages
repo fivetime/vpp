@@ -6,10 +6,10 @@ Maintainer: fd.io VPP Packaging Team <vpp-dev@fd.io>
 Installed-Size: 592
 Depends: libc6 (>= 2.38), libunwind8
 Filename: pool/trixie/main/libvppinfra_26.02-release_arm64.deb
-Size: 162528
-MD5sum: a3d8241ced3bd5503ec3f94229bbc8c7
-SHA1: dd9cd02f6addd903d5858964f733cc0a518ed36f
-SHA256: 0df26086afef1d3a9b6e4b3c5c425fd30fb22a255f7f606357fa4f5d733bd8ba
+Size: 162708
+MD5sum: 201527cfe494255f74e4a883ff090420
+SHA1: adc26aba9e90581984cf55a3c403e8d6d371395c
+SHA256: 5bb0daa53a34fb82c78fdd11f8087329da1afde46558f78d353e40d88b04ed7e
 Section: net
 Priority: extra
 Description: Vector Packet Processing--runtime libraries
@@ -22,10 +22,10 @@ Architecture: arm64
 Maintainer: fd.io VPP Packaging Team <vpp-dev@fd.io>
 Installed-Size: 948
 Filename: pool/trixie/main/libvppinfra-dev_26.02-release_arm64.deb
-Size: 163400
-MD5sum: 12cbef164c457e1f9bdb70ae8112bb11
-SHA1: eefe65380b2f308b20c983bc4d33afea4c41b1da
-SHA256: 40977a0e774dd08c6fb694744be5f39bf25e55e3688278eb07dc53739c82f89a
+Size: 163368
+MD5sum: 6755bc48dc64424640d4b05c12da0b3a
+SHA1: 5b4c07883855e9b3f185661d799f624260c98ca6
+SHA256: 0bdab4c5e27e736c7c97c7b2c182549796a978f915bb16b40783b32e078ce05c
 Section: net
 Priority: extra
 Description: Vector Packet Processing--runtime libraries
@@ -39,10 +39,10 @@ Maintainer: fd.io VPP Packaging Team <vpp-dev@fd.io>
 Installed-Size: 239
 Depends: vpp (= 26.02-release), python3:any
 Filename: pool/trixie/main/python3-vpp-api_26.02-release_arm64.deb
-Size: 36300
-MD5sum: 135d0aea8e190e65d1cad5eac93b96f0
-SHA1: b5654d00b87868f186165d1d2c021a0b068f66ab
-SHA256: ee8f0023181001a4dd6f8369082feef00fe1fb8e8539cfcb407c5ecabb82b6bd
+Size: 36296
+MD5sum: 91d6d787f2680fb143329562c3a39932
+SHA1: 5f55dbcdc6b40ff4b039d0d2469e7b3350cb9b53
+SHA256: ff6241153af6d07b9f9d916267211b8d82528a68aa9237886d7dfeb90655d0f5
 Section: net
 Priority: extra
 Description: VPP Python3 API bindings
@@ -55,10 +55,10 @@ Maintainer: fd.io VPP Packaging Team <vpp-dev@fd.io>
 Installed-Size: 42919
 Depends: libvppinfra (= 26.02-release), libc6 (>= 2.38), libnl-3-200 (>= 3.2.7), libnl-route-3-200 (>= 3.2.26), libssl3t64 (>= 3.0.0), libunwind8
 Filename: pool/trixie/main/vpp_26.02-release_arm64.deb
-Size: 4587788
-MD5sum: 7f65fd7dbdc4240125f329b1ec83b5e4
-SHA1: 1ec0eac7c5ddb69e6dbe37a007af8d06cde369e2
-SHA256: 79fb5fbf2561b18c4af39113955caf59e22199681868ed0b65cdb6011dd911ee
+Size: 4587620
+MD5sum: db64ab7df19ea3938fc7a1adc92e01f5
+SHA1: b56bc158ff1af603293ed3a080d2467391b6a091
+SHA256: ad6352f66ac4421fb6b781379c81f30dbed7255e3be4dba4279ac38a21b24dec
 Section: net
 Priority: extra
 Description: Vector Packet Processing--executables
@@ -75,10 +75,10 @@ Maintainer: fd.io VPP Packaging Team <vpp-dev@fd.io>
 Installed-Size: 919
 Depends: vpp (= 26.02-release), libc6 (>= 2.17), libssl3t64 (>= 3.0.0)
 Filename: pool/trixie/main/vpp-crypto-engines_26.02-release_arm64.deb
-Size: 114064
-MD5sum: a3e0bdf924f19cc884f9f9250c3fd47b
-SHA1: 5349548aa621a87626875c48a6ac32bcc039484f
-SHA256: aab92974a341ae05206453a568531371fb70073b6a9340de2b02bcb10198e751
+Size: 114112
+MD5sum: 5a70c737afd2764c7e676fdedcc86627
+SHA1: 0d29da17c8b19fdc6ac152635841e503375002f8
+SHA256: 5b2ac1dc9bb07988758b637ba96731b9b446bcde8d296d464c0959dfd4abe8e7
 Section: net
 Priority: extra
 Description: Vector Packet Processing--runtime crypto engines
@@ -92,10 +92,10 @@ Maintainer: fd.io VPP Packaging Team <vpp-dev@fd.io>
 Installed-Size: 21905
 Depends: libvppinfra-dev (= 26.02-release)
 Filename: pool/trixie/main/vpp-dev_26.02-release_arm64.deb
-Size: 1512304
-MD5sum: 65883167eb1ad1e638f0ec83d101a8d4
-SHA1: 987b0399c3c4d49744a4ada540f54e4c3e90c937
-SHA256: c3c0dbe50084bf21ef81b45c196638a27232f1d4d759e6025f783f61c090adc2
+Size: 1512168
+MD5sum: db87eae4619f4a945d2d08b40c3d47d9
+SHA1: f1920ffc6d836f269342f3ad642017e58c1d3594
+SHA256: 4c6bd7393de595f0ff3713a67c7d5b9d0328931c506fe35b0212f38daa069bc5
 Section: net
 Priority: extra
 Description: Vector Packet Processing--development support
@@ -109,10 +109,10 @@ Maintainer: fd.io VPP Packaging Team <vpp-dev@fd.io>
 Installed-Size: 1620
 Depends: vpp (= 26.02-release), libc6 (>= 2.17)
 Filename: pool/trixie/main/vpp-drivers_26.02-release_arm64.deb
-Size: 175624
-MD5sum: 61a0dc19fe841889351815883714e05b
-SHA1: 39ae575a070ef22fde7fec9e21eeb79cde537972
-SHA256: 0cc2155772b74365408a81164826eec4e65e127b21f9dbe533e656d89e8f6884
+Size: 175676
+MD5sum: f64e49fe9e78ca60add6348f5d527e54
+SHA1: 27dc7afd0521d40a3640463416c1f5b54d5749be
+SHA256: 3e85778dcd80bb932b363024b4bbb81ebcb23d682b3d45277ec9b8ca35c626b2
 Section: net
 Priority: extra
 Description: Vector Packet Processing--runtime device drivers
@@ -126,10 +126,10 @@ Maintainer: fd.io VPP Packaging Team <vpp-dev@fd.io>
 Installed-Size: 30191
 Depends: vpp (= 26.02-release), libc6 (>= 2.38), libelf1t64 (>= 0.144), libnl-3-200 (>= 3.2.21), libnl-route-3-200 (>= 3.7.0), libpcap0.8t64 (>= 1.0.0), libssl3t64 (>= 3.0.0), libunwind8, libvppinfra, zlib1g (>= 1:1.2.3.4)
 Filename: pool/trixie/main/vpp-plugin-core_26.02-release_arm64.deb
-Size: 4066264
-MD5sum: 5b1455d9077a774adc6b4ce12c0e0ae9
-SHA1: 16662ad5b785e1e243dd8b3b67f994f0611f9a97
-SHA256: 8e81046adf0fa7f359c4e641a1ca7794a53fe610165cdf24839110f7b9cc6058
+Size: 4065504
+MD5sum: cb559de8ae7201ed54389050a7cd30b5
+SHA1: 588fb6791fe0767d61cebb97d0316a31f7e2f601
+SHA256: 1c56ea29d597099b42644eff5f821927f18882411de5d8e308ec17aa0ceb9136
 Section: net
 Priority: extra
 Description: Vector Packet Processing--runtime core plugins
@@ -143,10 +143,10 @@ Maintainer: fd.io VPP Packaging Team <vpp-dev@fd.io>
 Installed-Size: 1645
 Depends: vpp (= 26.02-release), libc6 (>= 2.34), libunwind8, libvppinfra
 Filename: pool/trixie/main/vpp-plugin-devtools_26.02-release_arm64.deb
-Size: 282740
-MD5sum: 223165bf3bf860099b1c2f63c63285b3
-SHA1: 29a34f485b6c76b25fee6b3491493cdff5211bd0
-SHA256: 7f8ee9244fc157ab89c04b82bb18c179891135409b30a721fb2258871b98236e
+Size: 282688
+MD5sum: 1572ee51145ec622d8c7943d91e38c36
+SHA1: 82eaa479c55793b99e2693481268eabc1ff8b42c
+SHA256: d219e4376941254577f10e5b451a496efb70335364ac740e7bf8637eccf57d65
 Section: net
 Priority: extra
 Description: Vector Packet Processing--runtime developer tool plugins
@@ -160,10 +160,10 @@ Maintainer: fd.io VPP Packaging Team <vpp-dev@fd.io>
 Installed-Size: 16513
 Depends: vpp (= 26.02-release), libc6 (>= 2.38), libnuma1 (>= 2.0.11), libssl3t64 (>= 3.0.0)
 Filename: pool/trixie/main/vpp-plugin-dpdk_26.02-release_arm64.deb
-Size: 3962832
-MD5sum: 27d7b9349f0713bd90e7d8ad33f358a5
-SHA1: a8b2e47df6edce4e0c1b4b46f0dc1452cd569512
-SHA256: 10f1b151dd6b317c1e6f7969b194c4fcb48b3885ab45cde03e6844f83e552b00
+Size: 3962904
+MD5sum: 00462ae7153dd158769cd5f7232fb5ed
+SHA1: 7c6b4d10cf4a3bd77dc075bfea271184b419b605
+SHA256: 78952249509162109fa2efa2cab3b20b6ea7321c66ea9f50dd229ba86d3fb63d
 Section: net
 Priority: extra
 Description: Vector Packet Processing--runtime dpdk plugin
