@@ -1,0 +1,6 @@
+Archive: bookworm
+Suite: bookworm
+Component: main
+Origin: VPP community packages
+Label: VPP
+Architecture: arm64
