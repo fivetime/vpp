@@ -291,12 +291,22 @@ jobs:
           git push "$url" HEAD:gh-pages
 
       - name: Attach packages to GitHub Release
+        # Secondary to the apt/yum repos (already pushed to gh-pages above) — this only
+        # offers the raw files for direct download, so never fail publish on it.
+        continue-on-error: true
         run: |
-          set -euo pipefail
+          set -uo pipefail
           files=$(find incoming -type f \( -name '*.deb' -o -name '*.rpm' \))
           base="https://${GITHUB_REPOSITORY%%/*}.github.io/${GITHUB_REPOSITORY#*/}"
           if gh release view "pkg-${TAG}" >/dev/null 2>&1; then
-            gh release upload "pkg-${TAG}" $files --clobber
+            # Delete existing same-name assets first, then upload fresh. `gh release
+            # upload --clobber` deletes-by-id and aborts with HTTP 404 if an asset id is
+            # stale (e.g. left over from an interrupted run); delete-by-name is tolerant.
+            for f in $files; do
+              gh release delete-asset "pkg-${TAG}" "$(basename "$f")" -y 2>/dev/null || true
+            done
+            gh release upload "pkg-${TAG}" $files \
+              || echo "::warning::some release assets did not upload — the apt/yum repos are already published"
           else
             gh release create "pkg-${TAG}" $files \
               --title "VPP packages ${VERSION}" \
