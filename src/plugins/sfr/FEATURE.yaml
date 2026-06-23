@@ -1,0 +1,17 @@
+---
+name: Source-FIB Redirect
+maintainer: vpp-dev
+features:
+  - Source-based redirect implemented as an input feature on the L3 path.
+  - The packet's source address is looked up in a dedicated per-interface FIB
+    table. On a hit the packet is redirected via the resolved next-hop, reusing
+    the same mtrie/bihash forwarding structures as destination lookup.
+  - Non-member sources (table miss) and dead next-hops (e.g. BFD down collapsing
+    the load-balance to drop) fail open and continue down the input feature arc
+    on the normal destination-based L3 path.
+  - The source-FIB table is an ordinary FIB table, so its routes are programmed
+    with the standard ip_route_add_del path; SFR adds no route management of its
+    own.
+description: ""
+state: experimental
+properties: [API, CLI, MULTITHREAD]
