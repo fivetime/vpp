@@ -43,7 +43,27 @@ sfr_enable_disable (fib_protocol_t fproto, u32 sw_if_index, u32 table_id,
   if (is_enable)
     {
       if (~0 != sm->fib_index_by_sw_if_index[fproto][sw_if_index])
-	return (VNET_API_ERROR_ENTRY_ALREADY_EXISTS);
+	{
+	  /*
+	   * Already bound. Re-assert the data-plane feature rather than no-op:
+	   * an earlier enable may have raced the interface coming up (e.g. an
+	   * lcp tap still being set up) so the feature, though recorded, never
+	   * made it into the interface's compiled feature config — left listed
+	   * by 'show interface features' yet skipped in the data path. A
+	   * disable+enable forces a recompile; the feature count nets back to 1
+	   * so this stays idempotent. Lets a control-plane reconcile (which
+	   * re-enables periodically) self-heal a stuck binding.
+	   */
+	  vnet_feature_enable_disable (
+	    (FIB_PROTOCOL_IP4 == fproto ? "ip4-unicast" : "ip6-unicast"),
+	    (FIB_PROTOCOL_IP4 == fproto ? "sfr-input-ip4" : "sfr-input-ip6"),
+	    sw_if_index, 0, NULL, 0);
+	  vnet_feature_enable_disable (
+	    (FIB_PROTOCOL_IP4 == fproto ? "ip4-unicast" : "ip6-unicast"),
+	    (FIB_PROTOCOL_IP4 == fproto ? "sfr-input-ip4" : "sfr-input-ip6"),
+	    sw_if_index, 1, NULL, 0);
+	  return (0);
+	}
 
       /*
        * find or create the source-FIB table and hold a lock on it for as
