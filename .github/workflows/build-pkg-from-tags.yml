@@ -1,4 +1,4 @@
-name: "Release packages (apt/yum)"
+name: "Build package from tags"
 
 # 裸机场景:从源码编译 .deb(Debian13) + .rpm(Rocky9),发布为 GPG 签名的 apt/yum
 # 仓库到 GitHub Pages(gh-pages 分支),并把原始包附到 GitHub Release。与容器化的三
@@ -31,7 +31,7 @@ on:
 
 # 串行化:发布会读改 gh-pages,绝不并发(也不取消进行中的发布)。
 concurrency:
-  group: release-packages
+  group: release-packages-tags
   cancel-in-progress: false
 
 permissions:

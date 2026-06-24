@@ -1,4 +1,4 @@
-name: "Build image from master"
+name: "Build image from main"
 
 on:
   push:

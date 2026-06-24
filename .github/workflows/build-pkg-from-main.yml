@@ -1,0 +1,359 @@
+name: "Build package from main"
+
+# 裸机场景:从源码编译 .deb(Debian13) + .rpm(Rocky9),发布为 GPG 签名的 apt/yum
+# 仓库到 GitHub Pages(gh-pages 分支),并把原始包附到 GitHub Release。与容器化的三
+# 个工作流(build-from-*, sync-upstream)完全独立,互不影响。
+#
+on:
+  push:
+    branches:
+      - master
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'build/docker/README.md'
+      - 'build/docker/compose.yml'
+      - 'build/docker/startup.conf'
+      - 'build/docker/startup.conf.example'
+      - 'build/docker/examples/**'
+  workflow_dispatch:
+    inputs:
+      platforms:
+        description: 'Architectures'
+        required: false
+        default: all
+        type: choice
+        options: [all, amd64, arm64]
+      force:
+        description: 'Rebuild even if this version was already published'
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: build-pkg-from-main-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write        # 推送 gh-pages 分支 + 创建/更新 GitHub Release
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 解析 master 短 SHA + 构建矩阵。
+  # ---------------------------------------------------------------------------
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      tag:     ${{ steps.meta.outputs.tag }}
+      short_sha: ${{ steps.meta.outputs.short_sha }}
+      matrix:  ${{ steps.meta.outputs.matrix }}
+      skip:    ${{ steps.meta.outputs.skip }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: master
+          fetch-depth: 0     # 需要全部 tag 解析最新稳定版
+
+      - id: meta
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          short_sha="${GITHUB_SHA:0:8}"
+          # Package versions must start with a digit. Keep "master+<sha>" visible
+          # while staying valid for Debian/RPM and VPP's v[0-9]* version discovery.
+          version="0.master+${short_sha}"
+          tag="master-${short_sha}"
+
+          # 幂等:该 master SHA 的 GitHub Release 已存在则跳过(force/手动可强制)。
+          skip=false
+          if [ "${{ inputs.force }}" != "true" ] \
+             && gh release view "pkg-${tag}" >/dev/null 2>&1; then
+            echo "::notice::pkg-${tag} already published — skipping."
+            skip=true
+          fi
+
+          # 构建矩阵:deb+rpm × 选定架构。原生 runner(VPP 源码构建很重,不用 QEMU)。
+          # 每个发行版按自身 glibc/ABI 单独构建并发布到对应 suite(apt,按代号)或
+          # el<N>(yum)。Dockerfile 用 BASE_IMAGE 参数化:deb->Dockerfile.deb,
+          # rpm->Dockerfile.rpm。原生 runner(VPP 源码构建很重,不用 QEMU)。
+          # 砍掉的目标见 Dockerfile.rpm 头注释:el8/opensuse(python 3.6 太老)、
+          # fedora/el10(太新 — el10 的主 VPP 编译撞 RHEL10 OpenSSL-3 删了 ENGINE API,
+          # 属源码级移植,交上游 VPP v26.06+)。el9 向前兼容 RHEL 10。
+          all='[
+            {"kind":"deb","id":"trixie","base":"debian:trixie-slim","arch":"amd64","platform":"linux/amd64","runner":"ubuntu-latest"},
+            {"kind":"deb","id":"trixie","base":"debian:trixie-slim","arch":"arm64","platform":"linux/arm64","runner":"ubuntu-24.04-arm"},
+            {"kind":"deb","id":"bookworm","base":"debian:bookworm-slim","arch":"amd64","platform":"linux/amd64","runner":"ubuntu-latest"},
+            {"kind":"deb","id":"bookworm","base":"debian:bookworm-slim","arch":"arm64","platform":"linux/arm64","runner":"ubuntu-24.04-arm"},
+            {"kind":"deb","id":"jammy","base":"ubuntu:22.04","arch":"amd64","platform":"linux/amd64","runner":"ubuntu-latest"},
+            {"kind":"deb","id":"jammy","base":"ubuntu:22.04","arch":"arm64","platform":"linux/arm64","runner":"ubuntu-24.04-arm"},
+            {"kind":"rpm","id":"el9","base":"quay.io/rockylinux/rockylinux:9","arch":"amd64","platform":"linux/amd64","runner":"ubuntu-latest"},
+            {"kind":"rpm","id":"el9","base":"quay.io/rockylinux/rockylinux:9","arch":"arm64","platform":"linux/arm64","runner":"ubuntu-24.04-arm"}
+          ]'
+          p="${{ inputs.platforms }}"; [ -z "$p" ] && p=all
+          case "$p" in
+            all)   m="$all" ;;
+            amd64) m=$(jq -c '[.[]|select(.arch=="amd64")]' <<<"$all") ;;
+            arm64) m=$(jq -c '[.[]|select(.arch=="arm64")]' <<<"$all") ;;
+            *) echo "::error::unknown platforms: $p"; exit 1 ;;
+          esac
+          {
+            echo "version=$version"
+            echo "tag=$tag"
+            echo "short_sha=$short_sha"
+            echo "skip=$skip"
+            echo "matrix=$(jq -c <<<"$m")"
+          } >> "$GITHUB_OUTPUT"
+          echo "tag=$tag version=$version short_sha=$short_sha skip=$skip platforms=$p"
+
+  # ---------------------------------------------------------------------------
+  # 每个 (kind, arch) 在原生 runner 上从 master 源码构建包,导出为 artifact。
+  # ---------------------------------------------------------------------------
+  build:
+    needs: prepare
+    if: needs.prepare.outputs.skip != 'true'
+    name: build ${{ matrix.kind }}/${{ matrix.id }}/${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.prepare.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: master
+          fetch-depth: 0
+
+      - name: Tag master source for package version
+        run: |
+          set -eux
+          git -c user.email=build@vpp.local -c user.name=vpp-build \
+            tag -fa "v${{ needs.prepare.outputs.version }}" \
+            -m "v${{ needs.prepare.outputs.version }}"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build packages (${{ matrix.kind }}/${{ matrix.id }}/${{ matrix.arch }})
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          # deb -> build/packages/Dockerfile.deb, rpm -> build/packages/Dockerfile.rpm
+          file: build/packages/Dockerfile.${{ matrix.kind }}
+          target: packages
+          platforms: ${{ matrix.platform }}
+          # 只导出包,不出镜像、不 push。
+          outputs: type=local,dest=out
+          build-args: |
+            BASE_IMAGE=${{ matrix.base }}
+            VERSION=${{ needs.prepare.outputs.version }}
+          cache-from: type=gha,scope=pkg-${{ matrix.kind }}-${{ matrix.id }}-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=pkg-${{ matrix.kind }}-${{ matrix.id }}-${{ matrix.arch }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.kind }}-${{ matrix.id }}-${{ matrix.arch }}
+          path: out/*.${{ matrix.kind }}
+          if-no-files-found: error
+          retention-days: 3
+
+  # ---------------------------------------------------------------------------
+  # 汇总所有包 → 签名 → 累加进 gh-pages 上的 apt/yum 仓库 → 推送。
+  # ---------------------------------------------------------------------------
+  publish:
+    needs: [prepare, build]
+    # Publish whatever built: run as long as prepare succeeded and isn't skipped,
+    # even if SOME build legs failed (a single bad distro must not block shipping the
+    # rest). download-artifact pulls only the artifacts that exist; build-repo.sh
+    # skips empty suites/el<N>.
+    if: ${{ always() && needs.prepare.result == 'success' && needs.prepare.outputs.skip != 'true' }}
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO:  ${{ github.repository }}
+      VERSION:  ${{ needs.prepare.outputs.version }}
+      TAG:      ${{ needs.prepare.outputs.tag }}
+    steps:
+      - name: Checkout repo (scripts)
+        uses: actions/checkout@v5
+        with:
+          ref: master   # always assemble with the latest build-repo.sh / index template
+
+      - name: Validate signing secret
+        run: |
+          if [ -z "${{ secrets.GPG_PRIVATE_KEY }}" ]; then
+            echo "::error::Secret GPG_PRIVATE_KEY is not set. Generate a GPG key and add its ASCII-armored private key as repo secret GPG_PRIVATE_KEY (optional GPG_PASSPHRASE). See build/packages/README.md."
+            exit 1
+          fi
+
+      - name: Install repo tooling
+        run: |
+          sudo apt-get update
+          # apt-utils→apt-ftparchive, dpkg-dev→dpkg-scanpackages, createrepo-c, rpm→rpm/rpmsign
+          sudo apt-get install -y --no-install-recommends \
+            apt-utils dpkg-dev createrepo-c rpm gnupg
+
+      - name: Import GPG signing key
+        id: gpg
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          printf '%s\n' "$GPG_PRIVATE_KEY" | gpg --batch --import
+          keyid=$(gpg --list-secret-keys --with-colons | awk -F: '/^fpr:/{print $10; exit}')
+          echo "keyid=$keyid" >> "$GITHUB_OUTPUT"
+          echo "imported key $keyid"
+
+      # Pattern-based (not "download everything") — the latter intermittently fails
+      # with "Artifact download failed after 5 retries" even when each artifact already
+      # downloaded fine. Each artifact lands in dl/<name>/ (no merge-multiple).
+      - name: Download deb artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dl
+          pattern: deb-*
+      - name: Download rpm artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dl
+          pattern: rpm-*
+
+      - name: Arrange incoming packages (per suite / per el<N>+arch)
+        run: |
+          set -eux
+          # deb-<suite>-<arch> -> incoming/deb/<suite>/  (两个架构合到同一 suite 目录,
+          # dpkg-scanpackages -a <arch> 再按架构筛)
+          for d in dl/deb-*; do
+            [ -d "$d" ] || continue
+            suite=$(basename "$d" | cut -d- -f2)
+            mkdir -p "incoming/deb/$suite"
+            cp "$d"/*.deb "incoming/deb/$suite/" 2>/dev/null || true
+          done
+          # rpm-<elver>-<arch> -> incoming/rpm/<elver>/<rpm_arch>/  (amd64->x86_64, arm64->aarch64)
+          for d in dl/rpm-*; do
+            [ -d "$d" ] || continue
+            elver=$(basename "$d" | cut -d- -f2)
+            arch=$(basename "$d" | cut -d- -f3)
+            case "$arch" in amd64) ra=x86_64;; arm64) ra=aarch64;; *) ra="$arch";; esac
+            mkdir -p "incoming/rpm/$elver/$ra"
+            cp "$d"/*.rpm "incoming/rpm/$elver/$ra/" 2>/dev/null || true
+          done
+          find incoming -type f | sort
+
+      - name: Fetch existing gh-pages tree (accumulate)
+        run: |
+          set -euo pipefail
+          url="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          if git ls-remote --exit-code --heads "$url" gh-pages >/dev/null 2>&1; then
+            git clone --branch gh-pages --single-branch --depth 1 "$url" site
+          else
+            mkdir site && ( cd site && git init -q -b gh-pages )
+          fi
+
+      - name: Build signed apt + yum repositories
+        env:
+          SITE_DIR: site
+          INCOMING_DIR: incoming
+          GPG_KEY_ID: ${{ steps.gpg.outputs.keyid }}
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+          SUITES: "trixie bookworm jammy"   # apt suites, keep in sync with prepare matrix
+          EL_VERS: "el9"                    # yum el<N> repos, keep in sync with prepare matrix
+        run: |
+          # owner.github.io/repo — computed from GITHUB_REPOSITORY so it's correct
+          # on every event (github.event.repository.* is empty on schedule).
+          export REPO_URL="https://${GITHUB_REPOSITORY%%/*}.github.io/${GITHUB_REPOSITORY#*/}"
+          chmod +x build/packages/build-repo.sh
+          ./build/packages/build-repo.sh
+
+      - name: Commit & push gh-pages
+        run: |
+          set -euo pipefail
+          url="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          cd site
+          git add -A
+          git -c user.email="github-actions[bot]@users.noreply.github.com" \
+              -c user.name="github-actions[bot]" \
+              commit -m "publish vpp ${VERSION} packages" || { echo "nothing to commit"; exit 0; }
+          git push "$url" HEAD:gh-pages
+
+      - name: Summary
+        run: |
+          base="https://${GITHUB_REPOSITORY%%/*}.github.io/${GITHUB_REPOSITORY#*/}"
+          {
+            echo "## Published VPP ${VERSION}"
+            echo "- apt suites: \`trixie\` (Debian 13 / Ubuntu 24.04+), \`bookworm\` (Debian 12), \`jammy\` (Ubuntu 22.04)"
+            echo "  - e.g. \`deb [signed-by=…] ${base}/apt trixie main\`"
+            echo "- yum: \`${base}/rpm/el9/\$basearch\` and \`${base}/rpm/el10/\$basearch\`"
+            echo "- Release: pkg-${TAG}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  # GitHub Release assets are intentionally separate from publish so a failed
+  # upload can be rerun without rebuilding packages or republishing gh-pages.
+  # ---------------------------------------------------------------------------
+  release-assets:
+    needs: [prepare, build, publish]
+    if: ${{ always() && needs.prepare.result == 'success' && needs.prepare.outputs.skip != 'true' && needs.publish.result == 'success' }}
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO:  ${{ github.repository }}
+      VERSION:  ${{ needs.prepare.outputs.version }}
+      TAG:      ${{ needs.prepare.outputs.tag }}
+    steps:
+      # Pattern-based (not "download everything") — the latter intermittently fails
+      # with "Artifact download failed after 5 retries" even when each artifact already
+      # downloaded fine. Each artifact lands in dl/<name>/ (no merge-multiple).
+      - name: Download deb artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dl
+          pattern: deb-*
+
+      - name: Download rpm artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dl
+          pattern: rpm-*
+
+      - name: Arrange release packages
+        run: |
+          set -euo pipefail
+          # deb-<suite>-<arch> -> incoming/deb/<suite>/
+          for d in dl/deb-*; do
+            [ -d "$d" ] || continue
+            suite=$(basename "$d" | cut -d- -f2)
+            mkdir -p "incoming/deb/$suite"
+            cp "$d"/*.deb "incoming/deb/$suite/" 2>/dev/null || true
+          done
+          # rpm-<elver>-<arch> -> incoming/rpm/<elver>/<rpm_arch>/
+          for d in dl/rpm-*; do
+            [ -d "$d" ] || continue
+            elver=$(basename "$d" | cut -d- -f2)
+            arch=$(basename "$d" | cut -d- -f3)
+            case "$arch" in amd64) ra=x86_64;; arm64) ra=aarch64;; *) ra="$arch";; esac
+            mkdir -p "incoming/rpm/$elver/$ra"
+            cp "$d"/*.rpm "incoming/rpm/$elver/$ra/" 2>/dev/null || true
+          done
+          find incoming -type f | sort
+
+      - name: Create or update GitHub Release
+        run: |
+          set -euo pipefail
+          mapfile -t files < <(find incoming -type f \( -name '*.deb' -o -name '*.rpm' \) | sort)
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "::error::No release assets found to upload."
+            exit 1
+          fi
+
+          base="https://${GITHUB_REPOSITORY%%/*}.github.io/${GITHUB_REPOSITORY#*/}"
+          if ! gh release view "pkg-${TAG}" >/dev/null 2>&1; then
+            gh release create "pkg-${TAG}" \
+              --title "VPP packages ${VERSION}" \
+              --notes "apt/yum packages for VPP ${VERSION} (amd64/arm64). Repo: ${base}/"
+          fi
+
+          gh release upload "pkg-${TAG}" "${files[@]}"
