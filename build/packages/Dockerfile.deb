@@ -28,6 +28,16 @@ ARG DEBIAN_FRONTEND=noninteractive
 ARG BUILD_TYPE="release"
 ARG MAKE_PARALLEL_JOBS="16"
 ARG VERSION="dev"
+# DPDK PMDs to RE-ENABLE on top of VPP defaults (space/comma list, no net/
+# prefix). VPP already builds nearly every modern NIC PMD by default (Intel
+# ixgbe/i40e/ice/iavf, Broadcom NetXtreme-E bnxt, Mellanox mlx5, Amazon ena,
+# virtio, vmxnet3, Cisco enic, QLogic qede, ...). Upstream dpdk.mk only disables
+# (a) software PMDs VPP does natively (af_packet/af_xdp/tap/bonding/pcap/softnic)
+# and (b) SoC/vendor PMDs needing external SDKs + disabled buses (cnxk/dpaa/pfe/
+# ipn3ke). The only real PCIe-NIC gaps are OLD Broadcom (bnx2x, BCM578xx) and
+# Solarflare (sfc); enabled here by default so you never rebuild per card. A PMD
+# whose deps are unmet is auto-skipped by meson (no build failure). Override freely.
+ARG DPDK_ENABLE_PMDS="bnx2x sfc"
 
 # install-dep / install-ext-deps internally need these base tools.
 RUN set -eux \
@@ -55,6 +65,11 @@ RUN set -eux \
 
 # Separate RUNs so editing pkg-deb doesn't bust the costly install-ext-deps layer.
 RUN make UNATTENDED=yes install-dep
+# Re-enable any DPDK PMDs named in DPDK_ENABLE_PMDS by stripping them from
+# upstream dpdk.mk's DPDK_DRIVERS_DISABLED list, so they compile into
+# dpdk_plugin.so. No-op when empty (default = upstream behaviour). Must run
+# before install-ext-deps (which builds DPDK).
+RUN set -eux && for d in $(echo "${DPDK_ENABLE_PMDS}" | tr ',' ' '); do echo "enabling DPDK PMD net/${d}"; sed -i -E "s#net/${d},?##" build/external/packages/dpdk.mk; done
 RUN make UNATTENDED=yes install-ext-deps
 RUN set -eux \
     && if [ "$BUILD_TYPE" = "debug" ] ; then \
