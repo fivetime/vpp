@@ -13,7 +13,10 @@
 #include <vnet/feature/feature.h>
 #include <vnet/ip/ip4.h>
 #include <vnet/ip/ip6.h>
+#include <vnet/ip/ip4_inlines.h>	/* ip4_compute_flow_hash */
+#include <vnet/ip/ip6_inlines.h>	/* ip6_compute_flow_hash */
 #include <vnet/adj/adj.h>		/* IP4/IP6_LOOKUP_NEXT_NODES + IP_LOOKUP_NEXT_* */
+#include <vnet/dpo/load_balance_map.h>	/* load_balance_get_fwd_bucket */
 
 sfr_main_t sfr_main;
 
@@ -261,6 +264,7 @@ sfr_input_inline (vlib_main_t * vm,
 	  vlib_buffer_t *b0;
 	  u32 bi0, sw_if_index0, fib_index0;
 	  index_t lbi0;
+	  u32 hc0 = 0;			/* ECMP flow-hash —— 仅源路由多桶时计算 */
 
 	  bi0 = from[0];
 	  to_next[0] = bi0;
@@ -285,16 +289,36 @@ sfr_input_inline (vlib_main_t * vm,
 	    {
 	      const ip4_header_t *ip0 = vlib_buffer_get_current (b0);
 	      lbi0 = ip4_fib_forwarding_lookup (fib_index0, &ip0->src_address);
+	      lb0 = load_balance_get (lbi0);
+	      if (PREDICT_FALSE (lb0->lb_n_buckets > 1))
+		hc0 = ip4_compute_flow_hash (ip0, lb0->lb_hash_config);
 	    }
 	  else
 	    {
 	      const ip6_header_t *ip0 = vlib_buffer_get_current (b0);
 	      lbi0 = ip6_fib_table_fwding_lookup (fib_index0,
 						  &ip0->src_address);
+	      lb0 = load_balance_get (lbi0);
+	      if (PREDICT_FALSE (lb0->lb_n_buckets > 1))
+		hc0 = ip6_compute_flow_hash (ip0, lb0->lb_hash_config);
 	    }
 
-	  lb0 = load_balance_get (lbi0);
-	  dpo0 = load_balance_get_bucket_i (lb0, 0);
+	  /*
+	   * pick the forwarding bucket. An ECMP source route (several live
+	   * next-hops) hashes the flow so packets of one flow stay pinned to
+	   * one path — exactly as ip4-lookup does; single-next-hop and the
+	   * miss/dead-next-hop (drop) cases collapse to bucket 0.
+	   */
+	  if (PREDICT_FALSE (lb0->lb_n_buckets > 1))
+	    {
+	      vnet_buffer (b0)->ip.flow_hash = hc0;
+	      dpo0 = load_balance_get_fwd_bucket (
+		lb0, hc0 & (lb0->lb_n_buckets_minus_1));
+	    }
+	  else
+	    {
+	      dpo0 = load_balance_get_bucket_i (lb0, 0);
+	    }
 
 	  if (dpo_is_drop (dpo0))
 	    {
