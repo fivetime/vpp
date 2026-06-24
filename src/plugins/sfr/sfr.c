@@ -13,6 +13,7 @@
 #include <vnet/feature/feature.h>
 #include <vnet/ip/ip4.h>
 #include <vnet/ip/ip6.h>
+#include <vnet/adj/adj.h>		/* IP4/IP6_LOOKUP_NEXT_NODES + IP_LOOKUP_NEXT_* */
 
 sfr_main_t sfr_main;
 
@@ -254,7 +255,7 @@ sfr_input_inline (vlib_main_t * vm,
 
       while (n_left_from > 0 && n_left_to_next > 0)
 	{
-	  sfr_next_t next0 = SFR_NEXT_DROP;
+	  u32 next0 = IP_LOOKUP_NEXT_DROP;
 	  const load_balance_t *lb0;
 	  const dpo_id_t *dpo0;
 	  vlib_buffer_t *b0;
@@ -387,11 +388,12 @@ VLIB_REGISTER_NODE (sfr_ip4_node) =
   .type = VLIB_NODE_TYPE_INTERNAL,
   .n_errors = SFR_N_ERROR,
   .error_strings = sfr_error_strings,
-  .n_next_nodes = SFR_N_NEXT,
-  .next_nodes =
-  {
-    [SFR_NEXT_DROP] = "error-drop",
-  }
+  /* SFR-4x:注册整套标准 ip4 lookup next-node。redirect 时 next0 = 邻接 dpo 的
+     dpoi_next_node(IP_LOOKUP_NEXT_REWRITE=5 等标准值),必须能在本节点 next 表里映射到
+     ip4-rewrite,否则越界落 error-punt、包被丢不转发。ip4-lookup 同款做法。fail-open 的
+     vnet_feature_next 用 feature 框架追加的 arc-next 槽(>IP_LOOKUP_N_NEXT),与此并存。 */
+  .n_next_nodes = IP4_LOOKUP_N_NEXT,
+  .next_nodes = IP4_LOOKUP_NEXT_NODES,
 };
 
 VLIB_REGISTER_NODE (sfr_ip6_node) =
@@ -403,11 +405,10 @@ VLIB_REGISTER_NODE (sfr_ip6_node) =
   .type = VLIB_NODE_TYPE_INTERNAL,
   .n_errors = SFR_N_ERROR,
   .error_strings = sfr_error_strings,
-  .n_next_nodes = SFR_N_NEXT,
-  .next_nodes =
-  {
-    [SFR_NEXT_DROP] = "error-drop",
-  }
+  /* SFR-4x:同 ip4 —— 整套标准 ip6 lookup next-node,redirect 的 dpoi_next_node 映射到
+     ip6-rewrite。 */
+  .n_next_nodes = IP6_LOOKUP_N_NEXT,
+  .next_nodes = IP6_LOOKUP_NEXT_NODES,
 };
 
 VNET_FEATURE_INIT (sfr_ip4_feat, static) = {
