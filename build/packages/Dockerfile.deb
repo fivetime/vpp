@@ -71,6 +71,15 @@ RUN make UNATTENDED=yes install-dep
 # before install-ext-deps (which builds DPDK).
 RUN set -eux && for d in $(echo "${DPDK_ENABLE_PMDS}" | tr ',' ' '); do echo "enabling DPDK PMD net/${d}"; sed -i -E "s#net/${d},?##" build/external/packages/dpdk.mk; done
 RUN make UNATTENDED=yes install-ext-deps
+# af_xdp skb-mode: generic XDP for NICs without native XDP (Broadcom bnx2x, most
+# SR-IOV VFs). Patch the release-tag source, commit + re-tag so the build picks it
+# up while `git describe` stays clean (same 26.02-release version string).
+RUN set -eux \
+    && python3 build/packages/patch-af-xdp-skb.py \
+    && t="$(git describe --tags --abbrev=0 --match 'v[0-9]*' 2>/dev/null || true)" \
+    && git -c user.email=build@vpp.local -c user.name=vpp-build commit -aqm "ci(packaging): af_xdp skb-mode for non-native-XDP NICs" \
+    && if [ -n "$t" ]; then git -c user.email=build@vpp.local -c user.name=vpp-build tag -fa "$t" -m "$t"; fi
+
 RUN set -eux \
     && if [ "$BUILD_TYPE" = "debug" ] ; then \
            make UNATTENDED=yes MAKE_PARALLEL_JOBS="${MAKE_PARALLEL_JOBS}" pkg-deb-debug ; \

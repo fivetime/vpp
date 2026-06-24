@@ -243,7 +243,11 @@ af_xdp_load_program (af_xdp_create_if_args_t * args, af_xdp_device_t * ad)
 
   fd = bpf_program__fd (bpf_prog);
 
-  if (bpf_xdp_attach (ad->linux_ifindex, fd, XDP_FLAGS_UPDATE_IF_NOEXIST,
+  if (bpf_xdp_attach (ad->linux_ifindex, fd,
+		      XDP_FLAGS_UPDATE_IF_NOEXIST |
+			(args->flags & AF_XDP_CREATE_FLAGS_SKB_MODE ?
+			   XDP_FLAGS_SKB_MODE :
+			   0),
 		      NULL))
     {
       args->rv = VNET_API_ERROR_SYSCALL_ERROR_6;
@@ -332,6 +336,8 @@ af_xdp_create_queue (vlib_main_t *vm, af_xdp_create_if_args_t *args,
       sock_config.bind_flags |= XDP_ZEROCOPY;
       break;
     }
+  if (args->flags & AF_XDP_CREATE_FLAGS_SKB_MODE)
+    sock_config.xdp_flags |= XDP_FLAGS_SKB_MODE;
   if (args->prog)
     sock_config.libbpf_flags = XSK_LIBBPF_FLAGS__INHIBIT_PROG_LOAD;
   if (xsk_socket__create

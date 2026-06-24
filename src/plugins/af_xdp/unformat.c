@@ -43,6 +43,8 @@ unformat_af_xdp_create_if_args (unformat_input_t * input, va_list * vargs)
 	args->flags |= AF_XDP_CREATE_FLAGS_MAC_REUSE;
       else if (unformat (line_input, "no-syscall-lock"))
 	args->flags |= AF_XDP_CREATE_FLAGS_NO_SYSCALL_LOCK;
+      else if (unformat (line_input, "skb-mode"))
+	args->flags |= AF_XDP_CREATE_FLAGS_SKB_MODE;
       else
 	{
 	  /* return failure on unknown input */
