@@ -173,7 +173,7 @@ jobs:
           retention-days: 3
 
   # ---------------------------------------------------------------------------
-  # 汇总所有包 → 签名 → 累加进 gh-pages 上的 apt/yum 仓库 → 推送 + 发 Release。
+  # 汇总所有包 → 签名 → 累加进 gh-pages 上的 apt/yum 仓库 → 推送。
   # ---------------------------------------------------------------------------
   publish:
     needs: [prepare, build]
@@ -290,29 +290,6 @@ jobs:
               commit -m "publish vpp ${VERSION} packages" || { echo "nothing to commit"; exit 0; }
           git push "$url" HEAD:gh-pages
 
-      - name: Attach packages to GitHub Release
-        # Secondary to the apt/yum repos (already pushed to gh-pages above) — this only
-        # offers the raw files for direct download, so never fail publish on it.
-        continue-on-error: true
-        run: |
-          set -uo pipefail
-          files=$(find incoming -type f \( -name '*.deb' -o -name '*.rpm' \))
-          base="https://${GITHUB_REPOSITORY%%/*}.github.io/${GITHUB_REPOSITORY#*/}"
-          if gh release view "pkg-${TAG}" >/dev/null 2>&1; then
-            # Delete existing same-name assets first, then upload fresh. `gh release
-            # upload --clobber` deletes-by-id and aborts with HTTP 404 if an asset id is
-            # stale (e.g. left over from an interrupted run); delete-by-name is tolerant.
-            for f in $files; do
-              gh release delete-asset "pkg-${TAG}" "$(basename "$f")" -y 2>/dev/null || true
-            done
-            gh release upload "pkg-${TAG}" $files \
-              || echo "::warning::some release assets did not upload — the apt/yum repos are already published"
-          else
-            gh release create "pkg-${TAG}" $files \
-              --title "VPP packages ${VERSION}" \
-              --notes "apt/yum packages for VPP ${VERSION} (amd64/arm64). Repo: ${base}/"
-          fi
-
       - name: Summary
         run: |
           base="https://${GITHUB_REPOSITORY%%/*}.github.io/${GITHUB_REPOSITORY#*/}"
@@ -323,3 +300,70 @@ jobs:
             echo "- yum: \`${base}/rpm/el9/\$basearch\` and \`${base}/rpm/el10/\$basearch\`"
             echo "- Release: pkg-${TAG}"
           } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  # GitHub Release assets are intentionally separate from publish so a failed
+  # upload can be rerun without rebuilding packages or republishing gh-pages.
+  # ---------------------------------------------------------------------------
+  release-assets:
+    needs: [prepare, build, publish]
+    if: ${{ always() && needs.prepare.result == 'success' && needs.prepare.outputs.skip != 'true' && needs.publish.result == 'success' }}
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      VERSION:  ${{ needs.prepare.outputs.version }}
+      TAG:      ${{ needs.prepare.outputs.tag }}
+    steps:
+      # Pattern-based (not "download everything") — the latter intermittently fails
+      # with "Artifact download failed after 5 retries" even when each artifact already
+      # downloaded fine. Each artifact lands in dl/<name>/ (no merge-multiple).
+      - name: Download deb artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dl
+          pattern: deb-*
+
+      - name: Download rpm artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dl
+          pattern: rpm-*
+
+      - name: Arrange release packages
+        run: |
+          set -euo pipefail
+          # deb-<suite>-<arch> -> incoming/deb/<suite>/
+          for d in dl/deb-*; do
+            [ -d "$d" ] || continue
+            suite=$(basename "$d" | cut -d- -f2)
+            mkdir -p "incoming/deb/$suite"
+            cp "$d"/*.deb "incoming/deb/$suite/" 2>/dev/null || true
+          done
+          # rpm-<elver>-<arch> -> incoming/rpm/<elver>/<rpm_arch>/
+          for d in dl/rpm-*; do
+            [ -d "$d" ] || continue
+            elver=$(basename "$d" | cut -d- -f2)
+            arch=$(basename "$d" | cut -d- -f3)
+            case "$arch" in amd64) ra=x86_64;; arm64) ra=aarch64;; *) ra="$arch";; esac
+            mkdir -p "incoming/rpm/$elver/$ra"
+            cp "$d"/*.rpm "incoming/rpm/$elver/$ra/" 2>/dev/null || true
+          done
+          find incoming -type f | sort
+
+      - name: Create or update GitHub Release
+        run: |
+          set -euo pipefail
+          mapfile -t files < <(find incoming -type f \( -name '*.deb' -o -name '*.rpm' \) | sort)
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "::error::No release assets found to upload."
+            exit 1
+          fi
+
+          base="https://${GITHUB_REPOSITORY%%/*}.github.io/${GITHUB_REPOSITORY#*/}"
+          if ! gh release view "pkg-${TAG}" >/dev/null 2>&1; then
+            gh release create "pkg-${TAG}" \
+              --title "VPP packages ${VERSION}" \
+              --notes "apt/yum packages for VPP ${VERSION} (amd64/arm64). Repo: ${base}/"
+          fi
+
+          gh release upload "pkg-${TAG}" "${files[@]}"
