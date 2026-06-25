@@ -6,10 +6,10 @@ Maintainer: fd.io VPP Packaging Team <vpp-dev@fd.io>
 Installed-Size: 632
 Depends: libc6 (>= 2.34), libunwind8
 Filename: pool/bookworm/main/libvppinfra_26.02-release_amd64.deb
-Size: 205056
-MD5sum: a28e6e38cfeb4f3b1812b077c4f1b2e7
-SHA1: ccbb807dd52adb6ed9ad99546243fdb955679c73
-SHA256: 00614918638e56f17dafd86f5b5e8364a0cd61a720d12891c385407f720a788a
+Size: 204848
+MD5sum: 8787e4e58d423b1f8caf971553dfffbc
+SHA1: cb9cc0b63f63eaa991b4aaa1fcbd0b11e101338e
+SHA256: 7a511c1956e630d29636738dc2e4f9f6296ecc21a3c7c3c38f397138b6a47804
 Section: net
 Priority: extra
 Description: Vector Packet Processing--runtime libraries
@@ -22,10 +22,10 @@ Architecture: amd64
 Maintainer: fd.io VPP Packaging Team <vpp-dev@fd.io>
 Installed-Size: 948
 Filename: pool/bookworm/main/libvppinfra-dev_26.02-release_amd64.deb
-Size: 163388
-MD5sum: f18cf15e82070791e6abd87a636b8801
-SHA1: 6ba69b9cddb02f5f620f8c5f86ba4cc0713f89de
-SHA256: 69b37e883e2ae991e812cfb24dc5227b583bb957404f44276707fab6d1ff24d0
+Size: 163416
+MD5sum: 3d15a0d933ed0c6a9b9d6a591829c33a
+SHA1: a40b4697bcddb089be80f71fc800d26708fdb7e4
+SHA256: f46ecd8edb24566b555a2fb0ba9f284001eb7045cf77b8aa78910fc418298557
 Section: net
 Priority: extra
 Description: Vector Packet Processing--runtime libraries
@@ -40,9 +40,9 @@ Installed-Size: 239
 Depends: vpp (= 26.02-release), python3:any
 Filename: pool/bookworm/main/python3-vpp-api_26.02-release_amd64.deb
 Size: 36252
-MD5sum: c6162d8e8ff65f8afc59891c3b5fc4d6
-SHA1: 05e9e7067ddcce9db89c6835528618e28e568a01
-SHA256: ebb0f13005b1bd2a5886eb7fd242ffa94586c7e037270b8fa2682f54f57c0624
+MD5sum: b0061bf376d0c5b2a7bfae6a6d135156
+SHA1: ace2841b9a5b455c8c87a8fe72532b03525b770c
+SHA256: e33b2731808dbb0939b8c4e94f224c4e9cd0ac1ca387790d7c7787dfde73cd38
 Section: net
 Priority: extra
 Description: VPP Python3 API bindings
@@ -55,10 +55,10 @@ Maintainer: fd.io VPP Packaging Team <vpp-dev@fd.io>
 Installed-Size: 38752
 Depends: libvppinfra (= 26.02-release), libc6 (>= 2.34), libnl-3-200 (>= 3.2.7), libnl-route-3-200 (>= 3.2.26), libssl3 (>= 3.0.0), libunwind8
 Filename: pool/bookworm/main/vpp_26.02-release_amd64.deb
-Size: 5433360
-MD5sum: 8d23dda9390d4cca756199a17a2f29a6
-SHA1: bce184a01d7c500221fe6f629e8fc87964e372bc
-SHA256: cb0c562eb71542270c9d649a7d60c67f524a008c86d482d631d6582ec1e6b0c4
+Size: 5432460
+MD5sum: b7e1778889044abf9a5f3b0a1a4a4774
+SHA1: 958e3fa3313f227df630902f051ce829dce33dba
+SHA256: 029edd487259f9b5008c0921ed5bd364bab4b2700875a9c4d4dde48fdb7de22f
 Section: net
 Priority: extra
 Description: Vector Packet Processing--executables
@@ -75,10 +75,10 @@ Maintainer: fd.io VPP Packaging Team <vpp-dev@fd.io>
 Installed-Size: 13731
 Depends: vpp (= 26.02-release), libc6 (>= 2.14), libssl3 (>= 3.0.0)
 Filename: pool/bookworm/main/vpp-crypto-engines_26.02-release_amd64.deb
-Size: 1279636
-MD5sum: 4dccf8182b30817f9d4d2497748cb29f
-SHA1: a0ad1828a2c65b0fa7f34a2839e5fb762f8536cb
-SHA256: 5e4ffc14b1759c5daf46058e686e2a03613f5011f62916ccdd4e805a7cae2af2
+Size: 1279356
+MD5sum: a3149a44b3c115e821a0a187454b8090
+SHA1: d9e336d82d557cd743172d0286872a3189c8c7cd
+SHA256: e76315c120094a31712fd0b7dd1cc964fa308f78aec7438d8b854fe51c4aef4c
 Section: net
 Priority: extra
 Description: Vector Packet Processing--runtime crypto engines
@@ -92,10 +92,10 @@ Maintainer: fd.io VPP Packaging Team <vpp-dev@fd.io>
 Installed-Size: 21905
 Depends: libvppinfra-dev (= 26.02-release)
 Filename: pool/bookworm/main/vpp-dev_26.02-release_amd64.deb
-Size: 1512428
-MD5sum: 78e480674e3a8bad981b53e76da0bcc2
-SHA1: 50f61ea7d51677d09513e7122fe9491c44babb39
-SHA256: ca020a0680dae5a92943c07432e84d7c2ede367bdda0f2d5641f478198adc913
+Size: 1512344
+MD5sum: caa91fb90b7e2b722289fa5fddcf1e8a
+SHA1: 7a5b94c298d9a167bf10f63f2cf6f90ddf4dc728
+SHA256: ea75851cb7155d269391fabe25e951743d47df7aad70a38f5f00cbbae6e9016b
 Section: net
 Priority: extra
 Description: Vector Packet Processing--development support
@@ -109,10 +109,10 @@ Maintainer: fd.io VPP Packaging Team <vpp-dev@fd.io>
 Installed-Size: 2148
 Depends: vpp (= 26.02-release), libc6 (>= 2.14)
 Filename: pool/bookworm/main/vpp-drivers_26.02-release_amd64.deb
-Size: 266872
-MD5sum: d04f36db66d91db34a6fdeac6ccf75fb
-SHA1: 6d7c6d62424a6252a234108be43169c82d676006
-SHA256: aa711a81d5bc4473faf768b8487e056485f969feca5ae51a3bc81f6a07c697d5
+Size: 266932
+MD5sum: c74f384603f617de1c8470dbcbbab7c9
+SHA1: d1cc2542ec488fb7bf6c70b40e1c573d5c99c957
+SHA256: 975914e83210d6cf2adaa8198bb3f1b29b9ae165c06a0549b069858e0b064cc9
 Section: net
 Priority: extra
 Description: Vector Packet Processing--runtime device drivers
@@ -126,10 +126,10 @@ Maintainer: fd.io VPP Packaging Team <vpp-dev@fd.io>
 Installed-Size: 28188
 Depends: vpp (= 26.02-release), libc6 (>= 2.34), libelf1 (>= 0.144), libnl-3-200 (>= 3.2.21), libnl-route-3-200 (>= 3.7.0), libpcap0.8 (>= 1.0.0), libssl3 (>= 3.0.0), libunwind8, libvppinfra, zlib1g (>= 1:1.2.3.3)
 Filename: pool/bookworm/main/vpp-plugin-core_26.02-release_amd64.deb
-Size: 4701860
-MD5sum: c7aaf8e557c1f7c3644b08b242f0b77b
-SHA1: a2daa1579c979f3883a08c87f6e5a7374cca916b
-SHA256: 4cc533d3f12fb60ca784d5b3518982e2e974ec4decd24a7e3edaca8b98fe9854
+Size: 4701836
+MD5sum: 13d98b649e6bb12fd819970223e32702
+SHA1: 74cbf50fffaf769a1c867b5059972a564d5fa831
+SHA256: 83f77dbe425dca61281359e740d8868dd9feb1d50f7207587d5ab5c951a77251
 Section: net
 Priority: extra
 Description: Vector Packet Processing--runtime core plugins
@@ -143,10 +143,10 @@ Maintainer: fd.io VPP Packaging Team <vpp-dev@fd.io>
 Installed-Size: 1666
 Depends: vpp (= 26.02-release), libc6 (>= 2.34), libunwind8, libvppinfra
 Filename: pool/bookworm/main/vpp-plugin-devtools_26.02-release_amd64.deb
-Size: 382804
-MD5sum: 07af522f5d989dad3afab52cc8f5b722
-SHA1: 1be29c8970a98af40b240d92b22b8701b0224cef
-SHA256: c05aec80a05691aab9e1462667ffceaa92c105c8f37ef05d2a3425d304fe9a72
+Size: 383236
+MD5sum: 9006f68c3ad862e55883cd0f8838866e
+SHA1: 28e6c2f983f6240e5b3533c9fd7fe26cfe40ec16
+SHA256: c9ff24140b8d0a47bf4965c74eea7e6bb5b8026c9afc5dbcad4a93413fc8ff8c
 Section: net
 Priority: extra
 Description: Vector Packet Processing--runtime developer tool plugins
@@ -160,10 +160,10 @@ Maintainer: fd.io VPP Packaging Team <vpp-dev@fd.io>
 Installed-Size: 23175
 Depends: vpp (= 26.02-release), libc6 (>= 2.34), libnuma1 (>= 2.0.11), libssl3 (>= 3.0.0)
 Filename: pool/bookworm/main/vpp-plugin-dpdk_26.02-release_amd64.deb
-Size: 5519740
-MD5sum: 6eba55b700342a1d2178dc200dec7653
-SHA1: d36aaafa294ef5c5d88e9486d3384e686264eb1d
-SHA256: e136676982e39113c25e133151aff44ba9e05f78477c576dd0b4aa12ba1ca4cc
+Size: 5520532
+MD5sum: 6ffed1b21195a86bbd320c6a3476ec09
+SHA1: 1b427395a2148519d99545c2a7dffebf931193e1
+SHA256: 90c6e02443c958555b84a72d7439feef7d739e86cb887cb893708629f32c7397
 Section: net
 Priority: extra
 Description: Vector Packet Processing--runtime dpdk plugin
