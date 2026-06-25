@@ -6,10 +6,10 @@ Maintainer: fd.io VPP Packaging Team <vpp-dev@fd.io>
 Installed-Size: 624
 Depends: libc6 (>= 2.34), libunwind8
 Filename: pool/jammy/main/libvppinfra_26.02-release_amd64.deb
-Size: 222462
-MD5sum: 6448952126f9f5450f9187472a85f416
-SHA1: 47d45a3723fad766b639331fe0c85e65e829bc9f
-SHA256: 361ce2bfc32f5915b541fe6a39b02a3c9b339d65f0786445ef229d8be77baa00
+Size: 222472
+MD5sum: 0c4a355c0f05a43e95410198d2e2da60
+SHA1: a712b3284bd9d36a67baa227f68ad814fce1ebdc
+SHA256: 9e045638a85e52abfa2bed8605c1158c7d18f4a54623863b86d99646860a99fe
 Section: net
 Priority: extra
 Description: Vector Packet Processing--runtime libraries
@@ -22,10 +22,10 @@ Architecture: amd64
 Maintainer: fd.io VPP Packaging Team <vpp-dev@fd.io>
 Installed-Size: 948
 Filename: pool/jammy/main/libvppinfra-dev_26.02-release_amd64.deb
-Size: 168930
-MD5sum: f237a2b98d71ca65ef16b6a80cd865ad
-SHA1: 2f5ef25e71695779eaee54c264e31ee3bf8cd250
-SHA256: 439d8e7fcfd21ac977d4ede6faa3fdca3dd969a5e7c7112a24227c16223e2b13
+Size: 168884
+MD5sum: 21f406679df118dc72c5383955e0c7bd
+SHA1: 442b05c54b5350c2d82d0374e7b0481bd052e8b4
+SHA256: f06171c13d2c41746ca0fae2f8b43500effacd1a675a9c5ba4358cbe9fa229e8
 Section: net
 Priority: extra
 Description: Vector Packet Processing--runtime libraries
@@ -39,10 +39,10 @@ Maintainer: fd.io VPP Packaging Team <vpp-dev@fd.io>
 Installed-Size: 239
 Depends: vpp (= 26.02-release), python3:any
 Filename: pool/jammy/main/python3-vpp-api_26.02-release_amd64.deb
-Size: 36600
-MD5sum: 77e14e9f371d3b3fce4fb2887155db0b
-SHA1: 879fcf423983b6db28d76bbac3545b3091733b0f
-SHA256: 624ce531f264634e46fd6c03f4f5eefca05b8c7945d9d1bcb7f4216e5cb93d9a
+Size: 36614
+MD5sum: cf16db61c71e4652088787718969f606
+SHA1: a5910f3b427d4790fd892ed8e75b8420a82fef1a
+SHA256: d09114625f54264afc9274364906962f3b481acb47ad2d1acd59c6e65e356726
 Section: net
 Priority: extra
 Description: VPP Python3 API bindings
@@ -55,10 +55,10 @@ Maintainer: fd.io VPP Packaging Team <vpp-dev@fd.io>
 Installed-Size: 38655
 Depends: libvppinfra (= 26.02-release), libc6 (>= 2.34), libnl-3-200 (>= 3.2.7), libnl-route-3-200 (>= 3.2.26), libssl3 (>= 3.0.0~~alpha1), libunwind8
 Filename: pool/jammy/main/vpp_26.02-release_amd64.deb
-Size: 5693962
-MD5sum: 05635733c9f8cb24878ddd9aa96ea483
-SHA1: ca22b30b7a8d87fd605f0adae6625e367584527f
-SHA256: 0e5e0627c9c95f0df05455537bb28ac3bbc82e00dae249c3ee1c6fef3f41a099
+Size: 5693690
+MD5sum: 3b3cad6ff2820a8a529a125f5df27f35
+SHA1: 9b4492ba87e208a918464583ea720ec094dc8e93
+SHA256: 837538f3c63826c8e79191c55f70a5f17bee3755ef0c5b3bd6cfcfef67351feb
 Section: net
 Priority: extra
 Description: Vector Packet Processing--executables
@@ -75,10 +75,10 @@ Maintainer: fd.io VPP Packaging Team <vpp-dev@fd.io>
 Installed-Size: 13643
 Depends: vpp (= 26.02-release), libc6 (>= 2.14), libssl3 (>= 3.0.0~~alpha1)
 Filename: pool/jammy/main/vpp-crypto-engines_26.02-release_amd64.deb
-Size: 1424094
-MD5sum: 9004ed2eba581c4ca061917d1d64e5f4
-SHA1: 69b771b5b262f7f3b39e4a6406aaa87dab98a17c
-SHA256: 6cf2a9f9b8cf5fa6443480274c0e3f7ac75cdcb7a84a764ad4cd4b0532d27afb
+Size: 1424056
+MD5sum: 3a289ea04498954ee67acdc183d49322
+SHA1: 6f2ef6d338cadb2290e18a67dfb7287ed57d1cda
+SHA256: 22b396bd5796312598932ae33f392ffc070261ba4133e1c9443bb544d30d9c9e
 Section: net
 Priority: extra
 Description: Vector Packet Processing--runtime crypto engines
@@ -92,10 +92,10 @@ Maintainer: fd.io VPP Packaging Team <vpp-dev@fd.io>
 Installed-Size: 21905
 Depends: libvppinfra-dev (= 26.02-release)
 Filename: pool/jammy/main/vpp-dev_26.02-release_amd64.deb
-Size: 1476374
-MD5sum: 99c272e897531efaf78a95bb004076be
-SHA1: fff0b8a828b16328dab0200eb2a0b4891ed47d0a
-SHA256: 8d502cf57e5ca1f72c8a384b711982306fa2e0d44b3dee1f87ba8f39479e4da1
+Size: 1476592
+MD5sum: b7d189db2c374c78a39d2b484caa0dec
+SHA1: 46dfff4db1467c4f2e3b7b33eb449b91c2f554c2
+SHA256: a9b1b7e214129cba0e21e2fef7a47d8b887dcb66b7603fd8546efd7c802384d1
 Section: net
 Priority: extra
 Description: Vector Packet Processing--development support
@@ -109,10 +109,10 @@ Maintainer: fd.io VPP Packaging Team <vpp-dev@fd.io>
 Installed-Size: 2148
 Depends: vpp (= 26.02-release), libc6 (>= 2.14)
 Filename: pool/jammy/main/vpp-drivers_26.02-release_amd64.deb
-Size: 292822
-MD5sum: 92951b8993622264b478fc4153fb32f5
-SHA1: 6bbfcf69f2a39720957130a8db9d658dc0e98eb0
-SHA256: fcef93a6b850e65318dfa639b64e94b9ce7772fcbf497cb136ecaa27ff09aa25
+Size: 292820
+MD5sum: 95a0b62d07e2a0ae44bb72c67eff3c67
+SHA1: 79f4722214e64ae6b3478ee7883ec188b8d9515e
+SHA256: 5684c330f75c87c43c0ea350f2caf6593a106602a58cb4038f2dc4bd11b8033d
 Section: net
 Priority: extra
 Description: Vector Packet Processing--runtime device drivers
@@ -126,10 +126,10 @@ Maintainer: fd.io VPP Packaging Team <vpp-dev@fd.io>
 Installed-Size: 28082
 Depends: vpp (= 26.02-release), libc6 (>= 2.34), libelf1 (>= 0.144), libnl-3-200 (>= 3.2.21), libnl-route-3-200 (>= 3.4.0), libpcap0.8 (>= 1.0.0), libssl3 (>= 3.0.0~~alpha1), libunwind8, libvppinfra, zlib1g (>= 1:1.2.3.3)
 Filename: pool/jammy/main/vpp-plugin-core_26.02-release_amd64.deb
-Size: 5047114
-MD5sum: 968aa1a6860f95b3846fd49265302885
-SHA1: 854a11bb47e2dc87cf140a34ba2414bab6dcc2fa
-SHA256: 30081d47a0ef01c0c5e3c884e794fa43488a7ff5737802fa671a3fdf912057ff
+Size: 5047218
+MD5sum: 7ba82be13e62c31895181ed26021fd13
+SHA1: 23bbdc2389fa71b3c3c3977723c32dbf8af7ecf2
+SHA256: 2dd3408756ee508ef958eb08aa016ce90dc04cce5386a3e7d5fcd73461ca8603
 Section: net
 Priority: extra
 Description: Vector Packet Processing--runtime core plugins
@@ -143,10 +143,10 @@ Maintainer: fd.io VPP Packaging Team <vpp-dev@fd.io>
 Installed-Size: 1654
 Depends: vpp (= 26.02-release), libc6 (>= 2.34), libunwind8, libvppinfra
 Filename: pool/jammy/main/vpp-plugin-devtools_26.02-release_amd64.deb
-Size: 419056
-MD5sum: 4dd96c0bd70583c5fc4a286b897600a2
-SHA1: 9da8cbe9fe2feb361fe58f2339c85dd9952c9a63
-SHA256: 867c0be7bca5cc35c4af606f9d8629501b272202600aa4bbe5caa4c20f4eacda
+Size: 419384
+MD5sum: 313cef38ae071010961d52a8b3255dcf
+SHA1: e7652309162f32deeceb06b2b02e0a9271b47ce6
+SHA256: 74cb1f816756af82f856b53cf08f5761308b115a3355d2b329ae8c83100101a8
 Section: net
 Priority: extra
 Description: Vector Packet Processing--runtime developer tool plugins
@@ -160,10 +160,10 @@ Maintainer: fd.io VPP Packaging Team <vpp-dev@fd.io>
 Installed-Size: 23175
 Depends: vpp (= 26.02-release), libc6 (>= 2.34), libnuma1 (>= 2.0.11), libssl3 (>= 3.0.0~~alpha1)
 Filename: pool/jammy/main/vpp-plugin-dpdk_26.02-release_amd64.deb
-Size: 6024886
-MD5sum: c8f10d5b03aea67dd0ba575bbda0ae2f
-SHA1: 807ab73a8b0ff6c75c796b8458613513422f3baa
-SHA256: 2292d1a7bbe3334966e40bac7f5d42099ad227032dd7bf4b46823b8953f9f853
+Size: 6020548
+MD5sum: 1d2a562828030102490a2200a78b5235
+SHA1: 913f8f4c55546f5fb6fe49c744a878573bbe72cd
+SHA256: 20bea5c41a5c4840577d50b32cbfc599f9252616c62c47ea002e0c52d6c41def
 Section: net
 Priority: extra
 Description: Vector Packet Processing--runtime dpdk plugin
