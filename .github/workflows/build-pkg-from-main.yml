@@ -356,4 +356,4 @@ jobs:
               --notes "apt/yum packages for VPP ${VERSION} (amd64/arm64). Repo: ${base}/"
           fi
 
-          gh release upload "pkg-${TAG}" "${files[@]}"
+          gh release upload "pkg-${TAG}" "${files[@]}" --clobber
