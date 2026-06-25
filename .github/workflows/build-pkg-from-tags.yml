@@ -307,5 +307,21 @@ jobs:
             echo "- apt suites: \`trixie\` (Debian 13 / Ubuntu 24.04+), \`bookworm\` (Debian 12), \`jammy\` (Ubuntu 22.04)"
             echo "  - e.g. \`deb [signed-by=…] ${base}/apt trixie main\`"
             echo "- yum: \`${base}/rpm/el9/\$basearch\` and \`${base}/rpm/el10/\$basearch\`"
-            echo "- Release assets: run \`Release package assets\` with build run ID \`${{ github.run_id }}\`"
+            echo "- Release assets: triggered from build run \`${{ github.run_id }}\`"
           } >> "$GITHUB_STEP_SUMMARY"
+
+  trigger-release-assets:
+    needs: [prepare, publish]
+    if: ${{ always() && needs.prepare.result == 'success' && needs.prepare.outputs.skip != 'true' && needs.publish.result == 'success' }}
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO:  ${{ github.repository }}
+    steps:
+      - name: Trigger package asset Release workflow
+        run: |
+          set -euo pipefail
+          gh workflow run release-pkg-assets.yml \
+            -f build_run_id="${{ github.run_id }}" \
+            -f target=all \
+            -f clobber=true
