@@ -1,0 +1,152 @@
+name: "Release package assets"
+
+# Publish package artifacts from an existing package build run. This workflow is
+# intentionally separate from compilation so release logic can be fixed and
+# rerun without rebuilding VPP packages.
+on:
+  workflow_dispatch:
+    inputs:
+      build_run_id:
+        description: 'Build package workflow run ID to publish from'
+        required: true
+        type: string
+      target:
+        description: 'Package set to publish'
+        required: false
+        default: all
+        type: choice
+        options: [all, bookworm, jammy, trixie, el9]
+      clobber:
+        description: 'Overwrite assets in the target Release'
+        required: false
+        default: true
+        type: boolean
+
+concurrency:
+  group: release-pkg-assets-${{ inputs.build_run_id }}-${{ inputs.target }}
+  cancel-in-progress: false
+
+permissions:
+  actions: read
+  contents: write
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  GH_REPO:  ${{ github.repository }}
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - id: matrix
+        run: |
+          set -euo pipefail
+          case "${{ inputs.target }}" in
+            all)
+              matrix='[
+                {"target":"bookworm","kind":"deb","pattern":"deb-bookworm-*"},
+                {"target":"jammy","kind":"deb","pattern":"deb-jammy-*"},
+                {"target":"trixie","kind":"deb","pattern":"deb-trixie-*"},
+                {"target":"el9","kind":"rpm","pattern":"rpm-el9-*"}
+              ]'
+              ;;
+            bookworm|jammy|trixie)
+              matrix="[{\"target\":\"${{ inputs.target }}\",\"kind\":\"deb\",\"pattern\":\"deb-${{ inputs.target }}-*\"}]"
+              ;;
+            el9)
+              matrix='[{"target":"el9","kind":"rpm","pattern":"rpm-el9-*"}]'
+              ;;
+            *)
+              echo "::error::unknown target: ${{ inputs.target }}"
+              exit 1
+              ;;
+          esac
+          echo "matrix=$(jq -c <<<"$matrix")" >> "$GITHUB_OUTPUT"
+
+  release-assets:
+    needs: prepare
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.prepare.outputs.matrix) }}
+    steps:
+      - name: Download package artifacts
+        uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.build_run_id }}
+          path: dl
+          pattern: ${{ matrix.pattern }}
+
+      - name: Collect package files
+        run: |
+          set -euo pipefail
+          mkdir -p incoming
+          case "${{ matrix.kind }}" in
+            deb) find dl -type f -name '*.deb' -exec cp -t incoming {} + ;;
+            rpm) find dl -type f -name '*.rpm' -exec cp -t incoming {} + ;;
+            *) echo "::error::unknown kind: ${{ matrix.kind }}"; exit 1 ;;
+          esac
+          find incoming -type f | sort
+
+      - name: Resolve version metadata
+        id: meta
+        run: |
+          set -euo pipefail
+          mapfile -t files < <(find incoming -type f \( -name '*.deb' -o -name '*.rpm' \) | sort)
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "::error::No package assets found for ${{ matrix.target }} in run ${{ inputs.build_run_id }}."
+            exit 1
+          fi
+
+          first="$(basename "${files[0]}")"
+          case "$first" in
+            *.deb)
+              version="${first#*_}"
+              version="${version%-release_*}"
+              ;;
+            *.rpm)
+              version="${first#*-}"
+              version="${version%-release.*.rpm}"
+              ;;
+            *)
+              echo "::error::cannot infer version from $first"
+              exit 1
+              ;;
+          esac
+
+          if [[ "$version" == 0.master+* ]]; then
+            tag="master-${version#0.master+}"
+          else
+            tag="v${version#v}"
+          fi
+
+          {
+            echo "version=$version"
+            echo "tag=$tag"
+            echo "release_tag=pkg-${tag}-${{ matrix.target }}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Create or update GitHub Release
+        run: |
+          set -euo pipefail
+          mapfile -t files < <(find incoming -type f \( -name '*.deb' -o -name '*.rpm' \) | sort)
+          release_tag="${{ steps.meta.outputs.release_tag }}"
+          base="https://${GITHUB_REPOSITORY%%/*}.github.io/${GITHUB_REPOSITORY#*/}"
+
+          if ! gh release view "$release_tag" >/dev/null 2>&1; then
+            gh release create "$release_tag" \
+              --title "VPP packages ${{ steps.meta.outputs.version }} (${{ matrix.target }})" \
+              --notes "Package assets for VPP ${{ steps.meta.outputs.version }} (${{ matrix.target }}). Repo: ${base}/"
+          fi
+
+          upload_args=()
+          if [ "${{ inputs.clobber }}" = "true" ]; then
+            upload_args+=(--clobber)
+          fi
+          gh release upload "$release_tag" "${files[@]}" "${upload_args[@]}"
