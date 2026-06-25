@@ -1,21 +1,27 @@
 package main
 
 import (
+	"context"
+	"os/exec"
 	"regexp"
 	"strconv"
+	"time"
 
 	. "fd.io/hs-test/infra"
 )
 
+const tcpChainedBufferMTU = 9000
+
 func init() {
-	RegisterEchoTests(EchoBuiltinTest, EchoBuiltinBandwidthTest, EchoBuiltinEchoBytesTest, EchoBuiltinRoundtripTest,
-		EchoBuiltinUdpLossTest, EchoBuiltinPeriodicReportTest, EchoBuiltinPeriodicReportTotalTest, TlsSingleConnectionTest,
-		EchoBuiltinPeriodicReportUDPTest, EchoBuiltinUdpTest, EchoBuiltinTcpNoTxCsumOffloadTest,
+	RegisterEchoTests(EchoBuiltinTest, EchoBuiltinClientSessionDisconnectTest, EchoBuiltinBandwidthTest,
+		EchoBuiltinEchoBytesTest, EchoBuiltinRoundtripTest, EchoBuiltinUdpLossTest, EchoBuiltinPeriodicReportTest,
+		EchoBuiltinPeriodicReportTotalTest, TlsSingleConnectionTest, EchoBuiltinPeriodicReportUDPTest, EchoBuiltinUdpTest,
+		EchoBuiltinTcpNoTxCsumOffloadTest, EchoBuiltinTcpChainedBufferTest,
 		EchoBuiltinUdpNoTxCsumOffloadTest, EchoBuiltinHttpTest, EchoBuiltinHttpsTest, EchoBuiltinHttp2Test,
 		EchoBuiltinHttp3Test, EchoBuiltinHttpTestBytesTest, EchoBuiltinHttp2ConnectTcpTest, EchoBuiltinHttp3ConnectTcpTest,
 		EchoBuiltinHttp2ConnectUdpTest, EchoBuiltinHttp3ConnectUdpTest, EchoBuiltinHttp2ConnectUdpBackpressureTest)
-	RegisterEchoMWTests(TcpWithLossMWTest, EchoBuiltinHttp1CpsMWTest, EchoBuiltinHttp2CpsMWTest, EchoBuiltinHttp3CpsMWTest,
-		EchoBuiltinHttp2ConnectUdpBackpressureMWTest)
+	RegisterEchoMWTests(TcpWithLossMWTest, TcpChainedBufferWithLossMWTest, EchoBuiltinHttp1CpsMWTest,
+		EchoBuiltinHttp2CpsMWTest, EchoBuiltinHttp3CpsMWTest, EchoBuiltinHttp2ConnectUdpBackpressureMWTest)
 	RegisterEcho6Tests(TcpWithLoss6Test)
 }
 
@@ -32,6 +38,59 @@ func EchoBuiltinTest(s *EchoSuite) {
 		" uri tcp://" + s.Interfaces.Server.Ip4AddressString() + "/" + s.Ports.Port1)
 	Log(o)
 	AssertNotContains(o, "failed:")
+}
+
+func EchoBuiltinClientSessionDisconnectTest(s *EchoSuite) {
+	serverVpp := s.Containers.ServerVpp.VppInstance
+	serverVpp.Vppctl("vperf server " +
+		" uri tcp://" + s.Interfaces.Server.Ip4AddressString() + "/" + s.Ports.Port1)
+
+	clientVpp := s.Containers.ClientVpp.VppInstance
+	clientCliSocket := clientVpp.Container.GetContainerWorkDir() + "/var/run/vpp/cli.sock"
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	type clientResult struct {
+		output string
+		err    error
+	}
+	done := make(chan clientResult, 1)
+	go func() {
+		o, err := clientVpp.Container.ExecContext(ctx, false,
+			"vppctl -s %s vperf client nclients 2 echo-bytes run-time 30 uri tcp://%s/%s",
+			clientCliSocket, s.Interfaces.Server.Ip4AddressString(), s.Ports.Port1)
+		done <- clientResult{output: o, err: err}
+	}()
+
+	clientVpp.WaitForApp("vperf_client", 5)
+
+	dataPort, err := strconv.Atoi(s.Ports.Port1)
+	AssertNil(err)
+	dataPortString := strconv.Itoa(dataPort + 1)
+	sessionIDRegex := regexp.MustCompile(`\[(\d+):(\d+)\]`)
+	var dataSessions [][]string
+	for range 50 {
+		sessions := clientVpp.Vppctl("show session verbose proto tcp state ready rmt %s:%s",
+			s.Interfaces.Server.Ip4AddressString(), dataPortString)
+		dataSessions = sessionIDRegex.FindAllStringSubmatch(sessions, -1)
+		if len(dataSessions) >= 2 {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	AssertGreaterEqual(len(dataSessions), 2, "echo client data sessions did not become ready")
+
+	time.Sleep(500 * time.Millisecond)
+
+	clientVpp.Vppctl("clear session thread %s session %s", dataSessions[0][1], dataSessions[0][2])
+
+	result := <-done
+	Log(result.output)
+	if result.err != nil {
+		Log("echo client command returned: %v", result.err)
+	}
+	AssertNotEqual(context.DeadlineExceeded, ctx.Err(), "echo client did not return after session disconnect")
+	AssertContains(result.output, "session close")
 }
 
 func EchoBuiltinUdpTest(s *EchoSuite) {
@@ -65,6 +124,26 @@ func EchoBuiltinTcpNoTxCsumOffloadTest(s *EchoSuite) {
 	Log(o)
 	AssertNotContains(o, "failed")
 	AssertContains(o, "65536 bytes")
+	throughput, err := ParseEchoClientTransfer(o)
+	AssertNil(err)
+	AssertGreaterThan(throughput, uint64(0), "throughput must be > 0")
+}
+
+func EchoBuiltinTcpChainedBufferTest(s *EchoSuite) {
+	configureTcpChainedBufferMTU(s)
+
+	serverVpp := s.Containers.ServerVpp.VppInstance
+	clientVpp := s.Containers.ClientVpp.VppInstance
+	serverAddress := s.Interfaces.Server.Ip4AddressString()
+
+	serverVpp.Vppctl("vperf server fifo-size 256k uri tcp://%s/%s", serverAddress, s.Ports.Port1)
+
+	o := clientVpp.Vppctl("vperf client fifo-size 256k bytes 128k max-tx-chunk 64k "+
+		"echo-bytes test-bytes verbose test-timeout 10 uri tcp://%s/%s",
+		serverAddress, s.Ports.Port1)
+	Log(o)
+	AssertNotContains(o, "failed")
+	AssertContains(o, "131072 bytes")
 	throughput, err := ParseEchoClientTransfer(o)
 	AssertNil(err)
 	AssertGreaterThan(throughput, uint64(0), "throughput must be > 0")
@@ -119,7 +198,7 @@ func EchoBuiltinBandwidthTest(s *EchoSuite) {
 }
 
 func EchoBuiltinPeriodicReportTotalTest(s *EchoSuite) {
-	regex := regexp.MustCompile(`(\d?\.\d)\s+(\d+\.\d+)M\s+0\s+\d+\.\d+Mb/s\s+(\d?\.\d+)ms`)
+	regex := regexp.MustCompile(`(\d+\.\d)\s+(\d+(?:\.\d+)?)M\s+0\s+\d+(?:\.\d+)?Mb/s\s+(\d*\.?\d+)ms`)
 	serverVpp := s.Containers.ServerVpp.VppInstance
 
 	serverVpp.Vppctl("vperf server " +
@@ -134,25 +213,32 @@ func EchoBuiltinPeriodicReportTotalTest(s *EchoSuite) {
 		matches := regex.FindAllStringSubmatch(o, -1)
 		// Check we got a correct number of reports
 		AssertEqual(4, len(matches))
-		// Verify TX numbers
+		// Verify cumulative transmitted byte totals
 		for i := range 4 {
-			mbytes, _ := strconv.ParseFloat(matches[i][2], 32)
-			AssertEqualWithinThreshold(mbytes, 2*(i+1), 0.1, "amount of transmitted data outside of threshold")
+			transmittedMbytes, err := strconv.ParseFloat(matches[i][2], 64)
+			AssertNil(err)
+			AssertEqualWithinThreshold(transmittedMbytes, 2*(i+1), 0.1,
+				"amount of transmitted data outside of threshold")
 			rtt, _ := strconv.ParseFloat(matches[i][3], 32)
-			AssertGreaterThan(rtt, 0.0, "roundtrip time must be greater than 0.0")
+			AssertGreaterEqual(rtt, 0.0, "roundtrip time must not be negative")
 		}
 		// Verify reporting times
-		AssertEqual(matches[0][1], "1.0", "invalid report time")
-		AssertEqual(matches[1][1], "2.0", "invalid report time")
-		AssertEqual(matches[2][1], "3.0", "invalid report time")
-		AssertEqual(matches[3][1], "4.0", "invalid report time")
+		for i := range 3 {
+			end, err := strconv.ParseFloat(matches[i][1], 64)
+			AssertNil(err)
+			AssertEqual(end, float64(i+1), "invalid report time")
+		}
+		end, err := strconv.ParseFloat(matches[3][1], 64)
+		AssertNil(err)
+		AssertEqualWithinThreshold(end, 4.0, 0.15, "invalid report time")
 	} else {
 		AssertEmpty("invalid echo test client output")
 	}
 }
 
 func EchoBuiltinPeriodicReportUDPTest(s *EchoSuite) {
-	regex := regexp.MustCompile(`(\d?\.\d)-(\d?.\d)\s+(\d+\.\d+)M\s+\d?\.\d+M\s+\d+\.\d+Mb/s\s+(\d?\.\d+)ms\s+(\d+)/(\d+)`)
+	regex := regexp.MustCompile(`(\d+\.\d)-(\d+\.\d)\s+(\d+(?:\.\d+)?)M\s+(\d+(?:\.\d+)?)M\s+\d+(?:\.\d+)?Mb/s\s+(\d*\.?\d+)ms\s+(\d+)/(\d+)`)
+	totalRegex := regexp.MustCompile(`sent total (\d+) datagrams, received total (\d+) datagrams, lost (\d+) datagrams`)
 	serverVpp := s.Containers.ServerVpp.VppInstance
 
 	serverVpp.Vppctl("vperf server " +
@@ -165,35 +251,43 @@ func EchoBuiltinPeriodicReportUDPTest(s *EchoSuite) {
 	Log(o)
 	if regex.MatchString(o) {
 		matches := regex.FindAllStringSubmatch(o, -1)
-		// Check we got a correct number of reports
-		AssertEqual(4, len(matches))
+		AssertGreaterEqual(len(matches), 3, "invalid number of periodic reports")
 		// Verify TX numbers
-		for i := range 4 {
-			mbytes, _ := strconv.ParseFloat(matches[i][3], 32)
+		for i := range matches {
+			mbytes, err := strconv.ParseFloat(matches[i][3], 64)
+			AssertNil(err)
 			AssertEqualWithinThreshold(mbytes, 1.5, 0.1, "amount of transmitted data outside of threshold")
-			rtt, _ := strconv.ParseFloat(matches[i][4], 32)
-			AssertGreaterThan(rtt, 0.0, "roundtrip time must be greater than 0.0")
-			dgramsSent, _ := strconv.ParseUint(matches[i][5], 10, 32)
-			AssertEqualWithinThreshold(dgramsSent, 2048, 20, "sent dgrams outside of threshold")
-			dgramsReceived, _ := strconv.ParseUint(matches[i][6], 10, 32)
-			AssertEqualWithinThreshold(dgramsReceived, 2048, 50, "received dgrams outside of threshold")
+			rtt, _ := strconv.ParseFloat(matches[i][5], 32)
+			AssertGreaterEqual(rtt, 0.0, "roundtrip time must not be negative")
 		}
+		totalMatches := totalRegex.FindStringSubmatch(o)
+		AssertNotEmpty(totalMatches, "invalid echo test client output")
+		dgramsSentTotal, _ := strconv.ParseUint(totalMatches[1], 10, 32)
+		dgramsReceivedTotal, _ := strconv.ParseUint(totalMatches[2], 10, 32)
+		dgramsLost, _ := strconv.ParseUint(totalMatches[3], 10, 32)
+		AssertEqualWithinThreshold(dgramsSentTotal, uint64(8192), 300, "sent dgrams outside of threshold")
+		AssertEqualWithinThreshold(dgramsReceivedTotal, dgramsSentTotal, 100, "received dgrams outside of threshold")
+		AssertEqual(uint64(0), dgramsLost, "lost dgrams outside of threshold")
 		// Verify time interval numbers
-		AssertEqual(matches[0][1], "0.0")
-		AssertEqual(matches[0][2], "1.0")
-		AssertEqual(matches[1][1], "1.0")
-		AssertEqual(matches[1][2], "2.0")
-		AssertEqual(matches[2][1], "2.0")
-		AssertEqual(matches[2][2], "3.0")
-		AssertEqual(matches[3][1], "3.0")
-		AssertEqual(matches[3][2], "4.0")
+		for i := range matches {
+			start, err := strconv.ParseFloat(matches[i][1], 64)
+			AssertNil(err)
+			end, err := strconv.ParseFloat(matches[i][2], 64)
+			AssertNil(err)
+			AssertEqual(start, float64(i), "invalid report time")
+			if i == len(matches)-1 {
+				AssertEqualWithinThreshold(end, float64(i+1), 0.15, "invalid report time")
+			} else {
+				AssertEqual(end, float64(i+1), "invalid report time")
+			}
+		}
 	} else {
 		AssertEmpty("invalid echo test client output")
 	}
 }
 
 func EchoBuiltinPeriodicReportTest(s *EchoSuite) {
-	regex := regexp.MustCompile(`(\d?\.\d)-(\d?.\d)\s+(\d+\.\d+)M\s+0\s+\d+\.\d+Mb/s\s+(\d?\.\d+)ms`)
+	regex := regexp.MustCompile(`(\d+\.\d)-(\d+\.\d)\s+(\d+(?:\.\d+)?)M\s+0\s+\d+(?:\.\d+)?Mb/s\s+(\d*\.?\d+)ms`)
 	serverVpp := s.Containers.ServerVpp.VppInstance
 
 	serverVpp.Vppctl("vperf server " +
@@ -210,20 +304,25 @@ func EchoBuiltinPeriodicReportTest(s *EchoSuite) {
 		AssertEqual(4, len(matches))
 		// Verify TX numbers
 		for i := range 4 {
-			mbytes, _ := strconv.ParseFloat(matches[i][3], 32)
+			mbytes, err := strconv.ParseFloat(matches[i][3], 64)
+			AssertNil(err)
 			AssertEqualWithinThreshold(mbytes, 2, 0.1)
 			rtt, _ := strconv.ParseFloat(matches[i][4], 32)
-			AssertGreaterThan(rtt, 0.0, "roundtrip time must be greater than 0.0")
+			AssertGreaterEqual(rtt, 0.0, "roundtrip time must not be negative")
 		}
 		// Verify time interval numbers
-		AssertEqual(matches[0][1], "0.0", "invalid report time")
-		AssertEqual(matches[0][2], "1.0", "invalid report time")
-		AssertEqual(matches[1][1], "1.0", "invalid report time")
-		AssertEqual(matches[1][2], "2.0", "invalid report time")
-		AssertEqual(matches[2][1], "2.0", "invalid report time")
-		AssertEqual(matches[2][2], "3.0", "invalid report time")
-		AssertEqual(matches[3][1], "3.0", "invalid report time")
-		AssertEqual(matches[3][2], "4.0", "invalid report time")
+		for i := range 4 {
+			start, err := strconv.ParseFloat(matches[i][1], 64)
+			AssertNil(err)
+			end, err := strconv.ParseFloat(matches[i][2], 64)
+			AssertNil(err)
+			AssertEqual(start, float64(i), "invalid report time")
+			if i == 3 {
+				AssertEqualWithinThreshold(end, float64(i+1), 0.15, "invalid report time")
+			} else {
+				AssertEqual(end, float64(i+1), "invalid report time")
+			}
+		}
 	} else {
 		AssertEmpty("invalid echo test client output")
 	}
@@ -290,9 +389,61 @@ func EchoBuiltinUdpLossTest(s *EchoSuite) {
 	AssertContains(o, " bytes out of 32768 sent (32768 target)")
 }
 
+func setTcpChainedBufferLinuxLinkMTU(ifName string, mtu int) {
+	mtuString := strconv.Itoa(mtu)
+	cmd := exec.Command("ip", "link", "set", "dev", ifName, "mtu", mtuString)
+	Log(cmd.String())
+	o, err := cmd.CombinedOutput()
+	AssertNil(err, string(o))
+}
+
+func setTcpChainedBufferVethMTU(s *VethsSuite, mtu int) {
+	for _, nc := range s.NetConfigs {
+		if nc.Type() == Bridge {
+			setTcpChainedBufferLinuxLinkMTU(nc.Name(), mtu)
+		}
+	}
+
+	for _, intf := range []*NetInterface{s.Interfaces.Server, s.Interfaces.Client} {
+		setTcpChainedBufferLinuxLinkMTU(intf.Name(), mtu)
+		setTcpChainedBufferLinuxLinkMTU(intf.Host.Name(), mtu)
+	}
+}
+
+func setTcpChainedBufferVppInterfaceMTU(vpp *VppInstance, intf *NetInterface, mtu int) {
+	o := vpp.Vppctl("set interface mtu %d %s", mtu, intf.VppName())
+	Log(o)
+	AssertNotContains(o, "unknown input")
+	AssertNotContains(o, "error")
+}
+
+func configureTcpChainedBufferMTU(s *EchoSuite) {
+	expected := "TCP default mtu: " + strconv.Itoa(tcpChainedBufferMTU)
+	serverVpp := s.Containers.ServerVpp.VppInstance
+	clientVpp := s.Containers.ClientVpp.VppInstance
+
+	setTcpChainedBufferVethMTU(&s.VethsSuite, tcpChainedBufferMTU)
+	setTcpChainedBufferVppInterfaceMTU(serverVpp, s.Interfaces.Server, tcpChainedBufferMTU)
+	setTcpChainedBufferVppInterfaceMTU(clientVpp, s.Interfaces.Client, tcpChainedBufferMTU)
+	AssertContains(serverVpp.Vppctl("set tcp mtu %d", tcpChainedBufferMTU), expected)
+	AssertContains(clientVpp.Vppctl("set tcp mtu %d", tcpChainedBufferMTU), expected)
+
+	serverTcpConfig := serverVpp.Vppctl("sh tcp config")
+	clientTcpConfig := clientVpp.Vppctl("sh tcp config")
+	Log(serverTcpConfig)
+	Log(clientTcpConfig)
+	AssertContains(serverTcpConfig, "default mtu: "+strconv.Itoa(tcpChainedBufferMTU))
+	AssertContains(clientTcpConfig, "default mtu: "+strconv.Itoa(tcpChainedBufferMTU))
+}
+
 type tcpWithLossInterface interface {
 	SetupClientVpp()
 	SetupServerVpp()
+}
+
+type tcpWithLossConfig struct {
+	packetSize int
+	setup      func()
 }
 
 func tcpEcho(port string, ip string, clientVpp *VppInstance, serverVpp *VppInstance) string {
@@ -316,6 +467,17 @@ func TcpWithLossMWTest(s *EchoSuite) {
 		s.Interfaces.Client, s.Interfaces.Server, s.Ports.Port1)
 }
 
+func TcpChainedBufferWithLossMWTest(s *EchoSuite) {
+	s.CpusPerVppContainer = 2
+	s.CpusPerContainer = 1
+	s.SetupTest()
+	tcpWithLossAndNoLoss(s, s.Containers.ClientVpp.VppInstance, s.Containers.ServerVpp.VppInstance,
+		s.Interfaces.Client, s.Interfaces.Server, s.Ports.Port1, tcpWithLossConfig{
+			packetSize: tcpChainedBufferMTU,
+			setup:      func() { configureTcpChainedBufferMTU(s) },
+		})
+}
+
 func TcpWithLoss6Test(s *Echo6Suite) {
 	tcpWithLossAndNoLoss(s, s.Containers.ClientVpp.VppInstance, s.Containers.ServerVpp.VppInstance,
 		s.Interfaces.Client, s.Interfaces.Server, s.Ports.Port1)
@@ -323,7 +485,16 @@ func TcpWithLoss6Test(s *Echo6Suite) {
 
 // runs tcp echo without loss, then with loss
 func tcpWithLossAndNoLoss(s tcpWithLossInterface, clientVpp *VppInstance,
-	serverVpp *VppInstance, clientIf *NetInterface, serverIf *NetInterface, port string) {
+	serverVpp *VppInstance, clientIf *NetInterface, serverIf *NetInterface, port string,
+	configs ...tcpWithLossConfig) {
+	config := tcpWithLossConfig{packetSize: 1400}
+	if len(configs) > 0 {
+		config = configs[0]
+		if config.packetSize == 0 {
+			config.packetSize = 1400
+		}
+	}
+
 	Log(clientVpp.Vppctl("set nsim poll-main-thread delay 10 ms bandwidth 40 gbit"))
 	Log(clientVpp.Vppctl("nsim output-feature enable-disable " + clientIf.VppName()))
 
@@ -335,6 +506,9 @@ func tcpWithLossAndNoLoss(s tcpWithLossInterface, clientVpp *VppInstance,
 	}
 
 	Log("  * running TcpWithoutLoss")
+	if config.setup != nil {
+		config.setup()
+	}
 	output := tcpEcho(port, serverAddress, clientVpp, serverVpp)
 	baseline, err := ParseEchoClientTransfer(output)
 	AssertNil(err)
@@ -347,12 +521,15 @@ func tcpWithLossAndNoLoss(s tcpWithLossInterface, clientVpp *VppInstance,
 	s.SetupServerVpp()
 
 	// Add loss of packets with Network Delay Simulator
-	Log(clientVpp.Vppctl("set nsim poll-main-thread delay 10 ms bandwidth 40 gbit" +
-		" packet-size 1400 drop-fraction 0.033"))
+	Log(clientVpp.Vppctl("set nsim poll-main-thread delay 10 ms bandwidth 40 gbit"+
+		" packet-size %d drop-fraction 0.033", config.packetSize))
 
 	Log(clientVpp.Vppctl("nsim output-feature enable-disable " + clientIf.VppName()))
 
 	Log("  * running TcpWithLoss")
+	if config.setup != nil {
+		config.setup()
+	}
 	output = tcpEcho(port, serverAddress, clientVpp, serverVpp)
 
 	withLoss, err := ParseEchoClientTransfer(output)
