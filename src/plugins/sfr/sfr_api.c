@@ -56,8 +56,18 @@ vl_api_sfr_enable_disable_t_handler (vl_api_sfr_enable_disable_t * mp)
 			   FIB_PROTOCOL_IP6 : FIB_PROTOCOL_IP4);
   int rv;
 
+  /*
+   * Bounds-check the interface index before it reaches the data structures:
+   * sfr_enable_disable() feeds sw_if_index straight into vec_validate, so an
+   * out-of-range value (e.g. 0xFFFFFFFE) would otherwise trigger a huge
+   * allocation / OOM. Rejects ~0 too.
+   */
+  VALIDATE_SW_IF_INDEX (mp);
+
   rv = sfr_enable_disable (fproto, ntohl (mp->sw_if_index),
 			   ntohl (mp->table_id), mp->is_enable);
+
+  BAD_SW_IF_INDEX_LABEL;
 
   REPLY_MACRO (VL_API_SFR_ENABLE_DISABLE_REPLY);
 }

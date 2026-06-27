@@ -31,6 +31,21 @@ extern vlib_node_registration_t sfr_ip6_node;
  */
 #define SFR_FIB_SOURCE FIB_SOURCE_API
 
+/**
+ * Does the source-FIB currently bound on (fproto, sw_if_index) carry a
+ * different table_id than the one requested? Caller must already have
+ * confirmed the slot is bound (!= ~0).
+ */
+static_always_inline int
+fib_index_to_table_id_differs (fib_protocol_t fproto, u32 sw_if_index,
+			       u32 table_id)
+{
+  sfr_main_t *sm = &sfr_main;
+  u32 fib_index = sm->fib_index_by_sw_if_index[fproto][sw_if_index];
+
+  return (table_id != fib_table_get_table_id (fib_index, fproto));
+}
+
 int
 sfr_enable_disable (fib_protocol_t fproto, u32 sw_if_index, u32 table_id,
 		    u8 is_enable)
@@ -49,7 +64,22 @@ sfr_enable_disable (fib_protocol_t fproto, u32 sw_if_index, u32 table_id,
       if (~0 != sm->fib_index_by_sw_if_index[fproto][sw_if_index])
 	{
 	  /*
-	   * Already bound. Re-assert the data-plane feature rather than no-op:
+	   * Already bound. A request to bind a *different* source-FIB table
+	   * cannot be honoured by silently re-asserting the feature: that
+	   * would leave the data plane on the OLD table while returning
+	   * success, hiding the failed table change from the control plane.
+	   * Reject it explicitly so bird-vpp can detect it (and disable then
+	   * re-enable to move the binding). Rebinding in place would need to
+	   * unlock the old table and lock+recompile the new one while the
+	   * data plane may be reading this slot — racy in this not-MP-safe
+	   * path — so we take the safe, detectable-error route instead.
+	   */
+	  if (fib_index_to_table_id_differs (fproto, sw_if_index, table_id))
+	    return (VNET_API_ERROR_INSTANCE_IN_USE);
+
+	  /*
+	   * Same table re-requested. Re-assert the data-plane feature rather
+	   * than no-op:
 	   * an earlier enable may have raced the interface coming up (e.g. an
 	   * lcp tap still being set up) so the feature, though recorded, never
 	   * made it into the interface's compiled feature config — left listed
@@ -125,6 +155,43 @@ sfr_walk (sfr_walk_cb_t cb, void *ctx)
     }
   }
 }
+
+/**
+ * Release any SFR binding when an interface is deleted.
+ *
+ * An SFR enable takes a lock on its source-FIB table that is only dropped by
+ * an explicit disable. If the interface is deleted (e.g. an lcp tap teardown)
+ * without a disable first, the lock would leak — the FIB table could never be
+ * freed — and the stale vec slot would alias a later interface that reuses the
+ * same sw_if_index. On delete, run the disable/unlock path for any protocol
+ * still bound so the lock is released and the slot is reset to the ~0 sentinel.
+ */
+static clib_error_t *
+sfr_sw_interface_add_del (vnet_main_t * vnm, u32 sw_if_index, u32 is_add)
+{
+  sfr_main_t *sm = &sfr_main;
+  fib_protocol_t fproto;
+
+  if (is_add)
+    return (NULL);
+
+  FOR_EACH_FIB_IP_PROTOCOL (fproto)
+  {
+    if (sw_if_index < vec_len (sm->fib_index_by_sw_if_index[fproto]) &&
+	~0 != sm->fib_index_by_sw_if_index[fproto][sw_if_index])
+      {
+	/*
+	 * table_id is unused on the disable path; pass ~0. This unlocks the
+	 * source-FIB table, removes the feature, and resets the slot to ~0.
+	 */
+	sfr_enable_disable (fproto, sw_if_index, ~0, 0 /* is_enable */);
+      }
+  }
+
+  return (NULL);
+}
+
+VNET_SW_INTERFACE_ADD_DEL_FUNCTION (sfr_sw_interface_add_del);
 
 static clib_error_t *
 sfr_enable_cmd (vlib_main_t * vm,
@@ -280,53 +347,16 @@ sfr_input_inline (vlib_main_t * vm,
 		  sw_if_index0);
 	  fib_index0 = sm->fib_index_by_sw_if_index[fproto][sw_if_index0];
 
-	  /*
-	   * look the packet's SOURCE address up in the bound source-FIB,
-	   * using the same forwarding lookup the L3 path uses for the
-	   * destination. The lookup is address-agnostic.
-	   */
-	  if (FIB_PROTOCOL_IP4 == fproto)
-	    {
-	      const ip4_header_t *ip0 = vlib_buffer_get_current (b0);
-	      lbi0 = ip4_fib_forwarding_lookup (fib_index0, &ip0->src_address);
-	      lb0 = load_balance_get (lbi0);
-	      if (PREDICT_FALSE (lb0->lb_n_buckets > 1))
-		hc0 = ip4_compute_flow_hash (ip0, lb0->lb_hash_config);
-	    }
-	  else
-	    {
-	      const ip6_header_t *ip0 = vlib_buffer_get_current (b0);
-	      lbi0 = ip6_fib_table_fwding_lookup (fib_index0,
-						  &ip0->src_address);
-	      lb0 = load_balance_get (lbi0);
-	      if (PREDICT_FALSE (lb0->lb_n_buckets > 1))
-		hc0 = ip6_compute_flow_hash (ip0, lb0->lb_hash_config);
-	    }
+	  lbi0 = ~0;
 
-	  /*
-	   * pick the forwarding bucket. An ECMP source route (several live
-	   * next-hops) hashes the flow so packets of one flow stay pinned to
-	   * one path — exactly as ip4-lookup does; single-next-hop and the
-	   * miss/dead-next-hop (drop) cases collapse to bucket 0.
-	   */
-	  if (PREDICT_FALSE (lb0->lb_n_buckets > 1))
-	    {
-	      vnet_buffer (b0)->ip.flow_hash = hc0;
-	      dpo0 = load_balance_get_fwd_bucket (
-		lb0, hc0 & (lb0->lb_n_buckets_minus_1));
-	    }
-	  else
-	    {
-	      dpo0 = load_balance_get_bucket_i (lb0, 0);
-	    }
-
-	  if (dpo_is_drop (dpo0))
+	  if (PREDICT_FALSE (~0 == fib_index0))
 	    {
 	      /*
-	       * miss (source not a member, hits the table's drop default
-	       * route) or a dead next-hop (e.g. BFD down collapsed the
-	       * load-balance to drop): fail open and continue down the
-	       * input feature arc on the normal destination L3 path.
+	       * no source-FIB bound for this interface (the feature is not
+	       * enabled, or a disable/interface-delete reset the slot to the
+	       * ~0 sentinel while a packet was in flight). Fail open: skip the
+	       * source-FIB redirect entirely and continue down the input
+	       * feature arc on the normal destination L3 path.
 	       */
 	      vnet_feature_next (&next0, b0);
 	      passes++;
@@ -334,12 +364,67 @@ sfr_input_inline (vlib_main_t * vm,
 	  else
 	    {
 	      /*
-	       * hit with a live next-hop: redirect via the resolved
-	       * adjacency, bypassing the destination lookup.
+	       * look the packet's SOURCE address up in the bound source-FIB,
+	       * using the same forwarding lookup the L3 path uses for the
+	       * destination. The lookup is address-agnostic.
 	       */
-	      vnet_buffer (b0)->ip.adj_index[VLIB_TX] = dpo0->dpoi_index;
-	      next0 = dpo0->dpoi_next_node;
-	      redirects++;
+	      if (FIB_PROTOCOL_IP4 == fproto)
+		{
+		  const ip4_header_t *ip0 = vlib_buffer_get_current (b0);
+		  lbi0 =
+		    ip4_fib_forwarding_lookup (fib_index0, &ip0->src_address);
+		  lb0 = load_balance_get (lbi0);
+		  if (PREDICT_FALSE (lb0->lb_n_buckets > 1))
+		    hc0 = ip4_compute_flow_hash (ip0, lb0->lb_hash_config);
+		}
+	      else
+		{
+		  const ip6_header_t *ip0 = vlib_buffer_get_current (b0);
+		  lbi0 = ip6_fib_table_fwding_lookup (fib_index0,
+						      &ip0->src_address);
+		  lb0 = load_balance_get (lbi0);
+		  if (PREDICT_FALSE (lb0->lb_n_buckets > 1))
+		    hc0 = ip6_compute_flow_hash (ip0, lb0->lb_hash_config);
+		}
+
+	      /*
+	       * pick the forwarding bucket. An ECMP source route (several live
+	       * next-hops) hashes the flow so packets of one flow stay pinned
+	       * to one path — exactly as ip4-lookup does; single-next-hop and
+	       * the miss/dead-next-hop (drop) cases collapse to bucket 0.
+	       */
+	      if (PREDICT_FALSE (lb0->lb_n_buckets > 1))
+		{
+		  vnet_buffer (b0)->ip.flow_hash = hc0;
+		  dpo0 = load_balance_get_fwd_bucket (
+		    lb0, hc0 & (lb0->lb_n_buckets_minus_1));
+		}
+	      else
+		{
+		  dpo0 = load_balance_get_bucket_i (lb0, 0);
+		}
+
+	      if (dpo_is_drop (dpo0))
+		{
+		  /*
+		   * miss (source not a member, hits the table's drop default
+		   * route) or a dead next-hop (e.g. BFD down collapsed the
+		   * load-balance to drop): fail open and continue down the
+		   * input feature arc on the normal destination L3 path.
+		   */
+		  vnet_feature_next (&next0, b0);
+		  passes++;
+		}
+	      else
+		{
+		  /*
+		   * hit with a live next-hop: redirect via the resolved
+		   * adjacency, bypassing the destination lookup.
+		   */
+		  vnet_buffer (b0)->ip.adj_index[VLIB_TX] = dpo0->dpoi_index;
+		  next0 = dpo0->dpoi_next_node;
+		  redirects++;
+		}
 	    }
 
 	  if (PREDICT_FALSE (b0->flags & VLIB_BUFFER_IS_TRACED))
