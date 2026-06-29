@@ -12,6 +12,13 @@ features:
   - The source-FIB table is an ordinary FIB table, so its routes are programmed
     with the standard ip_route_add_del path; SFR adds no route management of its
     own.
-description: ""
-state: experimental
+description: "Source-based redirect on the L3 input path: the packet's source
+  address is looked up in a dedicated per-interface source-FIB and, on a hit,
+  redirected via the resolved next-hop; table misses and dead next-hops fail
+  open to the normal destination path. The data path is multi-thread safe;
+  enable/disable (API/CLI) is main-thread (control-plane) only. Validated by
+  test/test_sfr.py for IPv4 and IPv6 (redirect-on-hit, fail-open on
+  miss/dead-next-hop, ECMP flow-pinning, the binding dump API, and the
+  enable/disable control semantics)."
+state: production
 properties: [API, CLI, MULTITHREAD]
