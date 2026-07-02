@@ -1593,6 +1593,15 @@ again:
   if (rv != VAPI_OK)
     return rv;
 
+  /* Robustness: a zero-length message in a multi-message rx batch makes
+   * vapi_sock_recv_internal set *vec_msg = 0 while rv stays VAPI_OK (from a
+   * prior message in the same batch), so *msg can be NULL here even on VAPI_OK.
+   * Dereferencing it (the keepalive msgid peek / dispatch below) is a NULL
+   * SEGV — observed under heavy request/reply load (bird-vpp vppfib 3000-route
+   * churn). Treat a NULL message as "nothing ready" instead of crashing. */
+  if (!*msg)
+    return VAPI_EAGAIN;
+
   if (ctx->handle_keepalives)
     {
       unsigned msgid = be16toh (*(u16 *) *msg);
