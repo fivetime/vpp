@@ -22,7 +22,7 @@
 #   REPO_URL      public base URL, e.g. https://owner.github.io/repo
 # Optional env:
 #   GPG_PASSPHRASE,
-#   SUITES(="trixie bookworm jammy"), EL_VERS(="el9 el10"), COMPONENT(=main),
+#   SUITES(="trixie bookworm jammy"), EL_VERS(="el9"), COMPONENT(=main),
 #   ARCHES_DEB(="amd64 arm64"), ARCHES_RPM(="x86_64 aarch64"), ORIGIN, LABEL
 ###############################################################################
 set -euo pipefail
@@ -163,7 +163,7 @@ cp "$SITE/vpp-archive-keyring.asc" "$SITE/RPM-GPG-KEY-vpp"   # conventional rpm 
 touch "$SITE/.nojekyll"                                       # serve _/dotted paths verbatim
 
 # Distinct VPP versions currently in any apt pool (for display only).
-versions="$(ls "$apt_root"/pool/*/"$COMPONENT"/vpp_*.deb 2>/dev/null | sed -E 's#.*/vpp_([^_]+)_.*#\1#' | sort -uV || true)"
+versions="$(ls "$apt_root"/pool/*/"$COMPONENT"/vpp_*.deb 2>/dev/null | sed -E 's#.*/vpp_([^_]+)_.*#\1#; s/-release$//' | sort -uV || true)"
 ver_items=""
 for v in $versions; do ver_items="${ver_items}<li><code>${v}</code></li>"; done
 [ -z "$ver_items" ] && ver_items="<li>(none yet)</li>"

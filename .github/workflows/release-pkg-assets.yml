@@ -120,14 +120,17 @@ jobs:
               ;;
           esac
 
-          if [[ "$version" == 0.master+* ]]; then
-            tag="master-${version#0.master+}"
+          if [[ "$version" == 0.* ]]; then
+            tag="$version"
+            display_version="${version}-${{ matrix.target }}"
           else
             tag="v${version#v}"
+            display_version="$version"
           fi
 
           {
             echo "version=$version"
+            echo "display_version=$display_version"
             echo "tag=$tag"
             echo "release_tag=pkg-${tag}-${{ matrix.target }}"
           } >> "$GITHUB_OUTPUT"
@@ -141,8 +144,9 @@ jobs:
 
           if ! gh release view "$release_tag" >/dev/null 2>&1; then
             gh release create "$release_tag" \
-              --title "VPP packages ${{ steps.meta.outputs.version }} (${{ matrix.target }})" \
-              --notes "Package assets for VPP ${{ steps.meta.outputs.version }} (${{ matrix.target }}). Repo: ${base}/"
+              --title "VPP packages ${{ steps.meta.outputs.display_version }}" \
+              --notes "Package assets for VPP ${{ steps.meta.outputs.display_version }}. Repo: ${base}/" \
+              --latest=false
           fi
 
           upload_args=()

@@ -5,9 +5,9 @@ publishes them as **GPG-signed apt and yum repositories on GitHub Pages**, so yo
 can `apt install vpp` / `dnf install vpp` on a bare-metal host (no container).
 
 It is intentionally **separate from the container pipeline** — the
-`build-from-*.yml` / `sync-upstream.yml` workflows handle the Docker images and
-are untouched. This pipeline is the `release-packages.yml` workflow plus the two
-files here.
+`build-img-from-*.yml` / `sync-upstream.yml` workflows handle the Docker images.
+Package builds are handled by `build-pkg-from-main.yml`,
+`build-pkg-from-tags.yml`, and `release-pkg-assets.yml`, plus the files here.
 
 Each distro is built on its **own base image** (a package is linked against its
 build distro's libraries) and published under its own apt **suite** (by codename)
@@ -82,23 +82,44 @@ Site URL: `https://<owner>.github.io/<repo>/`.
 
 ## How it runs
 
-`release-packages.yml`:
+`build-pkg-from-tags.yml` publishes packages from release tags:
 
-1. **prepare** — resolve the newest stable `vYY.MM[.P]` tag (same regex as the
-   container build), build a `deb×{trixie,bookworm,jammy} + rpm×{el9}` × arch
-   matrix, and **skip** if a `pkg-v<ver>` GitHub Release already exists (idempotent).
+1. **prepare** — resolve the requested or newest stable `vYY.MM[.P]` tag, build a
+   `deb×{trixie,bookworm,jammy} + rpm×{el9}` × arch matrix, and skip when all
+   per-target package asset Releases already exist unless `force=true`.
 2. **build** — each `(kind, suite/el, arch)` compiles on a native runner from the
-   release tag's source (with `build/docker`, `build/packages`, `.dockerignore`
-   overlaid from `master`) using `Dockerfile.<kind>` + `BASE_IMAGE`, exporting
-   packages as artifacts. No QEMU — VPP source builds are too heavy to emulate.
-3. **publish** — import the key, **accumulate** the new packages onto whatever is
-   already on `gh-pages`, regenerate signed apt (`dpkg-scanpackages` +
-   `apt-ftparchive`) and yum (`createrepo_c`) metadata, push `gh-pages`, and
-   attach the raw `.deb`/`.rpm` to a `pkg-v<ver>` GitHub Release.
+   release tag's source, with package build infra overlaid from `master`, using
+   `Dockerfile.<kind>` + `BASE_IMAGE`. It exports `.deb` / `.rpm` files as
+   workflow artifacts. No QEMU — VPP source builds are too heavy to emulate.
+3. **publish** — import the key, accumulate the new packages onto the existing
+   `gh-pages` package pool, regenerate signed apt (`dpkg-scanpackages` +
+   `apt-ftparchive`) and yum (`createrepo_c`) metadata, and push `gh-pages`.
+4. **trigger-release-assets** — dispatch `release-pkg-assets.yml` with the build
+   run id so raw package files can be attached to GitHub Releases without
+   recompiling if the asset publishing logic needs a rerun.
 
-Triggers: automatically after **Sync from Upstream** succeeds, weekly on a
-schedule (skips if unchanged), or manually via **Run workflow** (with optional
-`version`, `platforms`, and `force` rebuild).
+`build-pkg-from-main.yml` follows the same package/publish flow for `master`.
+Its package version is `0.<short_sha>`, so main branch packages do not collide
+with release-tag packages while still clearly showing the source commit.
+
+`release-pkg-assets.yml` downloads package artifacts from an existing package
+build run and uploads raw `.deb` / `.rpm` files to per-target Releases:
+
+- `pkg-v<ver>-bookworm`
+- `pkg-v<ver>-jammy`
+- `pkg-v<ver>-trixie`
+- `pkg-v<ver>-el9`
+- `pkg-0.<short_sha>-<target>` for main builds
+
+Triggers:
+
+- `build-pkg-from-tags.yml`: automatically after **Sync from Upstream** succeeds,
+  weekly on a schedule, or manually via **Run workflow** with optional `version`,
+  `platforms`, and `force`.
+- `build-pkg-from-main.yml`: on pushes to `master`, or manually with `platforms`
+  and `force`.
+- `release-pkg-assets.yml`: manually, or automatically from a successful package
+  build workflow.
 
 > The repo is rebuilt from the **package pool** each run (no stateful DB), so old
 > versions on `gh-pages` are preserved and the metadata is always reproducible.

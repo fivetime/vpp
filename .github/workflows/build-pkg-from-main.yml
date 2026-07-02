@@ -66,10 +66,11 @@ jobs:
         run: |
           set -euo pipefail
           short_sha="${GITHUB_SHA:0:8}"
-          # Package versions must start with a digit. Keep "master+<sha>" visible
-          # while staying valid for Debian/RPM and VPP's v[0-9]* version discovery.
-          version="0.master+${short_sha}"
-          tag="master-${short_sha}"
+          # Package versions must start with a digit. Use the short SHA as the
+          # pseudo-version for master builds; per-suite/el release names are
+          # formed by release-pkg-assets.yml.
+          version="0.${short_sha}"
+          tag="$version"
 
           # 幂等:该 master SHA 的 package asset Releases 已存在则跳过(force/手动可强制)。
           skip=false
@@ -179,6 +180,9 @@ jobs:
     # rest). download-artifact pulls only the artifacts that exist; build-repo.sh
     # skips empty suites/el<N>.
     if: ${{ always() && needs.prepare.result == 'success' && needs.prepare.outputs.skip != 'true' }}
+    concurrency:
+      group: package-repo-publish
+      cancel-in-progress: false
     runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -295,7 +299,7 @@ jobs:
             echo "## Published VPP ${VERSION}"
             echo "- apt suites: \`trixie\` (Debian 13 / Ubuntu 24.04+), \`bookworm\` (Debian 12), \`jammy\` (Ubuntu 22.04)"
             echo "  - e.g. \`deb [signed-by=…] ${base}/apt trixie main\`"
-            echo "- yum: \`${base}/rpm/el9/\$basearch\` and \`${base}/rpm/el10/\$basearch\`"
+            echo "- yum: \`${base}/rpm/el9/\$basearch\`"
             echo "- Release assets: triggered from build run \`${{ github.run_id }}\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -311,6 +315,7 @@ jobs:
         run: |
           set -euo pipefail
           gh workflow run release-pkg-assets.yml \
+            --ref master \
             -f build_run_id="${{ github.run_id }}" \
             -f target=all \
             -f clobber=true

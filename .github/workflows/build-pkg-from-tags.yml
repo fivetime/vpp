@@ -191,6 +191,9 @@ jobs:
     # rest). download-artifact pulls only the artifacts that exist; build-repo.sh
     # skips empty suites/el<N>.
     if: ${{ always() && needs.prepare.result == 'success' && needs.prepare.outputs.skip != 'true' }}
+    concurrency:
+      group: package-repo-publish
+      cancel-in-progress: false
     runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -307,7 +310,7 @@ jobs:
             echo "## Published VPP ${VERSION}"
             echo "- apt suites: \`trixie\` (Debian 13 / Ubuntu 24.04+), \`bookworm\` (Debian 12), \`jammy\` (Ubuntu 22.04)"
             echo "  - e.g. \`deb [signed-by=…] ${base}/apt trixie main\`"
-            echo "- yum: \`${base}/rpm/el9/\$basearch\` and \`${base}/rpm/el10/\$basearch\`"
+            echo "- yum: \`${base}/rpm/el9/\$basearch\`"
             echo "- Release assets: triggered from build run \`${{ github.run_id }}\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -323,6 +326,7 @@ jobs:
         run: |
           set -euo pipefail
           gh workflow run release-pkg-assets.yml \
+            --ref master \
             -f build_run_id="${{ github.run_id }}" \
             -f target=all \
             -f clobber=true
