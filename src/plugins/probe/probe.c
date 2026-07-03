@@ -33,9 +33,31 @@ probe_main_t probe_main;
 
 #define PROBE_EVENT_SCAN 1
 
-/* Map a resolved forwarding DPO to a reachability verdict. A complete
+/* Descend the forwarding chain from an initial DPO to a leaf. A recursive or
+ * ECMP route nests a load-balance in bucket 0 (the top forwarding load-balance
+ * points at per-path load-balances, each of which points at the real
+ * adjacency), so the first bucket is often itself a DPO_LOAD_BALANCE, not the
+ * leaf. Follow bucket 0 down through load-balance levels until a non-LB DPO is
+ * reached; cap the depth to avoid a pathological loop. */
+static_always_inline const dpo_id_t *
+probe_dpo_leaf (const dpo_id_t *dpo)
+{
+  for (int depth = 0; depth < 8; depth++)
+    {
+      if (dpo->dpoi_type != DPO_LOAD_BALANCE)
+	return dpo;
+      const load_balance_t *lb = load_balance_get (dpo->dpoi_index);
+      if (lb->lb_n_buckets == 0)
+	return dpo; /* empty load-balance: no path, leave as-is (unreachable) */
+      dpo = load_balance_get_bucket_i (lb, 0);
+    }
+  return dpo; /* depth exceeded: treat as unreachable */
+}
+
+/* Map a resolved leaf forwarding DPO to a reachability verdict. A complete
  * adjacency (direct or midchain) can forward to a next-hop; drop / incomplete
- * / glean / receive cannot (black-hole or unresolved). */
+ * / glean / receive cannot (black-hole or unresolved). Call probe_dpo_leaf()
+ * first so recursive/ECMP routes are followed to their leaf adjacency. */
 static_always_inline u8
 probe_dpo_reachable (const dpo_id_t *dpo)
 {
@@ -70,9 +92,11 @@ probe_scan_one (probe_fib_target_t *t)
 	lbi = ip6_fib_table_fwding_lookup (fib_index, &t->prefix.fp_addr.ip6);
 
       lb = load_balance_get (lbi);
-      /* bucket 0 is representative; ECMP with a live path resolves to an
-       * adjacency in bucket 0, a pure miss/drop route to a drop DPO. */
+      /* bucket 0 is representative; descend nested load-balances (recursive /
+       * ECMP routes) to the leaf, then classify. A live path resolves to an
+       * adjacency, a pure miss/drop route to a drop DPO. */
       dpo = load_balance_get_bucket_i (lb, 0);
+      dpo = probe_dpo_leaf (dpo);
       dpo_type = dpo->dpoi_type;
       reachable = probe_dpo_reachable (dpo);
     }
