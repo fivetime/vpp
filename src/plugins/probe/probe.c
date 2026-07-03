@@ -183,12 +183,16 @@ probe_fib_add_del (const fib_prefix_t *prefix, u32 table_id, const u8 *name,
       t->table_id = table_id;
       t->name = key; /* owns the null-terminated key */
 
+      /* Publish as SCALAR_INDEX (not the newer GAUGE dir-type): the value is
+       * identical, but SCALAR_INDEX is understood by every stats client,
+       * including older ones (e.g. govpp v0.13.0) that do not yet decode
+       * STAT_DIR_TYPE_GAUGE and would otherwise read a nil value. */
       t->stat_reachable =
-	vlib_stats_add_gauge ("/probe/fib/%s/reachable", t->name);
+	vlib_stats_add_scalar ("/probe/fib/%s/reachable", t->name);
       t->stat_dpo_type =
-	vlib_stats_add_gauge ("/probe/fib/%s/dpo_type", t->name);
+	vlib_stats_add_scalar ("/probe/fib/%s/dpo_type", t->name);
       t->stat_changes =
-	vlib_stats_add_gauge ("/probe/fib/%s/changes", t->name);
+	vlib_stats_add_scalar ("/probe/fib/%s/changes", t->name);
 
       hash_set_mem (pm->target_by_name, t->name, t - pm->targets);
       probe_scan_kick ();

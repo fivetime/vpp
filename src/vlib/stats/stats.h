@@ -131,6 +131,11 @@ f64 vlib_stats_get_segment_update_rate (void);
 u32 vlib_stats_add_gauge (char *fmt, ...);
 void vlib_stats_set_gauge (u32 entry_index, u64 value);
 
+/* scalar (STAT_DIR_TYPE_SCALAR_INDEX): like a gauge, but the older/narrower
+ * dir-type understood by every stats client (including pre-GAUGE ones). Value
+ * is written with vlib_stats_set_gauge (both store the entry's inline value). */
+u32 vlib_stats_add_scalar (char *fmt, ...);
+
 /* timestamp */
 u32 vlib_stats_add_timestamp (char *fmt, ...);
 void vlib_stats_set_timestamp (u32 entry_index, f64 value);

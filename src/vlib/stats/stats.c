@@ -260,6 +260,18 @@ vlib_stats_add_gauge (char *fmt, ...)
   return vlib_stats_new_entry_internal (STAT_DIR_TYPE_GAUGE, name);
 }
 
+u32
+vlib_stats_add_scalar (char *fmt, ...)
+{
+  va_list va;
+  u8 *name;
+
+  va_start (va, fmt);
+  name = va_format (0, fmt, &va);
+  va_end (va);
+  return vlib_stats_new_entry_internal (STAT_DIR_TYPE_SCALAR_INDEX, name);
+}
+
 void
 vlib_stats_set_gauge (u32 index, u64 value)
 {
