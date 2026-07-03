@@ -1,0 +1,48 @@
+/* SPDX-License-Identifier: Apache-2.0
+ * Copyright (c) 2026 probe plugin contributors.
+ *
+ * probe: off-control-plane data-plane observation. This API registers/removes
+ * FIB-reachability probe targets. It is a *configuration* path (setup, not the
+ * hot path): the periodic lookups and result publishing happen on the plugin's
+ * own process node and the stats segment, never through this API. See
+ * docs/developer/plugins/probe.rst.
+ */
+
+option version = "0.1.0";
+
+import "vnet/ip/ip_types.api";
+
+/** \brief Add or remove a FIB-reachability probe target.
+    The plugin periodically resolves <prefix> in FIB table <table_id> and
+    publishes the verdict to /probe/fib/<name>/{reachable,dpo_type,changes}.
+    @param is_add - add (1) or remove (0)
+    @param table_id - IP4/IP6 FIB table id (VRF), family taken from prefix
+    @param prefix - the target prefix (typically a /32 or /128 next-hop)
+    @param name - stats-segment name for this target (unique)
+*/
+autoreply define probe_fib_add_del
+{
+  u32 client_index;
+  u32 context;
+  bool is_add;
+  u32 table_id;
+  vl_api_prefix_t prefix;
+  string name[64];
+};
+
+/** \brief Dump the registered FIB-reachability probe targets + last verdicts. */
+define probe_fib_dump
+{
+  u32 client_index;
+  u32 context;
+};
+
+define probe_fib_details
+{
+  u32 context;
+  u32 table_id;
+  vl_api_prefix_t prefix;
+  string name[64];
+  u8 reachable;
+  u8 dpo_type;
+};
