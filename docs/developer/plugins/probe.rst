@@ -5,8 +5,9 @@ probe: off-control-plane data-plane observation
 
 .. note::
 
-   Design draft. v1 implements FIB-reachability observation only; the
-   framework below reserves extension points for the remaining task types.
+   v1 (FIB-reachability observation) is implemented and lab-validated; the
+   framework below reserves extension points for the remaining task types
+   (still design-stage).
 
 Introduction
 ------------
@@ -132,11 +133,14 @@ unresolved?"* — the read-only equivalent of an active reachability check,
 without sending a packet or dumping the table through the API.
 
 Mechanism: the task's process node periodically resolves each registered
-target via ``ip[46]_fib_table_fwding_lookup`` → load-balance → DPO, and
-classifies the result:
+target via ``ip[46]_fib_forwarding_lookup`` → load-balance → **leaf DPO**, and
+classifies the result. A recursive or ECMP route nests a per-path load-balance
+in bucket 0 (the top forwarding load-balance points at per-path load-balances,
+each pointing at the real adjacency), so the task follows bucket 0 **down
+through the load-balance levels** to the leaf before classifying:
 
-* **reachable** — a real interface adjacency (``dpo-adjacency`` with a resolved
-  next-hop / rewrite);
+* **reachable** — a real interface adjacency (``dpo-adjacency`` /
+  ``dpo-adjacency-midchain`` with a resolved next-hop / rewrite);
 * **black-holed** — a ``dpo-drop`` (e.g. a ``via drop`` route, or a
   fail-open drop next-hop);
 * **unresolved** — ``dpo-adjacency-incomplete`` / glean (next-hop not yet
@@ -154,11 +158,12 @@ binary API / CLI:
 
 ::
 
-  probe fib add table <table-id> <prefix> [name <name>] [interval <sec>]
-  probe fib del table <table-id> <prefix>
+  probe fib [add|del] <prefix> table <table-id> name <name>
   show probe fib
 
-Binary API: ``probe_fib_add_del`` / ``probe_fib_dump``.
+The ``<prefix>`` must carry a length (``/32``, ``/128``); ``name`` is the
+unique stats-segment key for the target. Binary API: ``probe_fib_add_del`` /
+``probe_fib_dump``.
 
 Output (stats segment)
 ----------------------
@@ -169,9 +174,15 @@ thread involvement:
 
 ::
 
-  /probe/fib/<name>/reachable      gauge  1 = reachable, 0 = not
-  /probe/fib/<name>/dpo_type       gauge  encoded DPO class (adjacency/drop/incomplete)
-  /probe/fib/<name>/last_change    gauge  timestamp of last state transition
+  /probe/fib/<name>/reachable      1 = reachable, 0 = not
+  /probe/fib/<name>/dpo_type       leaf DPO class (adjacency / drop / incomplete)
+  /probe/fib/<name>/changes        count of reachable<->unreachable transitions
+
+These are published as ``STAT_DIR_TYPE_SCALAR_INDEX`` entries (via
+``vlib_stats_add_scalar`` + ``vlib_stats_set_gauge``), **not** the newer
+``STAT_DIR_TYPE_GAUGE``: the value is identical, but SCALAR_INDEX is decoded by
+every stats client, including older ones (e.g. govpp v0.13.0) that do not yet
+map the GAUGE dir-type and would otherwise read a nil value.
 
 Threading and read-safety
 -------------------------
