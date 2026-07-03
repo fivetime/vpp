@@ -160,6 +160,10 @@ RUN --mount=type=bind,from=builder,source=/pkg,target=/tmp/pkg \
     && apt-get install -y --no-install-recommends \
         /tmp/pkg/vpp-dev_*.deb \
         /tmp/pkg/libvppinfra-dev_*.deb \
+        /tmp/pkg/vpp-dbg_*.deb \
     && rm -rf /var/lib/apt/lists/* \
     # 构建期自检:vapi 头必须就位(下游 --with-vpp 靠它)
-    && test -f /usr/include/vapi/vapi.h
+    && test -f /usr/include/vapi/vapi.h \
+    # vpp-dbg 提供 /usr/lib/debug 下的 DWARF 符号(匹配 release 二进制、时序不变),
+    # 供 gdb 解析 libvlibmemory 等静态函数 + 在 dump handler 下断点(调试 dump-stall)。
+    && test -d /usr/lib/debug
