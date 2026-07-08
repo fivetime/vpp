@@ -478,7 +478,6 @@ quic_udp_session_connected_callback (u32 quic_app_index, u32 ctx_index,
   quic_build_sockaddr (sa, &tc->rmt_ip, tc->rmt_port, tc->is_ip4);
 
   ret = quic_eng_connect (ctx, ctx_index, thread_index, sa);
-  quic_eng_send_packets (ctx);
 
   return ret;
 }
@@ -508,6 +507,7 @@ quic_udp_session_cleanup_callback (session_t *udp_session,
 			QUIC_TIMER_TX);
   quic_eng_crypto_context_release (ctx->crypto_context_index,
 				   ctx->c_thread_index);
+  vec_free (ctx->srv_hostname);
   quic_ctx_free (qm, ctx);
 }
 
