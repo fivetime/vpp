@@ -128,6 +128,13 @@ probe_process (vlib_main_t *vm, vlib_node_runtime_t *rt, vlib_frame_t *f)
       (void) vlib_process_get_events (vm, &event_data);
       vec_reset_length (event_data);
 
+      /* Liveness heartbeat: advance once per scan. The process is timer-driven,
+       * so this beats even when VPP is idle; a stalled main thread cannot reach
+       * here, so a frozen /probe/heartbeat is the wedge signal agents cannot get
+       * from the adaptive-sleep-frozen worker loop counters (§4.1 blind spot). */
+      pm->beats++;
+      vlib_stats_set_gauge (pm->stat_heartbeat, pm->beats);
+
       probe_fib_target_t *t;
       pool_foreach (t, pm->targets)
 	{
@@ -292,8 +299,8 @@ probe_fib_show_cmd (vlib_main_t *vm, unformat_input_t *input,
   probe_main_t *pm = &probe_main;
   probe_fib_target_t *t;
 
-  vlib_cli_output (vm, "scan interval: %.1fs, targets: %u", pm->scan_interval,
-		   pool_elts (pm->targets));
+  vlib_cli_output (vm, "scan interval: %.1fs, heartbeat: %llu, targets: %u",
+		   pm->scan_interval, pm->beats, pool_elts (pm->targets));
   pool_foreach (t, pm->targets)
     {
       vlib_cli_output (
@@ -327,6 +334,11 @@ probe_init (vlib_main_t *vm)
   pm->target_by_name = hash_create_string (0, sizeof (uword));
   pm->scan_interval = PROBE_DEFAULT_SCAN_INTERVAL;
   pm->process_node_index = probe_process_node.index;
+
+  /* Liveness heartbeat gauge (SCALAR_INDEX for old-client compat, matching the
+   * per-target gauges). Bumped once per scan by probe_process. */
+  pm->beats = 0;
+  pm->stat_heartbeat = vlib_stats_add_scalar ("/probe/heartbeat");
 
   err = probe_api_hookup (vm);
   return err;

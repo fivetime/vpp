@@ -47,15 +47,30 @@ typedef struct probe_main_t_
   f64 scan_interval;	   /* seconds between scans */
   u32 process_node_index;  /* the vlib_process node */
 
+  /* Liveness heartbeat: a monotonically increasing counter bumped once per
+   * process scan, published as /probe/heartbeat. Because the process runs on a
+   * timer (vlib_process_wait_for_event_or_clock), it advances even when VPP is
+   * fully idle — unlike the worker vector/loop counters that freeze under
+   * adaptive sleep (the §4.1 "can't tell idle from wedged" blind spot). An
+   * agent reading the stats segment infers a STALLED main thread (wedge) when
+   * this stops advancing while the segment is still mapped; a dead process
+   * instead removes the stats socket, which the agent sees as
+   * ErrStatsDisconnected. Together they cover both death modes off the main
+   * thread, without a single binary-API call. */
+  u32 stat_heartbeat;
+  u64 beats;
+
   vlib_main_t *vlib_main;
   vnet_main_t *vnet_main;
 } probe_main_t;
 
 extern probe_main_t probe_main;
 
-/* Default scan cadence (seconds). Lookups are microseconds; this only bounds
- * how quickly a FIB change surfaces as a stat. */
-#define PROBE_DEFAULT_SCAN_INTERVAL 3.0
+/* Default scan cadence (seconds). Lookups are microseconds; this bounds how
+ * quickly a FIB change surfaces as a stat AND the heartbeat cadence (so the
+ * agent's wedge-detection floor is a small multiple of this). 1s keeps both
+ * responsive at negligible cost. */
+#define PROBE_DEFAULT_SCAN_INTERVAL 1.0
 
 /* add/del a target (shared by CLI + binary API). Returns 0 on success. */
 int probe_fib_add_del (const fib_prefix_t *prefix, u32 table_id,
