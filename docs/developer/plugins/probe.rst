@@ -165,6 +165,37 @@ The ``<prefix>`` must carry a length (``/32``, ``/128``); ``name`` is the
 unique stats-segment key for the target. Binary API: ``probe_fib_add_del`` /
 ``probe_fib_dump``.
 
+Classify session point-lookup
+-----------------------------
+
+``probe_classify_lookup`` resolves classify sessions by match key **without**
+dumping the whole table. VPP core exposes only ``classify_session_dump`` (whole
+table, ``table_id`` only — no match filter), so a control-plane client that
+wants the hit-next index of a *specific* session must otherwise stream the
+entire table across the main thread. For an edge-wide shared mask table that can
+be hundreds of thousands of sessions, paid on **every** membership change — the
+control plane only ever wanted a handful of keys.
+
+This message does the same O(1) hash lookup the data path does per packet
+(``vnet_classify_hash_packet`` + ``vnet_classify_find_entry``, with ``now = 0``
+so it never mutates the entry's ``hits`` / ``last_heard``), in a batch:
+
+* Request: ``table_id``, ``key_len`` (bytes per key =
+  ``(skip_n_vectors + match_n_vectors) * 16`` for that table — the same full
+  match buffer ``classify_add_del_session`` takes), and ``match`` = the keys
+  concatenated (count = ``match_len / key_len``). All keys in one request share
+  one table (hence one ``key_len``); a caller with multiple masks issues one
+  request per table.
+* Reply: ``hits[count]``, positionally aligned to the request keys — each is the
+  session's ``next_index`` (the policer index in policer-classify mode), or
+  ``~0`` (``0xffffffff``) if no session matches.
+
+It runs on the main thread like every binary-API handler, so it is serialized
+with ``classify_add_del_session`` writes and can never observe a torn write.
+Cost is O(1) per key versus O(table) per dump: the win is algorithmic (read the
+K keys you care about, not the whole table), not a thread change — a point
+lookup is a hash probe regardless of which thread runs it.
+
 Output (stats segment)
 ----------------------
 
