@@ -14,6 +14,7 @@
 #include <probe/probe.h>
 #include <vnet/fib/fib_table.h>
 #include <vnet/ip/ip_types_api.h>
+#include <vnet/classify/vnet_classify.h>
 
 #include <vpp/app/version.h>
 
@@ -85,6 +86,67 @@ vl_api_probe_fib_dump_t_handler (vl_api_probe_fib_dump_t *mp)
     {
       probe_fib_send_details (t, rp, mp->context);
     }
+}
+
+/* Sanity ceiling on one batch, so a malformed match_len/key_len cannot make us
+ * over-allocate the reply. The agent chunks well below this. */
+#define PROBE_CLASSIFY_LOOKUP_MAX 65536
+
+static void
+vl_api_probe_classify_lookup_t_handler (vl_api_probe_classify_lookup_t *mp)
+{
+  vnet_classify_main_t *cm = &vnet_classify_main;
+  vl_api_probe_classify_lookup_reply_t *rmp;
+  u32 table_index = ntohl (mp->table_id);
+  u32 key_len = ntohl (mp->key_len);
+  u32 match_len = ntohl (mp->match_len);
+  vnet_classify_table_t *t = 0;
+  u32 count = 0;
+  int rv = 0;
+  u32 i;
+
+  /* Derive the key count from the flat match buffer, validating against the
+   * table's fixed match-buffer size. On any error we reply with count=0 (an
+   * empty hits vector) and a non-zero retval; the loop below never runs (so t
+   * is never dereferenced). */
+  if (key_len == 0 || (match_len % key_len) != 0)
+    {
+      rv = VNET_API_ERROR_INVALID_VALUE;
+      goto reply;
+    }
+  count = match_len / key_len;
+  if (count > PROBE_CLASSIFY_LOOKUP_MAX)
+    {
+      rv = VNET_API_ERROR_INVALID_VALUE;
+      count = 0;
+      goto reply;
+    }
+  if (pool_is_free_index (cm->tables, table_index))
+    {
+      rv = VNET_API_ERROR_NO_SUCH_TABLE;
+      count = 0;
+      goto reply;
+    }
+  t = pool_elt_at_index (cm->tables, table_index);
+  if (key_len != (t->skip_n_vectors + t->match_n_vectors) * sizeof (u32x4))
+    {
+      rv = VNET_API_ERROR_INVALID_VALUE;
+      count = 0;
+      goto reply;
+    }
+
+reply:
+  REPLY_MACRO3 (VL_API_PROBE_CLASSIFY_LOOKUP_REPLY, count * sizeof (u32), ({
+		  rmp->count = htonl (count);
+		  for (i = 0; i < count; i++)
+		    {
+		      u8 *h = mp->match + (uword) i * key_len;
+		      u32 hash = vnet_classify_hash_packet (t, h);
+		      vnet_classify_entry_t *e =
+			vnet_classify_find_entry (t, h, hash, 0.0);
+		      rmp->hits[i] = htonl (e ? e->next_index : ~0);
+		    }
+		}));
 }
 
 #include <probe/probe.api.c>

@@ -46,3 +46,49 @@ define probe_fib_details
   u8 reachable;
   u8 dpo_type;
 };
+
+/** \brief Batch point-lookup of classify sessions in ONE table by match key.
+
+    Resolves each key to the hit-next index installed on its classify session
+    (the policer index in policer-classify mode), or ~0 if no session matches.
+    This is the O(1)-per-key alternative to a whole-table classify_session_dump
+    on the incremental reconcile hot path: each key is a single hash lookup —
+    exactly the one the data plane does per packet (vnet_classify_find_entry) —
+    so a member add/remove costs O(pool) point lookups instead of dumping the
+    edge-wide shared mask table. The handler runs on the main thread, serialized
+    with classify_add_del_session writes, and passes now=0 so it never mutates
+    the entry's hit counter / last_heard.
+
+    All keys in one request share ONE table (hence one key_len), because a
+    classify table's match buffer length is fixed by its mask. The caller groups
+    its keys by mask/table and issues one request per table.
+
+    @param table_id - the classify table to look up in
+    @param key_len  - bytes per key = (skip_n_vectors + match_n_vectors) * 16 for
+                      this table (same full match buffer classify_add_del_session
+                      takes: skip vectors + match vectors, address at its absolute
+                      packet offset)
+    @param match_len - total bytes in <match> = count * key_len
+    @param match     - the keys, concatenated (count of them = match_len/key_len)
+*/
+define probe_classify_lookup
+{
+  u32 client_index;
+  u32 context;
+  u32 table_id;
+  u32 key_len;
+  u32 match_len;
+  u8 match[match_len];
+};
+
+/** \brief Reply to probe_classify_lookup.
+    @param count - number of results (== request count), positionally aligned
+    @param hits  - per-key hit-next index, or ~0 (0xffffffff) if not found
+*/
+define probe_classify_lookup_reply
+{
+  u32 context;
+  i32 retval;
+  u32 count;
+  u32 hits[count];
+};
