@@ -8,6 +8,13 @@
 #include <arpa/inet.h>
 #include <stddef.h>
 #include <assert.h>
+#include <poll.h>		/* rank-1b: POLLOUT wait to complete a partial UDS write */
+
+/* rank-1a: upper bound on a single API message body from the length prefix, used to
+   reject a desynced/corrupt stream frame before a ~4GB vec_validate would OOM-panic
+   the client's fixed non-expandable heap.  64MB is orders of magnitude above any real
+   VPP API message (even a large dump detail is KB), so it never rejects a valid msg. */
+#define VAPI_MAX_MSG_LEN (64u << 20)
 
 #include <vpp-api/vapi/vapi_dbg.h>
 #include <vpp-api/vapi/vapi.h>
@@ -388,12 +395,69 @@ vapi_sock_get_errno (int err)
   return VAPI_ESOCK_FAILURE;
 }
 
+/* rank-1b (bird-vpp /32 churn OOM root cause): send ALL bytes of an iovec array on the
+   nonblocking UDS SOCK_STREAM, completing any PARTIAL write.  The old code returned
+   VAPI_EAGAIN whenever sendmsg committed 0<n<total_len bytes WITHOUT tracking the n
+   already on the wire; the caller then retries the WHOLE message (vapi's EAGAIN
+   contract), so those n orphaned bytes DESYNC the length-prefixed framing.  A later
+   vapi_sock_recv_internal then reads a garbage msgbuf_t with an ~4GB data_len and
+   vec_validate's it against the fixed non-expandable client mspace -> os_out_of_memory
+   -> os_panic (RSS flat then sudden cliff).  Fix: only return VAPI_EAGAIN when NOTHING
+   was sent (n==0 -> safe for the caller to retry the whole message); once any byte is
+   committed, finish the remaining bytes here (briefly waiting for POLLOUT) so a message
+   is always framed atomically on the wire.  iov[] is mutated in place (caller's stack). */
+#define VAPI_SEND_POLLOUT_MS 2000
+static vapi_error_e
+vapi_sendmsg_all (int fd, struct iovec *iov, int iovcnt, size_t total_len)
+{
+  size_t sent = 0;
+  while (sent < total_len)
+    {
+      struct msghdr hdr;
+      clib_memset (&hdr, 0, sizeof (hdr));
+      hdr.msg_iov = iov;
+      hdr.msg_iovlen = iovcnt;
+      ssize_t n = sendmsg (fd, &hdr, 0);
+      if (n < 0)
+	{
+	  if (errno == EINTR)
+	    continue;
+	  if (errno == EAGAIN || errno == EWOULDBLOCK)
+	    {
+	      if (sent == 0)
+		return VAPI_EAGAIN; /* nothing committed -> whole-message retry is safe */
+	      /* mid-message: bailing would desync the stream; wait for send room */
+	      struct pollfd p = { .fd = fd, .events = POLLOUT };
+	      poll (&p, 1, VAPI_SEND_POLLOUT_MS);
+	      continue;
+	    }
+	  return vapi_sock_get_errno (errno);
+	}
+      sent += (size_t) n;
+      /* advance iov past the n bytes just written */
+      size_t adv = (size_t) n;
+      while (adv > 0 && iovcnt > 0)
+	{
+	  if (adv >= iov->iov_len)
+	    {
+	      adv -= iov->iov_len;
+	      iov++;
+	      iovcnt--;
+	    }
+	  else
+	    {
+	      iov->iov_base = (u8 *) iov->iov_base + adv;
+	      iov->iov_len -= adv;
+	      adv = 0;
+	    }
+	}
+    }
+  return VAPI_OK;
+}
+
 static vapi_error_e
 vapi_sock_send (vapi_ctx_t ctx, u8 *msg)
 {
-  size_t n;
-  struct msghdr hdr;
-
   const size_t len = vec_len (msg);
   const size_t total_len = len + sizeof (msgbuf_t);
 
@@ -408,32 +472,18 @@ vapi_sock_send (vapi_ctx_t ctx, u8 *msg)
     [1] = { .iov_base = msg, .iov_len = len },
   };
 
-  clib_memset (&hdr, 0, sizeof (hdr));
-  hdr.msg_iov = bufs;
-  hdr.msg_iovlen = 2;
-
-  n = sendmsg (ctx->client_socket.fd, &hdr, 0);
-  if (n < 0)
-    {
-      return vapi_sock_get_errno (errno);
-    }
-
-  if (n < total_len)
-    {
-      return VAPI_EAGAIN;
-    }
+  vapi_error_e rv =
+    vapi_sendmsg_all (ctx->client_socket.fd, bufs, 2, total_len);
+  if (rv != VAPI_OK)
+    return rv;
 
   vec_free (msg);
-
   return VAPI_OK;
 }
 
 static vapi_error_e
 vapi_sock_send2 (vapi_ctx_t ctx, u8 *msg1, u8 *msg2)
 {
-  size_t n;
-  struct msghdr hdr;
-
   const size_t len1 = vec_len (msg1);
   const size_t len2 = vec_len (msg2);
   const size_t total_len = len1 + len2 + 2 * sizeof (msgbuf_t);
@@ -457,24 +507,15 @@ vapi_sock_send2 (vapi_ctx_t ctx, u8 *msg1, u8 *msg2)
     [3] = { .iov_base = msg2, .iov_len = len2 },
   };
 
-  clib_memset (&hdr, 0, sizeof (hdr));
-  hdr.msg_iov = bufs;
-  hdr.msg_iovlen = 4;
-
-  n = sendmsg (ctx->client_socket.fd, &hdr, 0);
-  if (n < 0)
-    {
-      return vapi_sock_get_errno (errno);
-    }
-
-  if (n < total_len)
-    {
-      return VAPI_EAGAIN;
-    }
+  /* rank-1b: complete partial writes (see vapi_sendmsg_all). EAGAIN only when nothing
+     was sent, so the caller's whole-message retry never desyncs the stream. */
+  vapi_error_e rv =
+    vapi_sendmsg_all (ctx->client_socket.fd, bufs, 4, total_len);
+  if (rv != VAPI_OK)
+    return rv;
 
   vec_free (msg1);
   vec_free (msg2);
-
   return VAPI_OK;
 }
 
@@ -523,6 +564,24 @@ vapi_sock_recv_internal (vapi_ctx_t ctx, u8 **vec_msg, u32 timeout)
 
       mbp = (msgbuf_t *) (sock->rx_buffer);
       data_len = ntohl (mbp->data_len);
+      /* rank-1a (defense-in-depth for the /32-churn OOM): bound data_len BEFORE
+	 vec_validate.  A desynced/corrupt length-prefixed stream yields an implausible
+	 data_len; vec_validate'ing it (up to ~4GB) against the fixed non-expandable
+	 client mspace calls clib_mem_heap_alloc -> os_out_of_memory -> os_panic and takes
+	 down the whole process.  No legitimate VPP API message approaches VAPI_MAX_MSG_LEN,
+	 so treat an over-max length as a broken connection: reset the rx buffer and return
+	 VAPI_ECONNRESET, letting the client tear down and reconnect (resync) instead of
+	 OOM-crashing.  (rank-1b removes the primary desync source; this is the safety net
+	 that also hardens against a malformed/hostile peer.) */
+      if (data_len > VAPI_MAX_MSG_LEN)
+	{
+	  clib_warning (
+	    "vapi: implausible msg data_len=%u (> VAPI_MAX_MSG_LEN=%u): stream "
+	    "desync/corruption, treating as connection reset",
+	    data_len, (u32) VAPI_MAX_MSG_LEN);
+	  vec_set_len (sock->rx_buffer, 0);
+	  return VAPI_ECONNRESET;
+	}
       current_rx_index = vec_len (sock->rx_buffer);
       vec_validate (sock->rx_buffer, current_rx_index + data_len);
       mbp = (msgbuf_t *) (sock->rx_buffer);

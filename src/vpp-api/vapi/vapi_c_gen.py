@@ -991,7 +991,17 @@ vapi_send_with_control_ping (vapi_ctx_t ctx, void *msg, u32 context)
     }
   ping->header.context = context;
   vapi_msg_control_ping_hton (ping);
-  return vapi_send2 (ctx, msg, ping);
+  vapi_error_e rv = vapi_send2 (ctx, msg, ping);
+  if (rv != VAPI_OK)
+    {
+      /* rank-2 (bird-vpp dump clib-heap leak): vapi_send2 transfers (frees) both msgs
+         only on VAPI_OK; on failure (EAGAIN when the socket buffer is full, or a hard
+         error) it frees neither.  `msg` is the caller's, but `ping` was allocated here
+         and would leak into the fixed client heap on every failed dump send (~48-64B
+         each) -> gradual os_out_of_memory under dump/rescan pressure.  Free it here. */
+      vapi_msg_free (ctx, ping);
+    }
+  return rv;
 }
 """
         print("#ifndef VAPI_EMIT_TYPES_ONLY")
