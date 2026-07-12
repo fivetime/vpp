@@ -550,14 +550,11 @@ vapi_sock_recv_internal (vapi_ctx_t ctx, u8 **vec_msg, u32 timeout)
 
       if (vec_len (sock->rx_buffer) >= data_len + sizeof (*mbp))
 	{
-	  if (data_len)
+	  bool have_msg = (data_len != 0);
+	  if (have_msg)
 	    {
 	      vec_add (*vec_msg, mbp->data, data_len);
 	      rv = VAPI_OK;
-	    }
-	  else
-	    {
-	      *vec_msg = 0;
 	    }
 
 	  if (vec_len (sock->rx_buffer) == data_len + sizeof (*mbp))
@@ -566,8 +563,27 @@ vapi_sock_recv_internal (vapi_ctx_t ctx, u8 **vec_msg, u32 timeout)
 	    vec_delete (sock->rx_buffer, data_len + sizeof (*mbp), 0);
 	  mbp = 0;
 
-	  /* Quit if we're out of data, and not expecting a ping reply */
-	  if (vec_len (sock->rx_buffer) == 0)
+	  /* Return exactly ONE message per recv: any further messages already
+	   * buffered in rx_buffer are framed by the next vapi_sock_recv() call
+	   * (this function resumes from rx_buffer's contents, no socket read is
+	   * needed).  The former loop kept going until rx_buffer drained,
+	   * vec_add'ing every backlogged message onto the same *vec_msg -- so a
+	   * batch of N coalesced replies was concatenated into one buffer of
+	   * which only the first was ever dispatched; replies 2..N were silently
+	   * lost, and (when a zero-length framing followed a data message) the
+	   * former `else { *vec_msg = 0; }` branch even leaked the accumulated
+	   * vector by overwriting its pointer.  Under a deep NONBLOCKING vapi
+	   * pipeline (bird-vpp vppfib /32 churn, request ring 1024) pipelined
+	   * replies routinely coalesce into a single recv, so this dropped
+	   * confirmations en masse: the originating requests never completed
+	   * (client-visible "materialized" state diverged from the VPP FIB) and
+	   * were retried forever (async-error storm), while the ever-larger
+	   * concatenated buffer ratcheted the fixed, non-growable client heap's
+	   * high-water until os_out_of_memory -> os_panic.  Framing one message
+	   * per recv keeps each buffer a single message and dispatches every
+	   * reply.  A zero-length framing carries no dispatchable payload, so
+	   * keep draining to the next message rather than return empty. */
+	  if (have_msg || vec_len (sock->rx_buffer) == 0)
 	    break;
 	}
     }
