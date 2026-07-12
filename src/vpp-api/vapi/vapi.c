@@ -255,23 +255,30 @@ vapi_msg_alloc (vapi_ctx_t ctx, size_t size)
 void
 vapi_msg_free (vapi_ctx_t ctx, void *msg)
 {
-  if (!ctx->connected)
-    {
-      return;
-    }
-
 #if VAPI_DEBUG_ALLOC
   vapi_trace_free (msg);
 #endif
 
   if (ctx->use_uds)
     {
+      /* UDS messages are private client-heap vectors (vapi_sock_msg_alloc /
+       * vapi_sock_recv_internal); reclaiming one needs no live connection.
+       * The former `if (!ctx->connected) return;` guard here silently dropped
+       * (leaked) every in-flight request/reply vector handed back to us across
+       * a disconnect/teardown window.  Under sustained route churn that also
+       * cycles the link (watchdog/link-dead teardown, VPP restart -- bird-vpp
+       * vppfib /32 churn), that leak accumulated into the fixed, non-growable
+       * client heap and tripped os_out_of_memory -> os_panic.  Gate only the
+       * shared-memory path (its ring is invalid once disconnected); always
+       * free the private UDS vector. */
       vec_free (msg);
+      return;
     }
-  else
-    {
-      vl_msg_api_free (msg);
-    }
+
+  if (!ctx->connected)
+    return;
+
+  vl_msg_api_free (msg);
 }
 
 vapi_msg_id_t
@@ -1350,6 +1357,14 @@ vapi_sock_disconnect (vapi_ctx_t ctx)
       if (ntohs (rp->_vl_msg_id) != VL_API_SOCKCLNT_DELETE_REPLY)
 	{
 	  clib_warning ("queue drain: %d", ntohs (rp->_vl_msg_id));
+	  /* Reclaim this drained reply's client-heap vector before looping.
+	   * Without this each backlogged reply (large under route churn) was
+	   * appended onto the same growing `msg` vector and leaked, and the
+	   * stale msg-id at msg[0] was re-read every iteration so the delete
+	   * reply was never matched (2s spin on top of the leak).  vec_free
+	   * frees the vector and resets msg to 0 so the next recv starts
+	   * fresh. */
+	  vec_free (msg);
 	  continue;
 	}
       vapi_sockclnt_delete_reply_t_handler (
@@ -1357,6 +1372,7 @@ vapi_sock_disconnect (vapi_ctx_t ctx)
       break;
     }
 fail:
+  vec_free (msg);
   clib_socket_close (&ctx->client_socket);
   clib_socket_free (&ctx->client_socket);
   vapi_api_name_and_crc_free (ctx);
