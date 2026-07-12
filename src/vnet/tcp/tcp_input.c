@@ -504,6 +504,10 @@ tcp_handle_postponed_dequeues (tcp_worker_ctx_t * wrk)
       if (PREDICT_FALSE (!tc->burst_acked))
 	continue;
 
+      /* Preserve the time at which the local flight drained */
+      if (tc->snd_una == tc->snd_nxt)
+	tc->delivered_time = tcp_time_now_us (tc->c_thread_index);
+
       /* Dequeue the newly ACKed bytes */
       session_tx_fifo_dequeue_drop (&tc->connection, tc->burst_acked);
       tcp_validate_txf_size (tc, tc->snd_nxt - tc->snd_una);
@@ -628,21 +632,6 @@ tcp_cc_congestion_undo (tcp_connection_t * tc)
 }
 
 static inline u8
-tcp_cc_is_spurious_timeout_rxt (tcp_connection_t * tc)
-{
-  return (tcp_in_recovery (tc) && tc->rto_boff == 1
-	  && tc->snd_rxt_ts
-	  && tcp_opts_tstamp (&tc->rcv_opts)
-	  && timestamp_lt (tc->rcv_opts.tsecr, tc->snd_rxt_ts));
-}
-
-static inline u8
-tcp_cc_is_spurious_retransmit (tcp_connection_t * tc)
-{
-  return (tcp_cc_is_spurious_timeout_rxt (tc));
-}
-
-static inline u8
 tcp_should_fastrecover (tcp_connection_t * tc, u8 has_sack)
 {
   if (!has_sack)
@@ -683,6 +672,8 @@ tcp_cc_exit_recovery (tcp_connection_t *tc)
 
   if (tcp_cc_is_spurious_retransmit (tc))
     {
+      if (tcp_opts_sack_permitted (&tc->rcv_opts))
+	scoreboard_recompute_sack_loss (&tc->sack_sb, tc->snd_una, tc->snd_mss);
       tcp_cc_congestion_undo (tc);
       is_spurious = 1;
     }
@@ -843,6 +834,21 @@ tcp_cc_handle_event (tcp_connection_t * tc, tcp_rate_sample_t * rs,
   /* RFC6675: If the incoming ACK is a cumulative acknowledgment,
    * reset dupacks to 0. Also needed if in congestion recovery */
   tc->rcv_dupacks = 0;
+
+  /* RFC 3522: Eifel spurious retransmit check */
+  if (PREDICT_FALSE (tc->snd_rxt_ts))
+    {
+      if (tcp_cc_is_spurious_retransmit (tc))
+	{
+	  tcp_cc_exit_recovery (tc);
+	  if (tcp_should_fastrecover (tc, has_sack))
+	    tcp_cc_enter_recovery (tc, has_sack);
+	  else
+	    tcp_cc_rcv_ack (tc, rs);
+	  return;
+	}
+      tc->snd_rxt_ts = 0;
+    }
 
   if (tcp_in_recovery (tc))
     tcp_cc_rcv_ack (tc, rs);
