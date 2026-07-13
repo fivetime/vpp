@@ -549,7 +549,19 @@ vapi_sock_recv_internal (vapi_ctx_t ctx, u8 **vec_msg, u32 timeout)
 	  if (n < 0)
 	    {
 	      if (errno == EAGAIN && clib_time_now (&ctx->time) >= deadline)
-		return VAPI_EAGAIN;
+		{
+		  /* DESYNC FIX (bird-vpp): record how many HEADER bytes were actually
+		     received before yielding, so the next call resumes the partial
+		     read from here.  Without this, rx_buffer keeps its vec_validate'd
+		     length (sizeof(msgbuf_t)) while fewer bytes were received; the
+		     resume then reads current_rx_index = vec_len = full header, skips
+		     the rest of the header, and reads data_len from a half-received
+		     header -> stream desync (implausible data_len on a later message).
+		     Under bird's NONBLOCKING deep pipeline a message routinely spans
+		     multiple recv attempts, so this fired constantly. */
+		  vec_set_len (sock->rx_buffer, current_rx_index);
+		  return VAPI_EAGAIN;
+		}
 
 	      if (errno == EAGAIN)
 		continue;
@@ -594,7 +606,17 @@ vapi_sock_recv_internal (vapi_ctx_t ctx, u8 **vec_msg, u32 timeout)
 	  if (n < 0)
 	    {
 	      if (errno == EAGAIN && clib_time_now (&ctx->time) >= deadline)
-		return VAPI_EAGAIN;
+		{
+		  /* DESYNC FIX (bird-vpp): same as the header loop -- record the
+		     bytes of the message BODY actually received before yielding so
+		     the next call resumes the partial body read.  Without it, the
+		     resume treats the message as fully received (vec_len was
+		     vec_validate'd to msg_size), dispatches a garbage-tailed message,
+		     and leaves the unread body bytes in the socket -> the next recv
+		     reads mid-message -> desync (implausible data_len). */
+		  vec_set_len (sock->rx_buffer, current_rx_index);
+		  return VAPI_EAGAIN;
+		}
 
 	      if (errno == EAGAIN)
 		continue;
