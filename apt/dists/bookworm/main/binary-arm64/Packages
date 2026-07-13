@@ -1,15 +1,15 @@
 Package: libvppinfra
 Source: vpp
-Version: 0.d10868b9-release
+Version: 0.f2e42274-release
 Architecture: arm64
 Maintainer: fd.io VPP Packaging Team <vpp-dev@fd.io>
 Installed-Size: 528
 Depends: libc6 (>= 2.34), libunwind8
-Filename: pool/bookworm/main/libvppinfra_0.d10868b9-release_arm64.deb
-Size: 156468
-MD5sum: f47c31646aa9f6d3ba240362c6abfd74
-SHA1: 3746d98048a4e915f5ed2ea1126cc111ce38bffb
-SHA256: 182dc3701ebad26296f69bdb4ae3a73256a67d085efa20b05ecf7f8b147828d5
+Filename: pool/bookworm/main/libvppinfra_0.f2e42274-release_arm64.deb
+Size: 156420
+MD5sum: 58bc67098695417f30f5fbfc0b15b01d
+SHA1: 6aba7cbd8f5aeac1d6fd5251bcc3504d7beb72eb
+SHA256: a3edeb31d73bf395eae73c8d9099f2069091692ccc7f90d912b978a0c3716fa6
 Section: net
 Priority: extra
 Description: Vector Packet Processing--runtime libraries
@@ -17,15 +17,15 @@ Description: Vector Packet Processing--runtime libraries
 
 Package: libvppinfra-dev
 Source: vpp
-Version: 0.d10868b9-release
+Version: 0.f2e42274-release
 Architecture: arm64
 Maintainer: fd.io VPP Packaging Team <vpp-dev@fd.io>
 Installed-Size: 963
-Filename: pool/bookworm/main/libvppinfra-dev_0.d10868b9-release_arm64.deb
+Filename: pool/bookworm/main/libvppinfra-dev_0.f2e42274-release_arm64.deb
 Size: 164960
-MD5sum: c8aab6507e1a1bd957aadf24e9dca6e9
-SHA1: ca4060ae84ed29e65cff5132c7a33187dd0d9ac0
-SHA256: 84e8c26c7159b68242d86809d9945e910b49baf94c3a02b669cc5241d95fdbda
+MD5sum: f101840e87bacc049f9aa7a119daae93
+SHA1: 945efb1c33538877bb77c251ed6fdd96d0041d65
+SHA256: dcfc82469dacbd6ddc1a87566d6ee6432e702c711bc24c634a4b18ca60c87b41
 Section: net
 Priority: extra
 Description: Vector Packet Processing--runtime libraries
@@ -33,32 +33,32 @@ Description: Vector Packet Processing--runtime libraries
 
 Package: python3-vpp-api
 Source: vpp
-Version: 0.d10868b9-release
+Version: 0.f2e42274-release
 Architecture: arm64
 Maintainer: fd.io VPP Packaging Team <vpp-dev@fd.io>
 Installed-Size: 242
-Depends: vpp (= 0.d10868b9-release), python3:any
-Filename: pool/bookworm/main/python3-vpp-api_0.d10868b9-release_arm64.deb
-Size: 37092
-MD5sum: ee8aba89de0131e84332219118cc6594
-SHA1: b7184d03c5689614e0e57d461339452d52f18da7
-SHA256: 6a3889c65d33a0c14795cd13c033f240ac6e1ab19d312d71260e2e1df865395d
+Depends: vpp (= 0.f2e42274-release), python3:any
+Filename: pool/bookworm/main/python3-vpp-api_0.f2e42274-release_arm64.deb
+Size: 37084
+MD5sum: 62f847945bae52fc9a08797fe463aacc
+SHA1: 648eaf066b28b673deebeca82ac64ea2fbb98004
+SHA256: dd9caa4ad0e590a9842bf81a3ae2a51744b085c681f967132400293b66a9368d
 Section: net
 Priority: extra
 Description: VPP Python3 API bindings
  This package contains VPP python api bindings
 
 Package: vpp
-Version: 0.d10868b9-release
+Version: 0.f2e42274-release
 Architecture: arm64
 Maintainer: fd.io VPP Packaging Team <vpp-dev@fd.io>
-Installed-Size: 43059
-Depends: libvppinfra (= 0.d10868b9-release), libc6 (>= 2.34), libnl-3-200 (>= 3.2.7), libnl-route-3-200 (>= 3.2.26), libssl3 (>= 3.0.0), libunwind8
-Filename: pool/bookworm/main/vpp_0.d10868b9-release_arm64.deb
-Size: 4526868
-MD5sum: 6060ff0bf2d15052aebc719d96bfa565
-SHA1: cdc7742d647e0d813edc071e026a57d7275b6fdb
-SHA256: ddde7da6713ddbd4bb1b8ee2488c82418468f49a94a4de4dc24e4c76d7f6caf7
+Installed-Size: 43126
+Depends: libvppinfra (= 0.f2e42274-release), libc6 (>= 2.34), libnl-3-200 (>= 3.2.7), libnl-route-3-200 (>= 3.2.26), libssl3 (>= 3.0.0), libunwind8
+Filename: pool/bookworm/main/vpp_0.f2e42274-release_arm64.deb
+Size: 4531752
+MD5sum: a61b97f9955b6892b789d56342faa1be
+SHA1: d15c5b531be58705f5bb7f5e00708a3928a47a35
+SHA256: 4470b95ea3d6c3efea3d270195544ba7c8ed9713c5a6f96c9d575d0d4014bdaa
 Section: net
 Priority: extra
 Description: Vector Packet Processing--executables
@@ -69,16 +69,16 @@ Description: Vector Packet Processing--executables
 
 Package: vpp-crypto-engines
 Source: vpp
-Version: 0.d10868b9-release
+Version: 0.f2e42274-release
 Architecture: arm64
 Maintainer: fd.io VPP Packaging Team <vpp-dev@fd.io>
 Installed-Size: 1694
-Depends: vpp (= 0.d10868b9-release), libc6 (>= 2.17), libssl3 (>= 3.0.0)
-Filename: pool/bookworm/main/vpp-crypto-engines_0.d10868b9-release_arm64.deb
-Size: 168964
-MD5sum: 313147da62f54a0e178d2afc482fc007
-SHA1: 7c434f60176403a6086a4f246c5f5ff3dc219600
-SHA256: 85b3557dbc5c324fa392fda924191dea6b22a093e23f7b2897f6375a0a43b137
+Depends: vpp (= 0.f2e42274-release), libc6 (>= 2.17), libssl3 (>= 3.0.0)
+Filename: pool/bookworm/main/vpp-crypto-engines_0.f2e42274-release_arm64.deb
+Size: 169040
+MD5sum: c7506880f4e857ea2551c3a0f3008acf
+SHA1: 547657ec55901a62847d441a5fa567ea9ac49134
+SHA256: 141ff139a61369fab1db639d22cb48b58e7cd426aafce0959a172fa1de65d780
 Section: net
 Priority: extra
 Description: Vector Packet Processing--runtime crypto engines
@@ -86,16 +86,16 @@ Description: Vector Packet Processing--runtime crypto engines
 
 Package: vpp-dev
 Source: vpp
-Version: 0.d10868b9-release
+Version: 0.f2e42274-release
 Architecture: arm64
 Maintainer: fd.io VPP Packaging Team <vpp-dev@fd.io>
-Installed-Size: 24024
-Depends: libvppinfra-dev (= 0.d10868b9-release)
-Filename: pool/bookworm/main/vpp-dev_0.d10868b9-release_arm64.deb
-Size: 1616836
-MD5sum: b1c46f7f8f0440797e41288d431aa3ae
-SHA1: b74e7f331af28d9493cb5eb433b459cc2d64c60c
-SHA256: 6b2c543007dfcb9fba3ae752b59e0d0ff2fe7175a526fe0c55c1e08aef4f18e0
+Installed-Size: 24083
+Depends: libvppinfra-dev (= 0.f2e42274-release)
+Filename: pool/bookworm/main/vpp-dev_0.f2e42274-release_arm64.deb
+Size: 1619176
+MD5sum: 332357c1a069a97018436c80680c36cc
+SHA1: 0cf6da2ef134d94e83e7b83dabb586b1f56c0809
+SHA256: 9e1250bc33405d441de3696445c82b23399ec26a5b5e8f1e235437cf49d69072
 Section: net
 Priority: extra
 Description: Vector Packet Processing--development support
@@ -103,16 +103,16 @@ Description: Vector Packet Processing--development support
 
 Package: vpp-drivers
 Source: vpp
-Version: 0.d10868b9-release
+Version: 0.f2e42274-release
 Architecture: arm64
 Maintainer: fd.io VPP Packaging Team <vpp-dev@fd.io>
 Installed-Size: 2328
-Depends: vpp (= 0.d10868b9-release), libc6 (>= 2.17)
-Filename: pool/bookworm/main/vpp-drivers_0.d10868b9-release_arm64.deb
-Size: 276632
-MD5sum: cd3480deaa9227251b6982779c8fcee3
-SHA1: a4f597ecaf44a82b3f4f3933d3034ecab4563331
-SHA256: 55c0ba6efd38b27301a7bea8a3aae37217153f4e1763d9f0fed5d457be96f376
+Depends: vpp (= 0.f2e42274-release), libc6 (>= 2.17)
+Filename: pool/bookworm/main/vpp-drivers_0.f2e42274-release_arm64.deb
+Size: 276728
+MD5sum: a0ac9e0a4e62344f6e833bf04bd6bcc0
+SHA1: 70d427a9abd8d9254cedd06bf7f2e44c7372fea0
+SHA256: bd6332b65eefe7bed6e58337c18fe53680bd966e7f05fdd5572ddb84e98221f2
 Section: net
 Priority: extra
 Description: Vector Packet Processing--runtime device drivers
@@ -120,16 +120,16 @@ Description: Vector Packet Processing--runtime device drivers
 
 Package: vpp-plugin-core
 Source: vpp
-Version: 0.d10868b9-release
+Version: 0.f2e42274-release
 Architecture: arm64
 Maintainer: fd.io VPP Packaging Team <vpp-dev@fd.io>
-Installed-Size: 31173
-Depends: vpp (= 0.d10868b9-release), libc6 (>= 2.34), libelf1 (>= 0.144), libnl-3-200 (>= 3.2.21), libnl-route-3-200 (>= 3.7.0), libpcap0.8 (>= 1.0.0), libssl3 (>= 3.0.0), libunwind8, libvppinfra, zlib1g (>= 1:1.2.3.3)
-Filename: pool/bookworm/main/vpp-plugin-core_0.d10868b9-release_arm64.deb
-Size: 4228560
-MD5sum: 83ba566714dfb97e0b9f3b2e43e0162f
-SHA1: a52d04c91f56fe48385b9ba9f17342e785cc8d4e
-SHA256: d64093602343fe2d28a57f2ea6d9be6318453b391d4442408fa2833655e17d97
+Installed-Size: 31266
+Depends: vpp (= 0.f2e42274-release), libc6 (>= 2.34), libelf1 (>= 0.144), libnl-3-200 (>= 3.2.21), libnl-route-3-200 (>= 3.7.0), libpcap0.8 (>= 1.0.0), libssl3 (>= 3.0.0), libunwind8, libvppinfra, zlib1g (>= 1:1.2.3.3)
+Filename: pool/bookworm/main/vpp-plugin-core_0.f2e42274-release_arm64.deb
+Size: 4236652
+MD5sum: 9ba365db9c2a3010f4ea224888f1328e
+SHA1: 8441e303c5e9c342a60a90fa6783d576c9403d80
+SHA256: 652e6b3b20d03d0ac4d4997e3a815b8f23512b534f46667adee5e4ca296f7a00
 Section: net
 Priority: extra
 Description: Vector Packet Processing--runtime core plugins
@@ -137,16 +137,16 @@ Description: Vector Packet Processing--runtime core plugins
 
 Package: vpp-plugin-devtools
 Source: vpp
-Version: 0.d10868b9-release
+Version: 0.f2e42274-release
 Architecture: arm64
 Maintainer: fd.io VPP Packaging Team <vpp-dev@fd.io>
 Installed-Size: 1769
-Depends: vpp (= 0.d10868b9-release), libc6 (>= 2.34), libunwind8, libvppinfra
-Filename: pool/bookworm/main/vpp-plugin-devtools_0.d10868b9-release_arm64.deb
-Size: 334328
-MD5sum: 20661e761312c94cd316710e7f318a87
-SHA1: ea0f9a32f5007b857ef33a1ebf383d66cbf76ad1
-SHA256: f925d9588a847c82807622f0eadb749c6687f3ece815fef405b1a1f22e63eae5
+Depends: vpp (= 0.f2e42274-release), libc6 (>= 2.34), libunwind8, libvppinfra
+Filename: pool/bookworm/main/vpp-plugin-devtools_0.f2e42274-release_arm64.deb
+Size: 334364
+MD5sum: bb2e6faa3e31f6a2ea3a73955ef0f68f
+SHA1: ee53d4ea393e9644c27fe5e0308ba7960b0ba19a
+SHA256: 2345b67ac45b6275ae2d3af6d4670b12b042e4bc7f92e00b90870ba2cee0b18a
 Section: net
 Priority: extra
 Description: Vector Packet Processing--runtime developer tool plugins
@@ -154,16 +154,16 @@ Description: Vector Packet Processing--runtime developer tool plugins
 
 Package: vpp-plugin-dpdk
 Source: vpp
-Version: 0.d10868b9-release
+Version: 0.f2e42274-release
 Architecture: arm64
 Maintainer: fd.io VPP Packaging Team <vpp-dev@fd.io>
 Installed-Size: 16642
-Depends: vpp (= 0.d10868b9-release), libc6 (>= 2.34), libnuma1 (>= 2.0.11), libssl3 (>= 3.0.0)
-Filename: pool/bookworm/main/vpp-plugin-dpdk_0.d10868b9-release_arm64.deb
-Size: 4164808
-MD5sum: 3e14f87c462cc3b47c043e56f7e7cfe6
-SHA1: e146f59aa1af7bc2ac5538ffc0b32e0198e7c2b3
-SHA256: f9a5995049eeb44c15f67fec3ba7e929e6022a0accb792ccfc801da20fb03409
+Depends: vpp (= 0.f2e42274-release), libc6 (>= 2.34), libnuma1 (>= 2.0.11), libssl3 (>= 3.0.0)
+Filename: pool/bookworm/main/vpp-plugin-dpdk_0.f2e42274-release_arm64.deb
+Size: 4164028
+MD5sum: aee7b87ffd747b779979e5ea7eead973
+SHA1: 280cbdfec296c1dfc486881e3f34e9ca5fb3a8b7
+SHA256: de0bf48aad48965796016c046b4d52c8cd81bbebcf9f8ae0e365548a5d3377e0
 Section: net
 Priority: extra
 Description: Vector Packet Processing--runtime dpdk plugin
