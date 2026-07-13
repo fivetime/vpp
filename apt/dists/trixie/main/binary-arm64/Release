@@ -1,0 +1,6 @@
+Archive: trixie
+Suite: trixie
+Component: main
+Origin: VPP community packages
+Label: VPP
+Architecture: arm64

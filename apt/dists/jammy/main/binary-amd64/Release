@@ -1,0 +1,6 @@
+Archive: jammy
+Suite: jammy
+Component: main
+Origin: VPP community packages
+Label: VPP
+Architecture: amd64

@@ -1,0 +1,171 @@
+Package: libvppinfra
+Source: vpp
+Version: 0.d10868b9-release
+Architecture: amd64
+Maintainer: fd.io VPP Packaging Team <vpp-dev@fd.io>
+Installed-Size: 624
+Depends: libc6 (>= 2.34), libunwind8
+Filename: pool/jammy/main/libvppinfra_0.d10868b9-release_amd64.deb
+Size: 225024
+MD5sum: 8726317fcf8a5477ea1bf5f2b89a4b31
+SHA1: c1aeeb34ad8d56f2475555bd048a5a7157346c40
+SHA256: 10a6ffc35841feb978a3aa94e95a9e072529bec7908d302f490ae8b6c4e9eca1
+Section: net
+Priority: extra
+Description: Vector Packet Processing--runtime libraries
+ This package contains the VPP shared libraries, including:
+
+Package: libvppinfra-dev
+Source: vpp
+Version: 0.d10868b9-release
+Architecture: amd64
+Maintainer: fd.io VPP Packaging Team <vpp-dev@fd.io>
+Installed-Size: 963
+Filename: pool/jammy/main/libvppinfra-dev_0.d10868b9-release_amd64.deb
+Size: 170446
+MD5sum: fca0e5bdc81645e065a51f7339493b40
+SHA1: 7f8ddf5080b8b14cca8100c874c51d4dc09f9a74
+SHA256: 9612662a39610372db6bbca3ee0ef63c3ffa1622354b1332a4c5475fb90f6b5a
+Section: net
+Priority: extra
+Description: Vector Packet Processing--runtime libraries
+ This package contains the VPP shared libraries, including:
+
+Package: python3-vpp-api
+Source: vpp
+Version: 0.d10868b9-release
+Architecture: amd64
+Maintainer: fd.io VPP Packaging Team <vpp-dev@fd.io>
+Installed-Size: 242
+Depends: vpp (= 0.d10868b9-release), python3:any
+Filename: pool/jammy/main/python3-vpp-api_0.d10868b9-release_amd64.deb
+Size: 37476
+MD5sum: d4ac20e837c4e69fab4f7a8d629f940d
+SHA1: 00cff0af4e34e5798bbf448ad0481b184a273a9a
+SHA256: 610b001202ba69b6c71b2833eaedf1b80e0fbd52f00659761bfea680ebf8b2f0
+Section: net
+Priority: extra
+Description: VPP Python3 API bindings
+ This package contains VPP python api bindings
+
+Package: vpp
+Version: 0.d10868b9-release
+Architecture: amd64
+Maintainer: fd.io VPP Packaging Team <vpp-dev@fd.io>
+Installed-Size: 31166
+Depends: libvppinfra (= 0.d10868b9-release), libc6 (>= 2.34), libnl-3-200 (>= 3.2.7), libnl-route-3-200 (>= 3.2.26), libssl3 (>= 3.0.0~~alpha1), libunwind8
+Filename: pool/jammy/main/vpp_0.d10868b9-release_amd64.deb
+Size: 5184296
+MD5sum: 861c469396c036becd59a18302f74c46
+SHA1: 44c7131aafba1c558cfead2e8960c53f2d511f10
+SHA256: 4bb06e556c57d0265d5ae10c891fa7a6e696320ec15de7660adbad0e3b5ce7fb
+Section: net
+Priority: extra
+Description: Vector Packet Processing--executables
+ This package provides VPP executables: vpp, vpp_api_test, vpp_json_test
+ vpp - the vector packet engine
+ vpp_api_test - vector packet engine API test tool
+ vpp_json_test - vector packet engine JSON test tool
+
+Package: vpp-crypto-engines
+Source: vpp
+Version: 0.d10868b9-release
+Architecture: amd64
+Maintainer: fd.io VPP Packaging Team <vpp-dev@fd.io>
+Installed-Size: 12739
+Depends: vpp (= 0.d10868b9-release), libc6 (>= 2.14), libssl3 (>= 3.0.0~~alpha1)
+Filename: pool/jammy/main/vpp-crypto-engines_0.d10868b9-release_amd64.deb
+Size: 1196748
+MD5sum: eb0ec515734e30e3cf31c6fa8b582c93
+SHA1: b0ddca747de5af3bfe468013f5aa809acf06d0c6
+SHA256: 51b043ee69f88f3c449eed4d5a4a9aee9430eaf7ee43ed0b2b06a541d51ea702
+Section: net
+Priority: extra
+Description: Vector Packet Processing--runtime crypto engines
+ This package contains VPP crypto engines
+
+Package: vpp-dev
+Source: vpp
+Version: 0.d10868b9-release
+Architecture: amd64
+Maintainer: fd.io VPP Packaging Team <vpp-dev@fd.io>
+Installed-Size: 24024
+Depends: libvppinfra-dev (= 0.d10868b9-release)
+Filename: pool/jammy/main/vpp-dev_0.d10868b9-release_amd64.deb
+Size: 1573386
+MD5sum: 6aa2cdb41e4f2fb558696726ea9929a6
+SHA1: 6c0870c881d57fb6de66277b348903cb0dc217f4
+SHA256: e7249e0278c8e6ea45129dc7f1d8fd08ebd92810d2137c1a23af81afe58d6549
+Section: net
+Priority: extra
+Description: Vector Packet Processing--development support
+ This package contains development support files for the VPP libraries
+
+Package: vpp-drivers
+Source: vpp
+Version: 0.d10868b9-release
+Architecture: amd64
+Maintainer: fd.io VPP Packaging Team <vpp-dev@fd.io>
+Installed-Size: 2080
+Depends: vpp (= 0.d10868b9-release), libc6 (>= 2.14)
+Filename: pool/jammy/main/vpp-drivers_0.d10868b9-release_amd64.deb
+Size: 342868
+MD5sum: 8007986f95defa81567f6d47b356ce83
+SHA1: 80d96c3d0c633561d782b954a116ed2f7a7bdf4f
+SHA256: 91d0e2b0bf4217f3498165aa1bddd4ddede8d4cd682b9c904671fb0014f55fb1
+Section: net
+Priority: extra
+Description: Vector Packet Processing--runtime device drivers
+ This package contains VPP device drivers
+
+Package: vpp-plugin-core
+Source: vpp
+Version: 0.d10868b9-release
+Architecture: amd64
+Maintainer: fd.io VPP Packaging Team <vpp-dev@fd.io>
+Installed-Size: 25970
+Depends: vpp (= 0.d10868b9-release), libc6 (>= 2.34), libelf1 (>= 0.144), libnl-3-200 (>= 3.2.21), libnl-route-3-200 (>= 3.4.0), libpcap0.8 (>= 1.0.0), libssl3 (>= 3.0.0~~alpha1), libunwind8, libvppinfra, zlib1g (>= 1:1.2.3.3)
+Filename: pool/jammy/main/vpp-plugin-core_0.d10868b9-release_amd64.deb
+Size: 4962286
+MD5sum: 0dc22de877dfc066c6af9a2245ce59f5
+SHA1: 56da272aff4f002bbf551695d1816dbb21fea796
+SHA256: 5e06f16f14a6141651c6b2b61d351e697a9fe3b116a96363ea5df28d5a07c193
+Section: net
+Priority: extra
+Description: Vector Packet Processing--runtime core plugins
+ This package contains VPP core plugins
+
+Package: vpp-plugin-devtools
+Source: vpp
+Version: 0.d10868b9-release
+Architecture: amd64
+Maintainer: fd.io VPP Packaging Team <vpp-dev@fd.io>
+Installed-Size: 1778
+Depends: vpp (= 0.d10868b9-release), libc6 (>= 2.34), libunwind8, libvppinfra
+Filename: pool/jammy/main/vpp-plugin-devtools_0.d10868b9-release_amd64.deb
+Size: 478964
+MD5sum: 1d5cf849c2689915e6e2945c46fcc810
+SHA1: d0d4c7f0d5afc80290f22081a4572a8c80270fb9
+SHA256: ec2228405dae9d321a11b11aeb6c44871aba3400af0510dc95e0b3e34c839ccd
+Section: net
+Priority: extra
+Description: Vector Packet Processing--runtime developer tool plugins
+ This package contains VPP developer tool plugins
+
+Package: vpp-plugin-dpdk
+Source: vpp
+Version: 0.d10868b9-release
+Architecture: amd64
+Maintainer: fd.io VPP Packaging Team <vpp-dev@fd.io>
+Installed-Size: 23126
+Depends: vpp (= 0.d10868b9-release), libc6 (>= 2.34), libnuma1 (>= 2.0.11), libssl3 (>= 3.0.0~~alpha1)
+Filename: pool/jammy/main/vpp-plugin-dpdk_0.d10868b9-release_amd64.deb
+Size: 5994118
+MD5sum: 8919acbc9acfe2c554dda0a856091386
+SHA1: ba9029f6e1c06a8a67a1400a41a43f5554695426
+SHA256: bc6b977803d9de9db071dd403c821f3e2dfa44c2d5dbcabcd88cbadb12db4c3d
+Section: net
+Priority: extra
+Description: Vector Packet Processing--runtime dpdk plugin
+ This package contains the VPP dpdk plugin
+
