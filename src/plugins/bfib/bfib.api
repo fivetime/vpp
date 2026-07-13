@@ -1,0 +1,94 @@
+/* Hey Emacs use -*- mode: C -*- */
+/*
+ * SPDX-License-Identifier: Apache-2.0
+ * Copyright (c) 2026 Bulk-FIB batch route plugin contributors.
+ */
+
+/** \file
+    Bulk-FIB (bfib): batch ip_route_add_del. One message carries up to
+    BFIB_BATCH_MAX routes; the reply echoes a per-item (cookie, retval)
+    pair so a pipelined client can confirm each route individually with
+    ZERO client-side batch bookkeeping (the cookie rides the wire).
+
+    Motivation: bird-vpp materializes 10M-scale FIBs one vapi message
+    per route; the per-message overhead (alloc, header, dispatch, reply)
+    dominates full-table re-arm convergence. Batching N routes per
+    message cuts that overhead by N on both sides while the per-item
+    reply keeps the client's per-route confirm/retry state machine
+    byte-identical. Semantics per item are EXACTLY vl_api_ip_route_add_del
+    with is_multipath=0 (atomic whole-path-group replace / delete):
+    the handler runs the same fib_api_path_decode + fib_api_route_add_del
+    pipeline per item.
+*/
+
+option version = "1.0.0";
+import "vnet/ip/ip_types.api";
+import "vnet/fib/fib_types.api";
+
+/** \brief Get the plugin version (also the client's capability probe) */
+define bfib_plugin_get_version
+{
+  u32 client_index;
+  u32 context;
+};
+
+define bfib_plugin_get_version_reply
+{
+  u32 context;
+  u32 major;
+  u32 minor;
+};
+
+/** \brief One route of a batch.
+    @param prefix  - the route prefix
+    @param cookie  - opaque client id echoed in the reply (bird: route vid)
+    @param is_add  - 1 add/replace (atomic path-group), 0 delete
+    @param n_paths - number of valid entries in paths[] (0..4; 0 only for del)
+    @param paths   - standard fib paths (recursive / attached / labels),
+                     fixed-size so items can nest inside the batch array;
+                     routes with more than 4 paths use the plain
+                     ip_route_add_del message instead */
+typedef bfib_route
+{
+  vl_api_prefix_t prefix;
+  u32 cookie;
+  u8 is_add;
+  u8 n_paths;
+  u8 pad[2];
+  vl_api_fib_path_t paths[4];
+};
+
+/** \brief Per-item result echoed to the client.
+    @param cookie - the request item's cookie
+    @param retval - 0 on success, VNET_API_ERROR_* otherwise */
+typedef bfib_result
+{
+  u32 cookie;
+  i32 retval;
+};
+
+/** \brief Batch add/del of routes into one FIB table.
+    @param table_id - VPP FIB table (all items share it; client batches per table)
+    @param n_items  - number of routes in this batch */
+define bfib_route_batch
+{
+  u32 client_index;
+  u32 context;
+  u32 table_id;
+  u16 n_items;
+  u8 pad[2];
+  vl_api_bfib_route_t items[n_items];
+};
+
+/** \brief Batch reply: one result per request item, same order.
+    @param retval - overall verdict: 0 = message processed (individual items
+                    may still have failed; see results), else the whole batch
+                    was rejected (e.g. bad table) and results is empty */
+define bfib_route_batch_reply
+{
+  u32 context;
+  i32 retval;
+  u16 n_items;
+  u8 pad[2];
+  vl_api_bfib_result_t results[n_items];
+};

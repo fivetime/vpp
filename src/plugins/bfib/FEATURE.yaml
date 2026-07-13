@@ -1,0 +1,13 @@
+---
+name: Bulk-FIB batch route add/del
+maintainer: bird-vpp contributors
+features:
+  - Batch ip_route_add_del (up to 512 routes per API message)
+  - Per-item (cookie, retval) reply for stateless pipelined clients
+description: "Amortizes per-message API overhead for full-table FIB
+  materialization by control planes (bird-vpp): one message carries many
+  routes, each handled through the stock fib_api_route_add_del pipeline,
+  with a per-item result echo so the client's per-route confirm/retry
+  state machine is unchanged."
+state: production
+properties: [API, CLI, MULTITHREAD]
