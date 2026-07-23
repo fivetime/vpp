@@ -1697,7 +1697,7 @@ tcp_test_persist_e2e (vlib_main_t *vm, unformat_input_t *input)
   u8 *appns_id = 0, *data = 0;
   u32 bi = ~0, old_rto, old_snd_nxt;
   u32 pending_bufs_len, pending_nexts_len;
-  int error, rv = 0, routes_added = 0, ns_added = 0;
+  int error, rv = 0, routes_added = 0, ns_added = 0, sessions_cleaned;
 
   while (unformat_check_input (input) != UNFORMAT_END_OF_INPUT)
     {
@@ -2062,22 +2062,7 @@ tcp_test_persist_e2e (vlib_main_t *vm, unformat_input_t *input)
     }
 
 cleanup:
-  if (accepted_session_index != ~0)
-    {
-      vnet_disconnect_args_t disconnect_args = {
-	.handle = session_make_handle (accepted_session_index, accepted_session_thread),
-	.app_index = server_index,
-      };
-      (void) vnet_disconnect_session (&disconnect_args);
-    }
-  else if (connected_session_index != ~0)
-    {
-      vnet_disconnect_args_t disconnect_args = {
-	.handle = session_make_handle (connected_session_index, connected_session_thread),
-	.app_index = client_index,
-      };
-      (void) vnet_disconnect_session (&disconnect_args);
-    }
+  sessions_cleaned = tcp_e2e_force_session_cleanup (vm);
 
   if (listen_handle != SESSION_INVALID_HANDLE)
     {
@@ -2129,15 +2114,14 @@ cleanup:
       (void) ip4_add_del_interface_address (vm, sw_if_index[j], &intf_addr[j], 24, 1 /* is_del */);
       vnet_sw_interface_set_flags (vnet_get_main (), sw_if_index[j], 0);
     }
-  for (int j = 0; j < 5; j++)
+  if (sessions_cleaned && tcp_e2e_drain_graph_frames (vm))
     {
-      vlib_worker_thread_barrier_release (vm);
-      vlib_process_suspend (vm, 1e-3);
-      vlib_worker_thread_barrier_sync (vm);
+      for (int j = 0; j < 2; j++)
+	if (sw_if_index[j] != ~0)
+	  (void) vnet_delete_loopback_interface (sw_if_index[j]);
     }
-  for (int j = 0; j < 2; j++)
-    if (sw_if_index[j] != ~0)
-      (void) vnet_delete_loopback_interface (sw_if_index[j]);
+  else
+    clib_warning ("graph frames did not quiesce; preserving test loopbacks");
 
   vec_free (data);
   vec_free (appns_id);
@@ -2202,7 +2186,6 @@ tcp_test_rto_rpc (void *argp)
   scoreboard_init_rxt (&tc->sack_sb, tc->snd_una);
   tc->snd_rxt_bytes = 0;
   tc->rxt_delivered = 0;
-  tc->rxt_head = tc->snd_una - 1;
   tc->tr_occurences = 0;
   tc->rto_boff = 0;
   a->mss = tc->snd_mss;
@@ -2308,7 +2291,6 @@ tcp_test_headrtx_setup_rpc (void *argp)
   tc->snd_rxt_bytes = 0;
   tc->rxt_delivered = 0;
   tc->prr_delivered = 0;
-  tc->rxt_head = tc->snd_una - 1;
 
   pool_get (sb->holes, hole);
   clib_memset (hole, 0, sizeof (*hole));
@@ -2365,7 +2347,7 @@ tcp_test_rto_reduce_once_e2e (vlib_main_t *vm, unformat_input_t *input)
   tcp_connection_t *client_tc = 0;
   transport_connection_t *tc;
   u8 *appns_id = 0, *data = 0;
-  int error, rv = 0, routes_added = 0, ns_added = 0;
+  int error, rv = 0, routes_added = 0, ns_added = 0, sessions_cleaned;
 
   while (unformat_check_input (input) != UNFORMAT_END_OF_INPUT)
     {
@@ -2852,22 +2834,7 @@ tcp_test_rto_reduce_once_e2e (vlib_main_t *vm, unformat_input_t *input)
   }
 
 cleanup:
-  if (accepted_session_index != ~0)
-    {
-      vnet_disconnect_args_t disconnect_args = {
-	.handle = session_make_handle (accepted_session_index, accepted_session_thread),
-	.app_index = server_index,
-      };
-      (void) vnet_disconnect_session (&disconnect_args);
-    }
-  else if (connected_session_index != ~0)
-    {
-      vnet_disconnect_args_t disconnect_args = {
-	.handle = session_make_handle (connected_session_index, connected_session_thread),
-	.app_index = client_index,
-      };
-      (void) vnet_disconnect_session (&disconnect_args);
-    }
+  sessions_cleaned = tcp_e2e_force_session_cleanup (vm);
 
   if (listen_handle != SESSION_INVALID_HANDLE)
     {
@@ -2919,15 +2886,14 @@ cleanup:
       (void) ip4_add_del_interface_address (vm, sw_if_index[j], &intf_addr[j], 24, 1 /* is_del */);
       vnet_sw_interface_set_flags (vnet_get_main (), sw_if_index[j], 0);
     }
-  for (int j = 0; j < 5; j++)
+  if (sessions_cleaned && tcp_e2e_drain_graph_frames (vm))
     {
-      vlib_worker_thread_barrier_release (vm);
-      vlib_process_suspend (vm, 1e-3);
-      vlib_worker_thread_barrier_sync (vm);
+      for (int j = 0; j < 2; j++)
+	if (sw_if_index[j] != ~0)
+	  (void) vnet_delete_loopback_interface (sw_if_index[j]);
     }
-  for (int j = 0; j < 2; j++)
-    if (sw_if_index[j] != ~0)
-      (void) vnet_delete_loopback_interface (sw_if_index[j]);
+  else
+    clib_warning ("graph frames did not quiesce; preserving test loopbacks");
 
   vec_free (data);
   vec_free (appns_id);
@@ -4866,6 +4832,28 @@ tcp_test_bt (vlib_main_t * vm, unformat_input_t * input)
   session_free (s);
   vec_free (a->new_segment_indices);
   fifo_segment_delete (fsm, fs);
+  tcp_bt_cleanup (tc);
+
+  /* Delivery sampling continues after FIN and excludes the FIN sequence. */
+  memset (tc, 0, sizeof (*tc));
+  memset (rs, 0, sizeof (*rs));
+  tcp_bt_init (tc);
+  tcp_test_set_time (thread_index, 50);
+  tcp_bt_track_tx (tc, 100);
+  tc->snd_nxt = 101;
+  tc->flags |= TCP_CONN_FINSNT;
+  tc->snd_una = 100;
+  tc->bytes_acked = 100;
+  tcp_test_set_time (thread_index, 51);
+  tcp_bt_sample_delivery_rate (tc, rs);
+  TCP_TEST (tc->delivered == 100 && rs->acked_and_sacked == 100,
+	    "data delivery remains sampled after FIN is sent");
+  tc->snd_una = 101;
+  tc->bytes_acked = 1;
+  memset (rs, 0, sizeof (*rs));
+  tcp_bt_sample_delivery_rate (tc, rs);
+  TCP_TEST (tc->delivered == 100 && rs->acked_and_sacked == 0,
+	    "FIN acknowledgment is excluded from delivered bytes");
   tcp_bt_cleanup (tc);
 
   return 0;
