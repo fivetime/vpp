@@ -583,21 +583,39 @@ tcp_bt_walk_samples_ooo (tcp_connection_t * tc, tcp_rate_sample_t * rs)
     }
 }
 
+static_always_inline u32
+tcp_bt_data_acked (tcp_connection_t *tc, tcp_rate_sample_t *rs)
+{
+  u32 ack_end, data_end, prev_una;
+
+  if (PREDICT_TRUE (!(tc->flags & TCP_CONN_FINSNT)))
+    return rs->bytes_acked;
+
+  data_end = tc->snd_nxt - 1;
+  prev_una = tc->snd_una - rs->bytes_acked;
+  ack_end = seq_lt (tc->snd_una, data_end) ? tc->snd_una : data_end;
+  return seq_gt (ack_end, prev_una) ? ack_end - prev_una : 0;
+}
+
 void
 tcp_bt_sample_delivery_rate (tcp_connection_t * tc, tcp_rate_sample_t * rs)
 {
-  u32 delivered;
+  u32 delivered, data_acked;
 
-  if (PREDICT_FALSE (tc->flags & TCP_CONN_FINSNT))
-    return;
+  tc->lost += rs->last_lost;
 
-  tc->lost += tc->sack_sb.last_lost_bytes;
+  data_acked = tcp_bt_data_acked (tc, rs);
+  delivered = data_acked + rs->last_sacked_bytes;
+  delivered -= rs->last_bytes_delivered;
+  if (tc->bt->head == TCP_BTS_INVALID_INDEX)
+    goto done;
 
-  delivered = tc->bytes_acked + tc->sack_sb.last_sacked_bytes;
-  /* Do not count bytes that were previously sacked again */
-  delivered -= tc->sack_sb.last_bytes_delivered;
-  if (!delivered || tc->bt->head == TCP_BTS_INVALID_INDEX)
-    return;
+  if (!delivered)
+    {
+      if (data_acked)
+	tcp_bt_walk_samples (tc, rs);
+      goto done;
+    }
 
   tc->delivered += delivered;
   tc->delivered_time = tcp_time_now_us (tc->c_thread_index);
@@ -605,17 +623,18 @@ tcp_bt_sample_delivery_rate (tcp_connection_t * tc, tcp_rate_sample_t * rs)
   if (tc->app_limited && tc->delivered > tc->app_limited)
     tc->app_limited = 0;
 
-  if (tc->bytes_acked)
+  if (data_acked)
     tcp_bt_walk_samples (tc, rs);
 
-  if (tc->sack_sb.last_sacked_bytes)
+  if (rs->last_sacked_bytes)
     tcp_bt_walk_samples_ooo (tc, rs);
 
   rs->interval_time = clib_max ((tc->delivered_time - rs->prior_time),
 				rs->interval_time);
   rs->delivered = tc->delivered - rs->prior_delivered;
+
+done:
   rs->acked_and_sacked = delivered;
-  rs->last_lost = tc->sack_sb.last_lost_bytes;
   rs->lost = tc->lost - rs->tx_lost;
 }
 

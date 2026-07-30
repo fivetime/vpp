@@ -80,9 +80,9 @@ tcp_cc_data (tcp_connection_t * tc)
  * dsack to disambiguate. Other outstanding loss is handled as a new recovery
  * event. Must be called on a cumulative ack in recovery. */
 static inline u8
-tcp_cc_is_spurious_retransmit (tcp_connection_t *tc)
+tcp_cc_is_spurious_retransmit (tcp_connection_t *tc, tcp_rate_sample_t *rs)
 {
-  ASSERT (tcp_in_cong_recovery (tc) && tc->bytes_acked);
+  ASSERT (tcp_in_cong_recovery (tc) && rs->bytes_acked);
   return (tc->snd_rxt_ts && seq_lt (tc->snd_una, tc->snd_congestion) &&
 	  tcp_opts_tstamp (&tc->rcv_opts) && timestamp_lt (tc->rcv_opts.tsecr, tc->snd_rxt_ts));
 }
@@ -99,6 +99,8 @@ void tcp_cc_algo_register (tcp_cc_algorithm_type_e type,
 tcp_cc_algorithm_type_e tcp_cc_algo_new_type (const tcp_cc_algorithm_t * vft);
 tcp_cc_algorithm_t *tcp_cc_algo_get (tcp_cc_algorithm_type_e type);
 
+/** Enter fast recovery using the connection's negotiated ACK mechanism. */
+void tcp_cc_enter_recovery (tcp_connection_t *tc);
 
 void newreno_rcv_cong_ack (tcp_connection_t * tc, tcp_cc_ack_t ack_type,
 			   tcp_rate_sample_t * rs);

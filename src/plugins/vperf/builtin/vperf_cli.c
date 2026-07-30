@@ -272,6 +272,8 @@ vp_client_command_fn (vlib_main_t *vm, unformat_input_t *input, vlib_cli_command
 	vpcm->cfg.http_connect_proto = VP_HTTP_CONNECT_PROTO_TCP;
       else if (unformat (line_input, "connect-udp"))
 	vpcm->cfg.http_connect_proto = VP_HTTP_CONNECT_PROTO_UDP;
+      else if (unformat (line_input, "uso"))
+	vpcm->cfg.uso = 1;
       else
 	{
 	  error =
@@ -306,7 +308,7 @@ vp_client_command_fn (vlib_main_t *vm, unformat_input_t *input, vlib_cli_command
 
 parse_config:
 
-  vpcm->cfg.test_cfg.num_test_sessions = vpcm->expected_connections =
+  vpcm->cfg.test_cfg.num_test_sessions = vpcm->expected_sessions =
     vpcm->cfg.n_clients * vpcm->cfg.n_streams;
 
   if (!vpcm->cfg.uri)
