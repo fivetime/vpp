@@ -319,6 +319,8 @@ tcp_update_burst_snd_vars (tcp_connection_t * tc)
   if (tc->snd_una == tc->snd_nxt)
     {
       tcp_cc_event (tc, TCP_CC_EVT_START_TX);
+      if (transport_connection_is_tx_paced (&tc->connection))
+	transport_connection_tx_pacer_reset_bucket (&tc->connection, 0);
     }
 
   if (tc->flags & TCP_CONN_PSH_PENDING)
@@ -1298,8 +1300,11 @@ tcp_cc_rxt_timeout (tcp_connection_t *tc)
 
       if (head_was_rxt)
 	{
-	  tc->rxt_delivered += n_bytes;
+	  /* rxt_delivered is aggregate state and can already include part of the range below
+	   * high_rxt. Retire no more than the retransmitted bytes still accounted in flight */
 	  ASSERT (tc->rxt_delivered <= tc->snd_rxt_bytes);
+	  n_bytes = clib_min (n_bytes, tc->snd_rxt_bytes - tc->rxt_delivered);
+	  tc->rxt_delivered += n_bytes;
 	}
     }
 

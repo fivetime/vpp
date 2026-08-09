@@ -2622,6 +2622,9 @@ typedef struct
   u32 cc_space_after_second;
   u32 snd_rxt_after_second;
   u32 rxt_delivered_after_second;
+  u32 rxt_flight_after_reneging;
+  u32 snd_rxt_after_reneging;
+  u32 rxt_delivered_after_reneging;
   u32 second_ssthresh;
   u32 second_prev_cwnd;
   u8 dsack_ineligible_after_second;
@@ -2683,6 +2686,17 @@ tcp_test_rto_rpc (void *argp)
   a->second_ssthresh = tc->ssthresh;
   a->second_prev_cwnd = tc->prev_cwnd;
   a->dsack_ineligible_after_second = (tc->dsack_flags & TCP_DSACK_INELIGIBLE) != 0;
+
+  /* A retransmitted range may be counted delivered and later reneged. In
+   * that case high_rxt still covers the head but no retransmitted bytes are
+   * left to retire before sending its replacement. */
+  tc->rxt_delivered = tc->snd_rxt_bytes;
+  tc->sack_sb.is_reneging = 1;
+  tcp_timer_reset (&wrk->timer_wheel, tc, TCP_TIMER_RETRANSMIT);
+  tcp_timer_retransmit_handler (tc);
+  a->rxt_flight_after_reneging = tc->snd_rxt_bytes - tc->rxt_delivered;
+  a->snd_rxt_after_reneging = tc->snd_rxt_bytes;
+  a->rxt_delivered_after_reneging = tc->rxt_delivered;
 
   /* Fire an RTO during fast recovery and preserve its entry snapshot. */
   tcp_recovery_off (tc);
@@ -3107,6 +3121,17 @@ tcp_test_rto_reduce_once_e2e (vlib_main_t *vm, unformat_input_t *input)
 	goto cleanup;
       }
     if (!TCP_TEST_I (a->dsack_ineligible_after_second, "second rto makes D-SACK undo ineligible"))
+      {
+	rv = 1;
+	goto cleanup;
+      }
+    if (!TCP_TEST_I ((a->snd_rxt_after_reneging == 3 * a->mss &&
+		      a->rxt_delivered_after_reneging == 2 * a->mss &&
+		      a->rxt_flight_after_reneging == a->mss),
+		     "rto after reneging leaves its replacement in flight "
+		     "(sent %u delivered %u rxt flight %u mss %u)",
+		     a->snd_rxt_after_reneging, a->rxt_delivered_after_reneging,
+		     a->rxt_flight_after_reneging, a->mss))
       {
 	rv = 1;
 	goto cleanup;
@@ -5159,6 +5184,126 @@ tcp_test_delivery (vlib_main_t * vm, unformat_input_t * input)
 }
 
 static int
+tcp_test_bt_repeat_sack (void)
+{
+  tcp_connection_t _tc = {}, *tc = &_tc;
+  tcp_rate_sample_t rs = {};
+  tcp_bt_sample_t *bts;
+  sack_block_t block;
+  u32 n_samples;
+
+  tcp_bt_init (tc);
+  tcp_bt_track_tx (tc, 1000);
+  tc->snd_nxt = 1000;
+
+  block = (sack_block_t) { .start = 100, .end = 900 };
+  vec_add1 (tc->rcv_opts.sacks, block);
+  rs.last_sacked_bytes = 800;
+  tcp_bt_sample_delivery_rate (tc, &rs);
+
+  n_samples = pool_elts (tc->bt->samples);
+  TCP_TEST (n_samples == 3 && tc->delivered == 800,
+	    "initial SACK creates three ranges and delivers 800 bytes: %u/%u", n_samples,
+	    tc->delivered);
+
+  /* A repeated block is processed alongside new coverage. It must not split
+   * the already SACKed range at either of its internal boundaries. */
+  vec_reset_length (tc->rcv_opts.sacks);
+  block = (sack_block_t) { .start = 200, .end = 800 };
+  vec_add1 (tc->rcv_opts.sacks, block);
+  block = (sack_block_t) { .start = 900, .end = 950 };
+  vec_add1 (tc->rcv_opts.sacks, block);
+  clib_memset (&rs, 0, sizeof (rs));
+  rs.last_sacked_bytes = 50;
+  tcp_bt_sample_delivery_rate (tc, &rs);
+
+  bts = pool_elt_at_index (tc->bt->samples, tc->bt->head);
+  bts = pool_elt_at_index (tc->bt->samples, bts->next);
+  TCP_TEST (pool_elts (tc->bt->samples) == n_samples && bts->min_seq == 100 &&
+	      bts->max_seq == 950 && (bts->flags & TCP_BTS_IS_SACKED),
+	    "repeat SACK preserves one compact SACKed range [100:950]");
+  TCP_TEST (tc->delivered == 850 && tcp_bt_is_sane (tc->bt),
+	    "repeat SACK accounts only new coverage and keeps BT sane: %u", tc->delivered);
+
+  vec_free (tc->rcv_opts.sacks);
+  tcp_bt_cleanup (tc);
+  return 0;
+}
+
+static int
+tcp_test_bt_rxt_across_sacked_island (void)
+{
+  tcp_connection_t _tc = {}, *tc = &_tc;
+  tcp_rate_sample_t rs = {};
+  tcp_bt_sample_t *bts;
+  sack_block_t block;
+
+  tcp_bt_init (tc);
+  tcp_bt_track_tx (tc, 200);
+  tc->snd_nxt = 200;
+
+  block = (sack_block_t) { .start = 40, .end = 60 };
+  vec_add1 (tc->rcv_opts.sacks, block);
+  rs.last_sacked_bytes = 20;
+  tcp_bt_sample_delivery_rate (tc, &rs);
+
+  /* The retransmitted segment covers unsacked bytes on both sides of the
+   * SACKed island. Preserve the island and relabel both transmitted pieces. */
+  tcp_bt_track_rxt (tc, 0, 100);
+  bts = pool_elt_at_index (tc->bt->samples, tc->bt->head);
+  TCP_TEST (bts->min_seq == 0 && bts->max_seq == 40 && (bts->flags & TCP_BTS_IS_RXT),
+	    "BT tracks retransmitted prefix [0:40]");
+  bts = pool_elt_at_index (tc->bt->samples, bts->next);
+  TCP_TEST (bts->min_seq == 40 && bts->max_seq == 60 && (bts->flags & TCP_BTS_IS_SACKED),
+	    "BT preserves SACKed island [40:60]");
+  bts = pool_elt_at_index (tc->bt->samples, bts->next);
+  TCP_TEST (bts->min_seq == 60 && bts->max_seq == 100 && (bts->flags & TCP_BTS_IS_RXT),
+	    "BT tracks retransmitted suffix [60:100]");
+
+  vec_reset_length (tc->rcv_opts.sacks);
+  block = (sack_block_t) { .start = 60, .end = 100 };
+  vec_add1 (tc->rcv_opts.sacks, block);
+  clib_memset (&rs, 0, sizeof (rs));
+  rs.last_sacked_bytes = 40;
+  tcp_bt_sample_delivery_rate (tc, &rs);
+  TCP_TEST (tc->delivered == 60 && (rs.flags & TCP_BTS_IS_RXT),
+	    "BT samples retransmitted suffix delivery as RTT ambiguous: %u", tc->delivered);
+  TCP_TEST (tcp_bt_is_sane (tc->bt), "BT remains sane after SACKing retransmitted suffix");
+
+  vec_free (tc->rcv_opts.sacks);
+  tcp_bt_cleanup (tc);
+  return 0;
+}
+
+static int
+tcp_test_bt_toggle (void)
+{
+  tcp_connection_t _tc = {}, *tc = &_tc;
+
+  tc->snd_una = 100;
+  tc->snd_nxt = 200;
+  TCP_TEST (tcp_bt_enable (tc, 0) == 0 && tc->bt == 0,
+	    "disabled byte tracker is a no-op with data in flight");
+  TCP_TEST (tcp_bt_enable (tc, 1) == -1 && tc->bt == 0,
+	    "cannot enable byte tracker with data in flight");
+
+  tc->snd_nxt = tc->snd_una;
+  TCP_TEST (tcp_bt_enable (tc, 1) == 0 && tc->bt != 0,
+	    "can enable byte tracker with an empty flight");
+
+  tc->snd_nxt = 200;
+  TCP_TEST (tcp_bt_enable (tc, 1) == 0 && tc->bt != 0,
+	    "enabled byte tracker is a no-op with data in flight");
+  TCP_TEST (tcp_bt_enable (tc, 0) == -1 && tc->bt != 0,
+	    "cannot disable byte tracker with data in flight");
+
+  tc->snd_una = tc->snd_nxt;
+  TCP_TEST (tcp_bt_enable (tc, 0) == 0 && tc->bt == 0,
+	    "can disable byte tracker with an empty flight");
+  return 0;
+}
+
+static int
 tcp_test_bt (vlib_main_t * vm, unformat_input_t * input)
 {
   clib_thread_index_t thread_index = 0;
@@ -5174,6 +5319,13 @@ tcp_test_bt (vlib_main_t * vm, unformat_input_t * input)
   u32 head;
   u8 *bt_fmt = 0;
   sack_block_t *blk;
+
+  if (tcp_test_bt_toggle ())
+    return 1;
+  if (tcp_test_bt_repeat_sack ())
+    return 1;
+  if (tcp_test_bt_rxt_across_sacked_island ())
+    return 1;
 
   /* Init data structures */
   memset (tc, 0, sizeof (*tc));

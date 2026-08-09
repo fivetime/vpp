@@ -328,8 +328,9 @@ tcp_bt_track_tx (tcp_connection_t * tc, u32 len)
     }
 }
 
-void
-tcp_bt_track_rxt (tcp_connection_t * tc, u32 start, u32 end)
+/* Record one contiguous unsacked retransmit range. */
+static void
+bt_track_rxt_range (tcp_connection_t *tc, u32 start, u32 end)
 {
   tcp_byte_tracker_t *bt = tc->bt;
   tcp_bt_sample_t *bts, *next, *cur, *prev, *nbts;
@@ -463,6 +464,46 @@ tcp_bt_track_rxt (tcp_connection_t * tc, u32 start, u32 end)
     }
 }
 
+void
+tcp_bt_track_rxt (tcp_connection_t *tc, u32 start, u32 end)
+{
+  tcp_byte_tracker_t *bt = tc->bt;
+  tcp_bt_sample_t *bts, *scan;
+  u32 range_end;
+
+  ASSERT (seq_lt (start, end));
+
+  /* A retransmit can cross one or more ranges the peer already sacked. Record every unsacked
+   * sub-range sent so retransmit delivery and rtt ambiguity remain byte exact. */
+  while (seq_lt (start, end))
+    {
+      bts = bt_lookup_seq (bt, start);
+      ASSERT (bts != 0 && seq_geq (start, bts->min_seq));
+
+      if (bts->flags & TCP_BTS_IS_SACKED)
+	{
+	  start = seq_lt (bts->max_seq, end) ? bts->max_seq : end;
+	  continue;
+	}
+
+      range_end = end;
+      scan = bt_next_sample (bt, bts);
+      while (scan && seq_lt (scan->min_seq, end))
+	{
+	  if (scan->flags & TCP_BTS_IS_SACKED)
+	    {
+	      range_end = scan->min_seq;
+	      break;
+	    }
+	  scan = bt_next_sample (bt, scan);
+	}
+
+      ASSERT (seq_lt (start, range_end));
+      bt_track_rxt_range (tc, start, range_end);
+      start = range_end;
+    }
+}
+
 static void
 tcp_bt_sample_to_rate_sample (tcp_connection_t * tc, tcp_bt_sample_t * bts,
 			      tcp_rate_sample_t * rs)
@@ -528,8 +569,8 @@ tcp_bt_walk_samples_ooo (tcp_connection_t * tc, tcp_rate_sample_t * rs)
       ASSERT (seq_geq (blk->start, cur->min_seq)
 	      && seq_lt (blk->start, cur->max_seq));
 
-      /* Current should be split. Second part will be consumed */
-      if (PREDICT_FALSE (cur->min_seq != blk->start))
+      /* Split current if block starts in new sack coverage. Second part will be consumed */
+      if (PREDICT_FALSE (cur->min_seq != blk->start) && !(cur->flags & TCP_BTS_IS_SACKED))
 	{
 	  cur = bt_split_sample (bt, cur, blk->start);
 	  prev = bt_prev_sample (bt, cur);
@@ -567,6 +608,9 @@ tcp_bt_walk_samples_ooo (tcp_connection_t * tc, tcp_rate_sample_t * rs)
 
       if (cur && seq_lt (cur->min_seq, blk->end))
 	{
+	  if (cur->flags & TCP_BTS_IS_SACKED)
+	    continue;
+
 	  tcp_bt_sample_to_rate_sample (tc, cur, rs);
 	  prev = bt_prev_sample (bt, cur);
 	  /* Extend previous to include the newly sacked bytes */
@@ -683,6 +727,23 @@ tcp_bt_init (tcp_connection_t * tc)
   bt->last_ooo = TCP_BTS_INVALID_INDEX;
   tc->bt = bt;
   tc->cfg_flags |= TCP_CFG_F_BYTE_TRACKER;
+}
+
+int
+tcp_bt_enable (tcp_connection_t *tc, u8 enable)
+{
+  bool is_enabled = tc->cfg_flags & TCP_CFG_F_BYTE_TRACKER;
+
+  if (!!enable == is_enabled)
+    return 0;
+  if (tc->snd_una != tc->snd_nxt)
+    return -1;
+
+  if (enable)
+    tcp_bt_init (tc);
+  else
+    tcp_bt_cleanup (tc);
+  return 0;
 }
 
 u8 *
