@@ -152,14 +152,38 @@ typedef struct _scoreboard_trace_elt
   u32 group;
 } scoreboard_trace_elt_t;
 
+typedef struct tcp_rxt_range_
+{
+  u32 start;  /**< Start sequence number */
+  u32 end;    /**< End sequence number */
+  u8 is_lost; /**< Range is considered lost */
+} tcp_rxt_range_t;
+
 typedef struct _sack_scoreboard_hole
 {
+  union
+  {
+    tcp_rxt_range_t range; /**< Retransmission range */
+    struct
+    {
+      u32 start;
+      u32 end;
+      u8 is_lost;
+    };
+  };
   u32 next;		/**< Index for next entry in linked list */
   u32 prev;		/**< Index for previous entry in linked list */
-  u32 start;		/**< Start sequence number */
-  u32 end;		/**< End sequence number */
-  u8 is_lost;		/**< Mark hole as lost */
 } sack_scoreboard_hole_t;
+
+STATIC_ASSERT (STRUCT_OFFSET_OF (sack_scoreboard_hole_t, range.start) ==
+		 STRUCT_OFFSET_OF (sack_scoreboard_hole_t, start),
+	       "scoreboard range and start offsets must match");
+STATIC_ASSERT (STRUCT_OFFSET_OF (sack_scoreboard_hole_t, range.end) ==
+		 STRUCT_OFFSET_OF (sack_scoreboard_hole_t, end),
+	       "scoreboard range and end offsets must match");
+STATIC_ASSERT (STRUCT_OFFSET_OF (sack_scoreboard_hole_t, range.is_lost) ==
+		 STRUCT_OFFSET_OF (sack_scoreboard_hole_t, is_lost),
+	       "scoreboard range and is_lost offsets must match");
 
 typedef struct _sack_scoreboard
 {
@@ -181,24 +205,36 @@ typedef struct _sack_scoreboard
 
 } sack_scoreboard_t;
 
-typedef enum tcp_dsack_rxt_flag_
-{
-  TCP_DSACK_RXT_DUPLICATE = 1,
-} tcp_dsack_rxt_flag_t;
-
 typedef enum tcp_dsack_state_flag_
 {
   TCP_DSACK_INELIGIBLE = 1,
   TCP_DSACK_UNDO_DISABLED = 1 << 1,
   TCP_DSACK_RXT_OVERFLOW = 1 << 2,
+  TCP_DSACK_HISTORY = 1 << 3,
+  TCP_DSACK_RXT_ACTIVE = 1 << 4,
 } __clib_packed tcp_dsack_state_flag_t;
+
+#define TCP_DSACK_RXT_INVALID_INDEX ((u32) ~0)
 
 /** Retransmitted byte range retained for conservative D-SACK undo. */
 typedef struct tcp_dsack_rxt_
 {
-  u32 start;
-  u32 end;
-  tcp_dsack_rxt_flag_t flags;
+  union
+  {
+    struct
+    {
+      u32 start;
+      u32 end;
+      u32 next;
+    };
+    /* Pool element zero stores active-range metadata. */
+    struct
+    {
+      u32 head;
+      u32 tail;
+      u32 history_start;
+    };
+  };
 } tcp_dsack_rxt_t;
 
 typedef enum tcp_ack_flag_
@@ -207,6 +243,7 @@ typedef enum tcp_ack_flag_
   TCP_ACK_F_DSACK = 1 << 1,
   TCP_ACK_F_DSACK_SPURIOUS = 1 << 2,
   TCP_ACK_F_EIFEL_SPURIOUS = 1 << 3,
+  TCP_ACK_F_BT_PROCESSED = 1 << 4,
   TCP_ACK_F_SPURIOUS = TCP_ACK_F_DSACK_SPURIOUS | TCP_ACK_F_EIFEL_SPURIOUS,
 } __clib_packed tcp_ack_flag_t;
 
@@ -218,6 +255,8 @@ typedef enum tcp_bts_flags_
   TCP_BTS_IS_APP_LIMITED = 1 << 1,
   TCP_BTS_IS_SACKED = 1 << 2,
   TCP_BTS_IS_RXT_LOST = 1 << 3,
+  TCP_BTS_IS_DELIVERED = 1 << 4,
+  TCP_BTS_IS_LOST = 1 << 5,
 } __clib_packed tcp_bts_flags_t;
 
 typedef struct tcp_bt_sample_
@@ -248,7 +287,7 @@ typedef struct tcp_rate_sample_
   u32 bytes_acked;		/**< Bytes cumulatively acknowledged now */
   u32 acked_and_sacked;		/**< Bytes acked + sacked now */
   u32 last_sacked_bytes;	/**< Number of bytes newly sacked */
-  u32 last_bytes_delivered;	/**< Previously sacked bytes cumulatively acked */
+  u32 last_bytes_delivered;	/**< Previously delivered bytes acked/sacked now */
   u32 rxt_sacked;		/**< Retransmitted bytes newly delivered */
   u32 last_lost;		/**< Bytes lost now */
   u32 lost;			/**< Number of bytes lost over interval */
@@ -263,6 +302,9 @@ typedef struct tcp_byte_tracker_
   u32 head;			/**< Head of samples linked list */
   u32 tail;			/**< Tail of samples linked list */
   u32 last_ooo;			/**< Cached last ooo sample */
+  u32 cur_rxt;			/**< Current retransmission sample */
+  u32 cur_rxt_end;		/**< Cached range end; mutations reset to high_rxt */
+  u32 sack_loss_high;		/**< Upper edge of SACK-derived lost prefix */
 } tcp_byte_tracker_t;
 
 typedef enum _tcp_cc_algorithm_type
@@ -352,6 +394,7 @@ typedef struct _tcp_connection
 
   /* Congestion control */
   u32 cwnd;		/**< Congestion window */
+  u32 cwnd_limited_seq; /**< End of last flight eligible for cwnd growth */
   u32 cwnd_acc_bytes;	/**< Bytes accumulated for cwnd increment */
   u32 ssthresh;		/**< Slow-start threshold */
   u32 prev_ssthresh;	/**< ssthresh before congestion */
@@ -400,8 +443,12 @@ typedef struct _tcp_connection
 
   tcp_errors_t errors;	/**< Soft connection errors */
 
-  tcp_dsack_rxt_t *dsack_rxt;	      /**< Retransmits retained for D-SACK undo */
-  u32 dsack_recovery_ack;	      /**< ACK at recovery exit; bounds retained history */
+  union
+  {
+    tcp_dsack_rxt_t *dsack_rxt; /**< Active retransmit ranges for D-SACK undo */
+    u32 dsack_history_start;	/**< Lower sequence bound for retired history */
+  };
+  u32 dsack_pending_bytes;	      /**< Retransmit bytes without D-SACK evidence */
   tcp_dsack_state_flag_t dsack_flags; /**< D-SACK undo state */
 
   u32 iss;		/**< initial sent sequence */
@@ -461,8 +508,7 @@ tcp_cong_recovery_off (tcp_connection_t * tc)
 #define tcp_zero_rwnd_sent_on(tc) (tc)->flags |= TCP_CONN_ZERO_RWND_SENT
 #define tcp_zero_rwnd_sent_off(tc) (tc)->flags &= ~TCP_CONN_ZERO_RWND_SENT
 
-#define tcp_dsack_has_history(tc)                                                                  \
-  ((tc)->dsack_rxt != 0 || ((tc)->dsack_flags & TCP_DSACK_RXT_OVERFLOW))
+#define tcp_dsack_has_history(tc) (((tc)->dsack_flags & TCP_DSACK_HISTORY) != 0)
 
 always_inline tcp_connection_t *
 tcp_get_connection_from_transport (transport_connection_t * tconn)

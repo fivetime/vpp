@@ -981,11 +981,12 @@ tcp_push_one_header (tcp_connection_t *tc, vlib_buffer_t *b, tcp_push_hdr_flags_
 }
 
 u32
-tcp_session_push_header (transport_connection_t *tconn, vlib_buffer_t **bs,
-			 u32 n_bufs)
+tcp_session_push_header (transport_connection_t *tconn, vlib_buffer_t **bs, u32 n_bufs,
+			 u32 available_bytes)
 {
   tcp_connection_t *tc = (tcp_connection_t *) tconn;
   tcp_push_hdr_flags_t push_hdr_flags = TCP_PUSH_HDR_F_BURST | TCP_PUSH_HDR_F_UPDATE_SND_NXT;
+  u32 max_dequeue = tc->snd_nxt - tc->snd_una + available_bytes;
 
   if (PREDICT_FALSE (tc->cfg_flags & TCP_CFG_F_TSO))
     push_hdr_flags |= TCP_PUSH_HDR_F_MAYBE_GSO;
@@ -1011,6 +1012,8 @@ tcp_session_push_header (transport_connection_t *tconn, vlib_buffer_t **bs,
       n_bufs -= 1;
       bs += 1;
     }
+
+  tcp_cc_update_cwnd_limited (tc, max_dequeue);
 
   /* If not tracking an ACK, start tracking */
   if (tc->rtt_ts == 0 && !tcp_in_cong_recovery (tc))
@@ -1261,11 +1264,10 @@ tcp_prepare_retransmit_segment (tcp_worker_ctx_t * wrk,
     return 0;
 
   tc->snd_rxt_bytes += n_bytes;
-  if (tcp_opts_sack_permitted (&tc->rcv_opts))
-    tcp_dsack_track_retransmit (tc, start, start + n_bytes);
-
   if (tc->cfg_flags & TCP_CFG_F_BYTE_TRACKER)
     tcp_bt_track_rxt (tc, start, start + n_bytes);
+  else if (tcp_opts_sack_permitted (&tc->rcv_opts))
+    tcp_dsack_track_retransmit (tc, start, start + n_bytes);
 
   tc->bytes_retrans += n_bytes;
   tc->segs_retrans += 1;
@@ -1296,7 +1298,7 @@ tcp_cc_rxt_timeout (tcp_connection_t *tc)
       head_overlaps_rxt = tcp_in_cong_recovery (tc) && seq_gt (tc->sack_sb.high_rxt, tc->snd_una);
 
       sack_reneged = tcp_sack_handle_reneging (tc);
-      scoreboard_rxt_mark_lost (&tc->sack_sb, tc->snd_una, tc->snd_nxt);
+      tcp_sack_rxt_mark_lost (tc);
 
       if (head_was_rxt)
 	{
@@ -1311,12 +1313,15 @@ tcp_cc_rxt_timeout (tcp_connection_t *tc)
   /* Advance the recovery point to snd_nxt on every rto (RFC 6675) */
   tc->snd_congestion = tc->snd_nxt;
 
+  /* An RTO exits the RFC 7661 non-validated phase */
+  tc->cwnd_limited_seq = tc->snd_nxt;
+
   /* State snapshotted once per congestion event, when the event starts. If we
    * are already in congestion recovery these were taken on entry and must not
    * be overwritten */
   if (!tcp_in_cong_recovery (tc))
     {
-      tcp_dsack_recovery_clear (tc);
+      tcp_dsack_recovery_init (tc);
       tc->prev_ssthresh = tc->ssthresh;
       tc->prev_cwnd = tc->cwnd;
       /* Record timestamp. Eifel detection algorithm RFC3522 */
@@ -1441,7 +1446,7 @@ tcp_timer_retransmit_handler (tcp_connection_t * tc)
 	{
 	  /* Allocation failed, do not re-credit again the head to rxt_delivered */
 	  if (tcp_opts_sack_permitted (&tc->rcv_opts))
-	    scoreboard_init_rxt (&tc->sack_sb, tc->snd_una);
+	    tcp_sack_init_rxt (tc, tc->snd_una);
 	  tcp_timer_update (&wrk->timer_wheel, tc, TCP_TIMER_RETRANSMIT,
 			    tcp_cfg.alloc_err_timeout);
 	  return;
@@ -1455,7 +1460,7 @@ tcp_timer_retransmit_handler (tcp_connection_t * tc)
       tc->rto_boff += 1;
 
       if (tcp_opts_sack_permitted (&tc->rcv_opts))
-	scoreboard_init_rxt (&tc->sack_sb, tc->snd_una + n_bytes);
+	tcp_sack_init_rxt (tc, tc->snd_una + n_bytes);
 
       tcp_program_retransmit (tc);
     }
@@ -1658,14 +1663,15 @@ tcp_retransmit_first_unacked (tcp_worker_ctx_t * wrk, tcp_connection_t * tc)
 }
 
 static int
-tcp_transmit_unsent (tcp_worker_ctx_t * wrk, tcp_connection_t * tc,
-		     u32 burst_size)
+tcp_transmit_unsent (tcp_worker_ctx_t *wrk, tcp_connection_t *tc, u32 burst_size,
+		     u32 available_bytes)
 {
-  u32 offset, n_segs = 0, n_written, bi, available_wnd;
+  u32 offset, max_dequeue, n_segs = 0, n_written, bi, available_wnd;
   vlib_main_t *vm = wrk->vm;
   vlib_buffer_t *b = 0;
 
   offset = tc->snd_nxt - tc->snd_una;
+  max_dequeue = offset + available_bytes;
   available_wnd = tc->snd_wnd - offset;
   burst_size = clib_min (burst_size, available_wnd / tc->snd_mss);
 
@@ -1690,6 +1696,8 @@ tcp_transmit_unsent (tcp_worker_ctx_t * wrk, tcp_connection_t * tc,
     }
 
 done:
+  if (n_segs)
+    tcp_cc_update_cwnd_limited (tc, max_dequeue);
   return n_segs;
 }
 
@@ -1734,20 +1742,63 @@ tcp_max_tx_deq (tcp_connection_t * tc)
     (seq_geq (_sb->rescue_rxt, _tc->snd_una) 			\
 	&& seq_leq (_sb->rescue_rxt, _tc->snd_congestion))
 
+typedef enum
+{
+  TCP_RXT_BACKEND_SCOREBOARD,
+  TCP_RXT_BACKEND_BT,
+} tcp_rxt_backend_t;
+
+typedef struct
+{
+  sack_scoreboard_hole_t *hole;
+  tcp_rxt_range_t bt_range;
+} tcp_rxt_cursor_t;
+
+static_always_inline tcp_rxt_range_t *
+tcp_rxt_next_range (tcp_connection_t *tc, tcp_rxt_backend_t backend, tcp_rxt_cursor_t *cursor,
+		    u8 have_unsent, u8 *can_rescue, u8 *snd_limited)
+{
+  if (backend == TCP_RXT_BACKEND_BT)
+    {
+      if (!tcp_bt_next_rxt_range (tc, have_unsent, can_rescue, snd_limited, &cursor->bt_range))
+	return 0;
+      return &cursor->bt_range;
+    }
+
+  cursor->hole =
+    scoreboard_next_rxt_hole (&tc->sack_sb, cursor->hole, have_unsent, can_rescue, snd_limited);
+  return cursor->hole ? &cursor->hole->range : 0;
+}
+
+static_always_inline tcp_rxt_range_t *
+tcp_rxt_last_range (tcp_connection_t *tc, tcp_rxt_backend_t backend, tcp_rxt_cursor_t *cursor)
+{
+  if (backend == TCP_RXT_BACKEND_BT)
+    {
+      if (!tcp_bt_last_rxt_range (tc, &cursor->bt_range))
+	return 0;
+      return &cursor->bt_range;
+    }
+
+  cursor->hole = scoreboard_last_hole (&tc->sack_sb);
+  return cursor->hole ? &cursor->hole->range : 0;
+}
+
 /**
  * Do retransmit with SACKs
  */
-static int
-tcp_retransmit_sack (tcp_worker_ctx_t * wrk, tcp_connection_t * tc,
-		     u32 burst_size)
+static_always_inline int
+tcp_retransmit_sack_inline (tcp_worker_ctx_t *wrk, tcp_connection_t *tc, u32 burst_size,
+			    tcp_rxt_backend_t backend)
 {
   u32 n_written = 0, offset, max_bytes, n_segs = 0;
   u8 snd_limited = 0, can_rescue = 0, cc_limited = 0;
   u32 bi, max_deq, burst_bytes, sent_bytes = 0;
-  sack_scoreboard_hole_t *hole;
+  tcp_rxt_cursor_t cursor = {};
+  tcp_rxt_range_t *range = 0;
   vlib_main_t *vm = wrk->vm;
   vlib_buffer_t *b = 0;
-  sack_scoreboard_t *sb;
+  sack_scoreboard_t *sb = &tc->sack_sb;
   int snd_space;
 
   ASSERT (tcp_in_cong_recovery (tc));
@@ -1772,19 +1823,17 @@ tcp_retransmit_sack (tcp_worker_ctx_t * wrk, tcp_connection_t * tc,
   if (snd_space < tc->snd_mss)
     goto done;
 
-  sb = &tc->sack_sb;
-
   TCP_EVT (TCP_EVT_CC_EVT, tc, 0);
-  hole = scoreboard_get_hole (sb, sb->cur_rxt_hole);
+  if (backend == TCP_RXT_BACKEND_SCOREBOARD)
+    cursor.hole = scoreboard_get_hole (sb, sb->cur_rxt_hole);
 
   max_deq = transport_max_tx_dequeue (&tc->connection);
   max_deq -= tc->snd_nxt - tc->snd_una;
 
   while (snd_space > 0 && n_segs < burst_size)
     {
-      hole = scoreboard_next_rxt_hole (sb, hole, max_deq != 0, &can_rescue,
-				       &snd_limited);
-      if (!hole)
+      range = tcp_rxt_next_range (tc, backend, &cursor, max_deq != 0, &can_rescue, &snd_limited);
+      if (!range)
 	{
 	  /* We are out of lost holes to retransmit so send some new data. */
 	  if (max_deq)
@@ -1804,7 +1853,7 @@ tcp_retransmit_sack (tcp_worker_ctx_t * wrk, tcp_connection_t * tc,
 	      burst_size = clib_min (burst_size - n_segs,
 				     snd_space / tc->snd_mss);
 	      burst_size = clib_min (burst_size, TCP_RXT_MAX_BURST);
-	      n_segs_new = tcp_transmit_unsent (wrk, tc, burst_size);
+	      n_segs_new = tcp_transmit_unsent (wrk, tc, burst_size, max_deq);
 	      n_bytes_new = n_segs_new * tc->snd_mss;
 	      sent_bytes += clib_min (max_deq, n_bytes_new);
 	      if (max_deq > n_bytes_new)
@@ -1822,10 +1871,12 @@ tcp_retransmit_sack (tcp_worker_ctx_t * wrk, tcp_connection_t * tc,
 	   * unSACKed sequence number SHOULD be returned, and RescueRxt set to
 	   * RecoveryPoint. HighRxt MUST NOT be updated.
 	   */
-	  hole = scoreboard_last_hole (sb);
-	  max_bytes = clib_min (tc->snd_mss, hole->end - hole->start);
+	  range = tcp_rxt_last_range (tc, backend, &cursor);
+	  if (!range)
+	    break;
+	  max_bytes = clib_min (tc->snd_mss, range->end - range->start);
 	  max_bytes = clib_min (max_bytes, snd_space);
-	  offset = hole->end - tc->snd_una - max_bytes;
+	  offset = range->end - tc->snd_una - max_bytes;
 	  n_written = tcp_prepare_retransmit_segment (wrk, tc, offset,
 						      max_bytes, &b);
 	  if (!n_written)
@@ -1841,7 +1892,7 @@ tcp_retransmit_sack (tcp_worker_ctx_t * wrk, tcp_connection_t * tc,
 	  goto done;
 	}
 
-      max_bytes = hole->end - sb->high_rxt;
+      max_bytes = range->end - sb->high_rxt;
       /* Avoid retransmitting segment less than mss if possible */
       if (snd_space < tc->snd_mss && max_bytes > snd_space)
 	break;
@@ -1870,7 +1921,7 @@ tcp_retransmit_sack (tcp_worker_ctx_t * wrk, tcp_connection_t * tc,
       n_segs += 1;
     }
 
-  if (hole)
+  if (range)
     tcp_program_retransmit (tc);
 
 done:
@@ -1884,6 +1935,21 @@ done:
   if (n_segs)
     tc->prev_prr_delivered = tc->prr_delivered;
   return n_segs;
+}
+
+static int
+tcp_retransmit_sack (tcp_worker_ctx_t *wrk, tcp_connection_t *tc, u32 burst_size)
+{
+  return tcp_retransmit_sack_inline (wrk, tc, burst_size, TCP_RXT_BACKEND_SCOREBOARD);
+}
+
+/**
+ * Do SACK retransmits using byte-tracker ranges
+ */
+static int
+tcp_retransmit_bt (tcp_worker_ctx_t *wrk, tcp_connection_t *tc, u32 burst_size)
+{
+  return tcp_retransmit_sack_inline (wrk, tc, burst_size, TCP_RXT_BACKEND_BT);
 }
 
 /**
@@ -1963,7 +2029,7 @@ send_unsent:
     {
       snd_space = clib_min (max_deq, snd_space);
       burst_size = clib_min (burst_size - n_segs, snd_space / tc->snd_mss);
-      n_segs_now = tcp_transmit_unsent (wrk, tc, burst_size);
+      n_segs_now = tcp_transmit_unsent (wrk, tc, burst_size, max_deq);
       if (n_segs_now && max_deq > n_segs_now * tc->snd_mss)
 	tcp_program_retransmit (tc);
       n_segs += n_segs_now;
@@ -2049,7 +2115,12 @@ tcp_do_retransmit (tcp_connection_t * tc, u32 max_burst_size)
   wrk = tcp_get_worker (tc->c_thread_index);
 
   if (tcp_opts_sack_permitted (&tc->rcv_opts))
-    n_segs = tcp_retransmit_sack (wrk, tc, max_burst_size);
+    {
+      if (PREDICT_FALSE (tc->cfg_flags & TCP_CFG_F_BYTE_TRACKER))
+	n_segs = tcp_retransmit_bt (wrk, tc, max_burst_size);
+      else
+	n_segs = tcp_retransmit_sack (wrk, tc, max_burst_size);
+    }
   else
     n_segs = tcp_retransmit_no_sack (wrk, tc, max_burst_size);
 

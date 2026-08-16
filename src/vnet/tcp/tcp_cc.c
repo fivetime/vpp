@@ -10,7 +10,7 @@ static void
 tcp_cc_init_congestion (tcp_connection_t *tc)
 {
   tcp_fastrecovery_on (tc);
-  tcp_dsack_recovery_clear (tc);
+  tcp_dsack_recovery_init (tc);
   tc->snd_congestion = tc->snd_nxt;
   tc->cwnd_acc_bytes = 0;
   tc->rxt_delivered = 0;
@@ -23,7 +23,7 @@ tcp_cc_init_congestion (tcp_connection_t *tc)
 
   tc->snd_rxt_bytes = 0;
   if (tcp_opts_sack_permitted (&tc->rcv_opts))
-    scoreboard_init_rxt (&tc->sack_sb, tc->snd_una);
+    tcp_sack_init_rxt (tc, tc->snd_una);
   else
     tcp_fastrecovery_first_on (tc);
 
