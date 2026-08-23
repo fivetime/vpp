@@ -360,7 +360,8 @@ format_tcp_scoreboard (u8 * s, va_list * args)
   u32 indent = format_get_indent (s);
 
   s = format (s, "sacked %u lost %u high_sacked %u is_reneging %u reorder %u\n", sb->sacked_bytes,
-	      sb->lost_bytes, sb->high_sacked - tc->iss, sb->is_reneging, sb->reorder);
+	      sb->lost_bytes, sb->high_sacked - tc->iss, tcp_scoreboard_is_reneging (sb),
+	      sb->reorder);
   s = format (s, "%Ucur_rxt_hole %u high_rxt %u rescue_rxt %u", format_white_space, indent,
 	      sb->cur_rxt_hole, sb->high_rxt - tc->iss, sb->rescue_rxt - tc->iss);
 
@@ -648,12 +649,12 @@ tcp_scoreboard_dump_trace (u8 * s, sack_scoreboard_t * sb)
 
   s = format (s, "scoreboard trace:");
   vec_foreach (block, sb->trace)
-  {
-    s = format (s, "{%u, %u, %u, %u, %u}, ", block->start, block->end,
-		block->ack, block->snd_una_max, block->group);
-    if ((++i % 3) == 0)
-      s = format (s, "\n");
-  }
+    {
+      s = format (s, "{%u, %u, %u, %u, %u}, ", block->start, block->end, block->ack, block->snd_nxt,
+		  block->group);
+      if ((++i % 3) == 0)
+	s = format (s, "\n");
+    }
   return s;
 #else
   return 0;
@@ -703,7 +704,7 @@ tcp_scoreboard_replay (u8 * s, tcp_connection_t * tc, u8 verbose)
   scoreboard_trace_elt_t *trace;
   u32 next_ack, left, group, has_new_ack = 0;
   tcp_connection_t _placeholder_tc, *placeholder_tc = &_placeholder_tc;
-  tcp_rate_sample_t rs = {};
+  tcp_ack_ctx_t ac = {};
   sack_block_t *block;
 
   if (!TCP_SCOREBOARD_TRACE)
@@ -744,8 +745,8 @@ tcp_scoreboard_replay (u8 * s, tcp_connection_t * tc, u8 verbose)
 	  if (trace[left].ack != 0)
 	    {
 	      if (verbose)
-		s = format (s, "Adding ack %u, snd_una_max %u, segs: ",
-			    trace[left].ack, trace[left].snd_nxt);
+		s = format (s, "Adding ack %u, snd_nxt %u, segs: ", trace[left].ack,
+			    trace[left].snd_nxt);
 	      placeholder_tc->snd_nxt = trace[left].snd_nxt;
 	      next_ack = trace[left].ack;
 	      has_new_ack = 1;
@@ -768,8 +769,10 @@ tcp_scoreboard_replay (u8 * s, tcp_connection_t * tc, u8 verbose)
       else
 	placeholder_tc->rcv_opts.flags &= ~TCP_OPTS_FLAG_SACK;
       placeholder_tc->rcv_opts.n_sack_blocks = vec_len (placeholder_tc->rcv_opts.sacks);
-      clib_memset (&rs, 0, sizeof (rs));
-      tcp_rcv_sacks (placeholder_tc, next_ack, &rs);
+      clib_memset (&ac, 0, sizeof (ac));
+      tcp_ack_handle_feedback (placeholder_tc, next_ack, &ac);
+      if (ac.ack_flags & TCP_ACK_F_DETECT_LOSS)
+	tcp_loss_on_ack (placeholder_tc, &ac);
       if (has_new_ack)
 	placeholder_tc->snd_una = next_ack;
 

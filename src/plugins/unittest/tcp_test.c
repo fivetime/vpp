@@ -31,13 +31,21 @@
     }								\
 }
 
-/* Production creates one rate sample per ACK. Keep direct scoreboard tests
- * faithful to that ownership model when they reuse a local sample. */
 static_always_inline void
-tcp_test_rcv_sacks (tcp_connection_t *tc, u32 ack, tcp_rate_sample_t *rs)
+tcp_test_ack_handle_feedback (tcp_connection_t *tc, u32 ack, tcp_ack_ctx_t *ac)
 {
-  clib_memset (rs, 0, sizeof (*rs));
-  tcp_rcv_sacks (tc, ack, rs);
+  tcp_ack_handle_feedback (tc, ack, ac);
+  if (ac->ack_flags & TCP_ACK_F_DETECT_LOSS)
+    tcp_loss_on_ack (tc, ac);
+}
+
+/* Production creates a fresh ACK context per ACK. Keep direct scoreboard
+ * tests faithful to that ownership model when they reuse a local context. */
+static_always_inline void
+tcp_test_rcv_sacks (tcp_connection_t *tc, u32 ack, tcp_ack_ctx_t *ac)
+{
+  clib_memset (ac, 0, sizeof (*ac));
+  tcp_test_ack_handle_feedback (tc, ack, ac);
 }
 
 typedef enum
@@ -158,7 +166,7 @@ static int
 tcp_test_sack_reordering (tcp_test_sack_backend_t backend)
 {
   tcp_connection_t _tc, *tc = &_tc;
-  tcp_rate_sample_t rs = {};
+  tcp_ack_ctx_t ac = {};
   sack_scoreboard_t *sb = &tc->sack_sb;
   sack_block_t block;
   u32 i;
@@ -171,7 +179,7 @@ tcp_test_sack_reordering (tcp_test_sack_backend_t backend)
       clib_memset (tc, 0, sizeof (*tc));
       tc->snd_nxt = t->snd_nxt;
       tc->snd_mss = t->snd_mss;
-      tc->rcv_opts.flags = TCP_OPTS_FLAG_SACK;
+      tc->rcv_opts.flags = TCP_OPTS_FLAG_SACK_PERMITTED | TCP_OPTS_FLAG_SACK;
       tcp_test_sack_backend_init (tc, backend);
       sb->reorder = t->initial_reorder;
       sb->rescue_rxt = tc->snd_una - 1;
@@ -196,7 +204,7 @@ tcp_test_sack_reordering (tcp_test_sack_backend_t backend)
       block.end = tc->snd_nxt;
       vec_add1 (tc->rcv_opts.sacks, block);
       tc->rcv_opts.n_sack_blocks = 1;
-      tcp_test_rcv_sacks (tc, tc->snd_una, &rs);
+      tcp_test_rcv_sacks (tc, tc->snd_una, &ac);
       ok = TCP_TEST_I (
 	(sb->reorder == t->initial_reorder), "%s sack reorder %s: frontier keeps %u, got %u",
 	tcp_test_sack_backend_names[backend], t->name, t->initial_reorder, sb->reorder);
@@ -207,7 +215,7 @@ tcp_test_sack_reordering (tcp_test_sack_backend_t backend)
 	  block.start = t->delayed_start;
 	  block.end = t->delayed_end;
 	  vec_add1 (tc->rcv_opts.sacks, block);
-	  tcp_test_rcv_sacks (tc, tc->snd_una, &rs);
+	  tcp_test_rcv_sacks (tc, tc->snd_una, &ac);
 	  ok = TCP_TEST_I (
 	    (sb->reorder == t->expected_reorder), "%s sack reorder %s: expected %u, got %u",
 	    tcp_test_sack_backend_names[backend], t->name, t->expected_reorder, sb->reorder);
@@ -228,7 +236,7 @@ static u32
 tcp_test_reorder_observe (tcp_connection_t *tc, tcp_test_sack_backend_t backend, u16 mss,
 			  u32 snd_nxt, u32 distance, u32 initial_reorder)
 {
-  tcp_rate_sample_t rs = {};
+  tcp_ack_ctx_t ac = {};
   sack_scoreboard_t *sb = &tc->sack_sb;
   sack_block_t block;
   u32 reorder;
@@ -236,7 +244,7 @@ tcp_test_reorder_observe (tcp_connection_t *tc, tcp_test_sack_backend_t backend,
   clib_memset (tc, 0, sizeof (*tc));
   tc->snd_nxt = snd_nxt;
   tc->snd_mss = mss;
-  tc->rcv_opts.flags = TCP_OPTS_FLAG_SACK;
+  tc->rcv_opts.flags = TCP_OPTS_FLAG_SACK_PERMITTED | TCP_OPTS_FLAG_SACK;
   tcp_test_sack_backend_init (tc, backend);
   sb->reorder = initial_reorder;
   sb->rescue_rxt = tc->snd_una - 1;
@@ -246,7 +254,7 @@ tcp_test_reorder_observe (tcp_connection_t *tc, tcp_test_sack_backend_t backend,
   block.end = snd_nxt;
   vec_add1 (tc->rcv_opts.sacks, block);
   tc->rcv_opts.n_sack_blocks = 1;
-  tcp_test_rcv_sacks (tc, tc->snd_una, &rs);
+  tcp_test_rcv_sacks (tc, tc->snd_una, &ac);
 
   /* Sack a delayed segment 'distance' bytes below the frontier. */
   vec_reset_length (tc->rcv_opts.sacks);
@@ -254,7 +262,7 @@ tcp_test_reorder_observe (tcp_connection_t *tc, tcp_test_sack_backend_t backend,
   block.end = block.start + mss;
   vec_add1 (tc->rcv_opts.sacks, block);
   tc->rcv_opts.n_sack_blocks = 1;
-  tcp_test_rcv_sacks (tc, tc->snd_una, &rs);
+  tcp_test_rcv_sacks (tc, tc->snd_una, &ac);
 
   reorder = sb->reorder;
 
@@ -269,7 +277,7 @@ static int
 tcp_test_sack_reorder_accuracy (tcp_test_sack_backend_t backend)
 {
   tcp_connection_t _tc, *tc = &_tc;
-  tcp_rate_sample_t rs = {};
+  tcp_ack_ctx_t ac = {};
   sack_scoreboard_t *sb = &tc->sack_sb;
   sack_block_t block;
   const u16 mss = 150;
@@ -332,7 +340,7 @@ tcp_test_sack_reorder_accuracy (tcp_test_sack_backend_t backend)
     clib_memset (tc, 0, sizeof (*tc));
     tc->snd_nxt = snd_nxt;
     tc->snd_mss = mss;
-    tc->rcv_opts.flags = TCP_OPTS_FLAG_SACK;
+    tc->rcv_opts.flags = TCP_OPTS_FLAG_SACK_PERMITTED | TCP_OPTS_FLAG_SACK;
     tcp_test_sack_backend_init (tc, backend);
     sb->rescue_rxt = tc->snd_una - 1;
 
@@ -340,7 +348,7 @@ tcp_test_sack_reorder_accuracy (tcp_test_sack_backend_t backend)
     block.end = snd_nxt;
     vec_add1 (tc->rcv_opts.sacks, block);
     tc->rcv_opts.n_sack_blocks = 1;
-    tcp_test_rcv_sacks (tc, tc->snd_una, &rs);
+    tcp_test_rcv_sacks (tc, tc->snd_una, &ac);
 
     /* Large reorder first. */
     vec_reset_length (tc->rcv_opts.sacks);
@@ -348,7 +356,7 @@ tcp_test_sack_reorder_accuracy (tcp_test_sack_backend_t backend)
     block.end = block.start + mss;
     vec_add1 (tc->rcv_opts.sacks, block);
     tc->rcv_opts.n_sack_blocks = 1;
-    tcp_test_rcv_sacks (tc, tc->snd_una, &rs);
+    tcp_test_rcv_sacks (tc, tc->snd_una, &ac);
     ok = TCP_TEST_I ((sb->reorder == big), "%s reorder max: large observation sets %u, got %u",
 		     tcp_test_sack_backend_names[backend], big, sb->reorder);
 
@@ -360,7 +368,7 @@ tcp_test_sack_reorder_accuracy (tcp_test_sack_backend_t backend)
 	block.end = block.start + mss;
 	vec_add1 (tc->rcv_opts.sacks, block);
 	tc->rcv_opts.n_sack_blocks = 1;
-	tcp_test_rcv_sacks (tc, tc->snd_una, &rs);
+	tcp_test_rcv_sacks (tc, tc->snd_una, &ac);
 	ok =
 	  TCP_TEST_I ((sb->reorder == big), "%s reorder max: smaller observation keeps %u, got %u",
 		      tcp_test_sack_backend_names[backend], big, sb->reorder);
@@ -386,7 +394,7 @@ static int
 tcp_test_sack_rx (vlib_main_t * vm, unformat_input_t * input)
 {
   tcp_connection_t _tc, *tc = &_tc;
-  tcp_rate_sample_t rs = {};
+  tcp_ack_ctx_t ac = {};
   sack_scoreboard_t *sb = &tc->sack_sb;
   sack_block_t *sacks = 0, block;
   sack_scoreboard_hole_t *hole;
@@ -413,7 +421,7 @@ tcp_test_sack_rx (vlib_main_t * vm, unformat_input_t * input)
   tc->flags |= TCP_CONN_FAST_RECOVERY | TCP_CONN_RECOVERY;
   tc->snd_una = 0;
   tc->snd_nxt = 1000;
-  tc->rcv_opts.flags |= TCP_OPTS_FLAG_SACK;
+  tc->rcv_opts.flags |= TCP_OPTS_FLAG_SACK_PERMITTED | TCP_OPTS_FLAG_SACK;
   tc->snd_mss = 150;
   scoreboard_init (&tc->sack_sb);
 
@@ -433,7 +441,7 @@ tcp_test_sack_rx (vlib_main_t * vm, unformat_input_t * input)
       vec_add1 (tc->rcv_opts.sacks, sacks[i * 2]);
     }
   tc->rcv_opts.n_sack_blocks = vec_len (tc->rcv_opts.sacks);
-  tcp_test_rcv_sacks (tc, 0, &rs);
+  tcp_test_rcv_sacks (tc, 0, &ac);
 
   if (verbose)
     vlib_cli_output (vm, "sb after even blocks (mss %u):\n%U",
@@ -450,11 +458,11 @@ tcp_test_sack_rx (vlib_main_t * vm, unformat_input_t * input)
   TCP_TEST ((hole->start == 900 && hole->end == 1000), "last hole start %u end %u", hole->start,
 	    hole->end);
   TCP_TEST ((sb->sacked_bytes == 400), "sacked bytes %d", sb->sacked_bytes);
-  TCP_TEST ((!sb->is_reneging), "is not reneging");
-  TCP_TEST ((rs.last_sacked_bytes == 400), "last sacked bytes %d", rs.last_sacked_bytes);
+  TCP_TEST ((!tcp_scoreboard_is_reneging (sb)), "is not reneging");
+  TCP_TEST ((ac.last_sacked_bytes == 400), "last sacked bytes %d", ac.last_sacked_bytes);
   TCP_TEST ((sb->high_sacked == 900), "high sacked %u", sb->high_sacked);
   TCP_TEST ((sb->lost_bytes == 300), "lost bytes %u", sb->lost_bytes);
-  TCP_TEST ((rs.last_lost == 300), "last lost bytes %u", rs.last_lost);
+  TCP_TEST ((ac.last_lost == 300), "last lost bytes %u", ac.last_lost);
 
   /*
    * Inject odd blocks except the last
@@ -467,7 +475,7 @@ tcp_test_sack_rx (vlib_main_t * vm, unformat_input_t * input)
       vec_add1 (tc->rcv_opts.sacks, sacks[i * 2 + 1]);
     }
   tc->rcv_opts.n_sack_blocks = vec_len (tc->rcv_opts.sacks);
-  tcp_test_rcv_sacks (tc, 0, &rs);
+  tcp_test_rcv_sacks (tc, 0, &ac);
 
   if (verbose)
     vlib_cli_output (vm, "\nsb after odd blocks:\n%U", format_tcp_scoreboard,
@@ -479,23 +487,23 @@ tcp_test_sack_rx (vlib_main_t * vm, unformat_input_t * input)
   TCP_TEST ((hole->start == 0 && hole->end == 100), "first hole start %u end %u", hole->start,
 	    hole->end);
   TCP_TEST ((sb->sacked_bytes == 800), "sacked bytes %d", sb->sacked_bytes);
-  TCP_TEST ((!sb->is_reneging), "is not reneging");
+  TCP_TEST ((!tcp_scoreboard_is_reneging (sb)), "is not reneging");
   TCP_TEST ((sb->high_sacked == 900), "high sacked %u", sb->high_sacked);
-  TCP_TEST ((rs.last_sacked_bytes == 400), "last sacked bytes %d", rs.last_sacked_bytes);
+  TCP_TEST ((ac.last_sacked_bytes == 400), "last sacked bytes %d", ac.last_sacked_bytes);
   TCP_TEST ((sb->lost_bytes == 100), "lost bytes %u", sb->lost_bytes);
-  TCP_TEST ((rs.last_lost == 0), "last lost bytes %u", rs.last_lost);
+  TCP_TEST ((ac.last_lost == 0), "last lost bytes %u", ac.last_lost);
 
   /*
    *  Ack until byte 100 - this is reneging because we should ack until 900
    */
-  tcp_test_rcv_sacks (tc, 100, &rs);
+  tcp_test_rcv_sacks (tc, 100, &ac);
   if (verbose)
     vlib_cli_output (vm, "\nack until byte 100:\n%U", format_tcp_scoreboard,
 		     sb, tc);
 
   TCP_TEST ((pool_elts (sb->holes) == 1), "scoreboard has %d elements",
 	    pool_elts (sb->holes));
-  TCP_TEST ((sb->is_reneging), "is reneging");
+  TCP_TEST ((tcp_scoreboard_is_reneging (sb)), "is reneging");
 
   /*
    * Make sure we accept duplicate acks while reneging.
@@ -507,22 +515,22 @@ tcp_test_sack_rx (vlib_main_t * vm, unformat_input_t * input)
   block.end = 950;
   vec_add1 (tc->rcv_opts.sacks, block);
 
-  tcp_test_rcv_sacks (tc, 100, &rs);
+  tcp_test_rcv_sacks (tc, 100, &ac);
   TCP_TEST ((pool_elts (sb->holes) == 1), "scoreboard has %d elements",
 	    pool_elts (sb->holes));
-  TCP_TEST ((sb->is_reneging), "is reneging");
-  TCP_TEST ((rs.last_sacked_bytes == 50), "last sacked bytes %d", rs.last_sacked_bytes);
-  TCP_TEST ((rs.rxt_sacked == 50), "last rxt sacked bytes %d", rs.rxt_sacked);
+  TCP_TEST ((tcp_scoreboard_is_reneging (sb)), "is reneging");
+  TCP_TEST ((ac.last_sacked_bytes == 50), "last sacked bytes %d", ac.last_sacked_bytes);
+  TCP_TEST ((ac.rxt_sacked == 50), "last rxt sacked bytes %d", ac.rxt_sacked);
 
   /*
    * Sack all up to 950
    */
-  tcp_test_rcv_sacks (tc, 950, &rs);
+  tcp_test_rcv_sacks (tc, 950, &ac);
   TCP_TEST ((sb->high_sacked == 950), "max sacked byte %u", sb->high_sacked);
   TCP_TEST ((sb->sacked_bytes == 0), "sacked bytes %d", sb->sacked_bytes);
-  TCP_TEST ((rs.last_sacked_bytes == 0), "last sacked bytes %d", rs.last_sacked_bytes);
+  TCP_TEST ((ac.last_sacked_bytes == 0), "last sacked bytes %d", ac.last_sacked_bytes);
   TCP_TEST ((sb->lost_bytes == 0), "lost bytes %u", sb->lost_bytes);
-  TCP_TEST ((!sb->is_reneging), "is not reneging");
+  TCP_TEST ((!tcp_scoreboard_is_reneging (sb)), "is not reneging");
 
   /*
    * Sack [960 970] [980 990]
@@ -539,13 +547,13 @@ tcp_test_sack_rx (vlib_main_t * vm, unformat_input_t * input)
   block.end = 990;
   vec_add1 (tc->rcv_opts.sacks, block);
 
-  tcp_test_rcv_sacks (tc, 950, &rs);
+  tcp_test_rcv_sacks (tc, 950, &ac);
   TCP_TEST ((sb->high_sacked == 990), "max sacked byte %u", sb->high_sacked);
   TCP_TEST ((sb->sacked_bytes == 20), "sacked bytes %d", sb->sacked_bytes);
-  TCP_TEST ((rs.last_sacked_bytes == 20), "last sacked bytes %d", rs.last_sacked_bytes);
+  TCP_TEST ((ac.last_sacked_bytes == 20), "last sacked bytes %d", ac.last_sacked_bytes);
   TCP_TEST ((sb->lost_bytes == 0), "lost bytes %u", sb->lost_bytes);
-  TCP_TEST ((!sb->is_reneging), "is not reneging");
-  TCP_TEST ((rs.rxt_sacked == 15), "last rxt sacked bytes %d", rs.rxt_sacked);
+  TCP_TEST ((!tcp_scoreboard_is_reneging (sb)), "is not reneging");
+  TCP_TEST ((ac.rxt_sacked == 15), "last rxt sacked bytes %d", ac.rxt_sacked);
 
   /*
    * Ack up to 960 (reneging) + [961 971]
@@ -553,13 +561,13 @@ tcp_test_sack_rx (vlib_main_t * vm, unformat_input_t * input)
   tc->rcv_opts.sacks[0].start = 961;
   tc->rcv_opts.sacks[0].end = 971;
 
-  tcp_test_rcv_sacks (tc, 960, &rs);
+  tcp_test_rcv_sacks (tc, 960, &ac);
 
-  TCP_TEST ((sb->is_reneging), "is reneging");
+  TCP_TEST ((tcp_scoreboard_is_reneging (sb)), "is reneging");
   TCP_TEST ((sb->sacked_bytes == 21), "sacked bytes %d", sb->sacked_bytes);
-  TCP_TEST ((rs.last_sacked_bytes == 1), "last sacked bytes %d", rs.last_sacked_bytes);
-  TCP_TEST ((rs.rxt_sacked == 11), "last rxt sacked bytes %d", rs.rxt_sacked);
-  TCP_TEST ((rs.last_bytes_delivered == 0), "last bytes delivered %d", rs.last_bytes_delivered);
+  TCP_TEST ((ac.last_sacked_bytes == 1), "last sacked bytes %d", ac.last_sacked_bytes);
+  TCP_TEST ((ac.rxt_sacked == 11), "last rxt sacked bytes %d", ac.rxt_sacked);
+  TCP_TEST ((ac.last_bytes_delivered == 0), "last bytes delivered %d", ac.last_bytes_delivered);
 
   /*
    * Ack up to 960 (reneging) + [961 990]
@@ -568,12 +576,12 @@ tcp_test_sack_rx (vlib_main_t * vm, unformat_input_t * input)
   tc->rcv_opts.sacks[0].start = 961;
   tc->rcv_opts.sacks[0].end = 990;
 
-  tcp_test_rcv_sacks (tc, 960, &rs);
+  tcp_test_rcv_sacks (tc, 960, &ac);
 
-  TCP_TEST ((sb->is_reneging), "is reneging");
+  TCP_TEST ((tcp_scoreboard_is_reneging (sb)), "is reneging");
   TCP_TEST ((sb->sacked_bytes == 30), "sacked bytes %d", sb->sacked_bytes);
-  TCP_TEST ((rs.last_sacked_bytes == 9), "last sacked bytes %d", rs.last_sacked_bytes);
-  TCP_TEST ((rs.rxt_sacked == 9), "last rxt sacked bytes %d", rs.rxt_sacked);
+  TCP_TEST ((ac.last_sacked_bytes == 9), "last sacked bytes %d", ac.last_sacked_bytes);
+  TCP_TEST ((ac.rxt_sacked == 9), "last rxt sacked bytes %d", ac.rxt_sacked);
 
   /*
    * Sack remaining bytes [990 1000]
@@ -581,12 +589,12 @@ tcp_test_sack_rx (vlib_main_t * vm, unformat_input_t * input)
   tc->rcv_opts.sacks[0].start = 990;
   tc->rcv_opts.sacks[0].end = 1000;
 
-  tcp_test_rcv_sacks (tc, 960, &rs);
+  tcp_test_rcv_sacks (tc, 960, &ac);
 
-  TCP_TEST ((sb->is_reneging), "is reneging");
+  TCP_TEST ((tcp_scoreboard_is_reneging (sb)), "is reneging");
   TCP_TEST ((sb->sacked_bytes == 40), "sacked bytes %d", sb->sacked_bytes);
-  TCP_TEST ((rs.last_sacked_bytes == 10), "last sacked bytes %d", rs.last_sacked_bytes);
-  TCP_TEST ((rs.rxt_sacked == 0), "last rxt sacked bytes %d", rs.rxt_sacked);
+  TCP_TEST ((ac.last_sacked_bytes == 10), "last sacked bytes %d", ac.last_sacked_bytes);
+  TCP_TEST ((ac.rxt_sacked == 0), "last rxt sacked bytes %d", ac.rxt_sacked);
   TCP_TEST (pool_elts (sb->holes) == 0, "no holes left");
 
   /*
@@ -594,24 +602,24 @@ tcp_test_sack_rx (vlib_main_t * vm, unformat_input_t * input)
    */
   vec_reset_length (tc->rcv_opts.sacks);
   tc->rcv_opts.flags &= ~TCP_OPTS_FLAG_SACK;
-  tcp_test_rcv_sacks (tc, 970, &rs);
+  tcp_test_rcv_sacks (tc, 970, &ac);
 
-  TCP_TEST ((sb->is_reneging), "is reneging");
+  TCP_TEST ((tcp_scoreboard_is_reneging (sb)), "is reneging");
   TCP_TEST ((sb->sacked_bytes == 30), "sacked bytes %d", sb->sacked_bytes);
-  TCP_TEST ((rs.last_sacked_bytes == 0), "last sacked bytes %d", rs.last_sacked_bytes);
-  TCP_TEST ((rs.rxt_sacked == 0), "last rxt sacked bytes %d", rs.rxt_sacked);
+  TCP_TEST ((ac.last_sacked_bytes == 0), "last sacked bytes %d", ac.last_sacked_bytes);
+  TCP_TEST ((ac.rxt_sacked == 0), "last rxt sacked bytes %d", ac.rxt_sacked);
 
   /*
    * Ack all up to 1000
    */
   tc->snd_una = 970;
-  tcp_test_rcv_sacks (tc, 1000, &rs);
+  tcp_test_rcv_sacks (tc, 1000, &ac);
   TCP_TEST ((sb->high_sacked == 1000), "max sacked byte %u", sb->high_sacked);
   TCP_TEST ((sb->sacked_bytes == 0), "sacked bytes %d", sb->sacked_bytes);
-  TCP_TEST (rs.last_bytes_delivered == 30, "last bytes delivered %d", rs.last_bytes_delivered);
-  TCP_TEST ((rs.last_sacked_bytes == 0), "last sacked bytes %d", rs.last_sacked_bytes);
+  TCP_TEST (ac.last_bytes_delivered == 30, "last bytes delivered %d", ac.last_bytes_delivered);
+  TCP_TEST ((ac.last_sacked_bytes == 0), "last sacked bytes %d", ac.last_sacked_bytes);
   TCP_TEST ((sb->lost_bytes == 0), "lost bytes %u", sb->lost_bytes);
-  TCP_TEST ((!sb->is_reneging), "is not reneging");
+  TCP_TEST ((!tcp_scoreboard_is_reneging (sb)), "is not reneging");
 
   /*
    * Add new block
@@ -626,13 +634,13 @@ tcp_test_sack_rx (vlib_main_t * vm, unformat_input_t * input)
 
   tc->snd_una = 1000;
   tc->snd_nxt = 1500;
-  tcp_test_rcv_sacks (tc, 1000, &rs);
+  tcp_test_rcv_sacks (tc, 1000, &ac);
 
   if (verbose)
     vlib_cli_output (vm, "\nadd [1200, 1300] snd_una_max 1500, snd_una 1000:"
 		     " \n%U", format_tcp_scoreboard, sb, tc);
 
-  TCP_TEST ((!sb->is_reneging), "is not reneging");
+  TCP_TEST ((!tcp_scoreboard_is_reneging (sb)), "is not reneging");
   TCP_TEST ((pool_elts (sb->holes) == 2),
 	    "scoreboard has %d holes", pool_elts (sb->holes));
   hole = scoreboard_first_hole (sb);
@@ -653,20 +661,19 @@ tcp_test_sack_rx (vlib_main_t * vm, unformat_input_t * input)
   tc->rcv_opts.flags &= ~TCP_OPTS_FLAG_SACK;
   tc->rcv_opts.n_sack_blocks = 0;
   /* Ack up to 1300 to avoid reneging */
-  tcp_test_rcv_sacks (tc, 1300, &rs);
+  tcp_test_rcv_sacks (tc, 1300, &ac);
 
   if (verbose)
-    vlib_cli_output (vm, "\nsb ack up to byte 1300:\n%U",
-		     format_tcp_scoreboard, sb, tc);
+    vlib_cli_output (vm, "\nsb ack up to byte 1300:\n%U", format_tcp_scoreboard, sb, tc);
 
+  TCP_TEST (vec_len (tc->rcv_opts.sacks) == 0, "cumulative ack does not add a sack block");
   TCP_TEST ((sb->sacked_bytes == 0), "sacked bytes %d", sb->sacked_bytes);
-  TCP_TEST ((pool_elts (sb->holes) == 1),
-	    "scoreboard has %d elements", pool_elts (sb->holes));
-  TCP_TEST ((rs.last_bytes_delivered == 100), "last bytes delivered %d", rs.last_bytes_delivered);
+  TCP_TEST ((pool_elts (sb->holes) == 1), "scoreboard has %d elements", pool_elts (sb->holes));
+  TCP_TEST ((ac.last_bytes_delivered == 100), "last bytes delivered %d", ac.last_bytes_delivered);
   TCP_TEST ((sb->lost_bytes == 0), "lost bytes %u", sb->lost_bytes);
   TCP_TEST ((sb->head != TCP_INVALID_SACK_HOLE_INDEX), "head %u", sb->head);
   TCP_TEST ((sb->tail != TCP_INVALID_SACK_HOLE_INDEX), "tail %u", sb->tail);
-  TCP_TEST ((!sb->is_reneging), "is not reneging");
+  TCP_TEST ((!tcp_scoreboard_is_reneging (sb)), "is not reneging");
 
   /*
    * Add some more blocks and then remove all
@@ -682,7 +689,7 @@ tcp_test_sack_rx (vlib_main_t * vm, unformat_input_t * input)
       vec_add1 (tc->rcv_opts.sacks, block);
     }
   tc->rcv_opts.n_sack_blocks = vec_len (tc->rcv_opts.sacks);
-  tcp_test_rcv_sacks (tc, 1900, &rs);
+  tcp_test_rcv_sacks (tc, 1900, &ac);
 
   scoreboard_clear (sb);
   if (verbose)
@@ -706,7 +713,7 @@ tcp_test_sack_rx (vlib_main_t * vm, unformat_input_t * input)
       vec_add1 (tc->rcv_opts.sacks, sacks[i * 2 + 1]);
     }
   tc->rcv_opts.n_sack_blocks = vec_len (tc->rcv_opts.sacks);
-  tcp_test_rcv_sacks (tc, 0, &rs);
+  tcp_test_rcv_sacks (tc, 0, &ac);
   if (verbose)
     vlib_cli_output (vm, "\nsb added odd blocks snd_una 0 snd_una_max 1000:"
 		     "\n%U", format_tcp_scoreboard, sb, tc);
@@ -720,7 +727,7 @@ tcp_test_sack_rx (vlib_main_t * vm, unformat_input_t * input)
   /*
    * Renege bytes from 950 to 1000
    */
-  tcp_test_rcv_sacks (tc, 950, &rs);
+  tcp_test_rcv_sacks (tc, 950, &ac);
 
   if (verbose)
     vlib_cli_output (vm, "\nack [0, 950]:\n%U", format_tcp_scoreboard, sb,
@@ -728,9 +735,9 @@ tcp_test_sack_rx (vlib_main_t * vm, unformat_input_t * input)
 
   TCP_TEST ((pool_elts (sb->holes) == 0), "scoreboard has %d elements",
 	    pool_elts (sb->holes));
-  TCP_TEST ((sb->is_reneging), "is reneging");
+  TCP_TEST ((tcp_scoreboard_is_reneging (sb)), "is reneging");
   TCP_TEST ((sb->sacked_bytes == 50), "sacked bytes %d", sb->sacked_bytes);
-  TCP_TEST ((rs.last_sacked_bytes == 0), "last sacked bytes %d", rs.last_sacked_bytes);
+  TCP_TEST ((ac.last_sacked_bytes == 0), "last sacked bytes %d", ac.last_sacked_bytes);
   TCP_TEST ((sb->lost_bytes == 0), "lost bytes %u", sb->lost_bytes);
   TCP_TEST ((sb->high_sacked == 1000), "high sacked %u", sb->high_sacked);
 
@@ -748,13 +755,13 @@ tcp_test_sack_rx (vlib_main_t * vm, unformat_input_t * input)
   vec_add1 (tc->rcv_opts.sacks, block);
   tc->rcv_opts.n_sack_blocks = vec_len (tc->rcv_opts.sacks);
 
-  tcp_test_rcv_sacks (tc, 0, &rs);
+  tcp_test_rcv_sacks (tc, 0, &ac);
 
   if (verbose)
     vlib_cli_output (vm, "\nsb added [100, 500] snd_una 0 snd_una_max 1000:"
 		     "\n%U", format_tcp_scoreboard, sb, tc);
 
-  tcp_test_rcv_sacks (tc, 800, &rs);
+  tcp_test_rcv_sacks (tc, 800, &ac);
 
   if (verbose)
     vlib_cli_output (vm, "\nsb ack [0, 800]:\n%U", format_tcp_scoreboard, sb,
@@ -762,10 +769,10 @@ tcp_test_sack_rx (vlib_main_t * vm, unformat_input_t * input)
 
   TCP_TEST ((pool_elts (sb->holes) == 1),
 	    "scoreboard has %d elements", pool_elts (sb->holes));
-  TCP_TEST ((!sb->is_reneging), "is not reneging");
+  TCP_TEST ((!tcp_scoreboard_is_reneging (sb)), "is not reneging");
   TCP_TEST ((sb->sacked_bytes == 0), "sacked bytes %d", sb->sacked_bytes);
-  TCP_TEST ((rs.last_sacked_bytes == 0), "last sacked bytes %d", rs.last_sacked_bytes);
-  TCP_TEST ((rs.last_bytes_delivered == 400), "last bytes delivered %d", rs.last_bytes_delivered);
+  TCP_TEST ((ac.last_sacked_bytes == 0), "last sacked bytes %d", ac.last_sacked_bytes);
+  TCP_TEST ((ac.last_bytes_delivered == 400), "last bytes delivered %d", ac.last_bytes_delivered);
   TCP_TEST ((sb->lost_bytes == 0), "lost bytes %u", sb->lost_bytes);
   TCP_TEST ((sb->head != TCP_INVALID_SACK_HOLE_INDEX), "head %u", sb->head);
   TCP_TEST ((sb->tail != TCP_INVALID_SACK_HOLE_INDEX), "tail %u", sb->tail);
@@ -785,12 +792,12 @@ tcp_test_sack_rx (vlib_main_t * vm, unformat_input_t * input)
   vec_add1 (tc->rcv_opts.sacks, block);
   tc->rcv_opts.n_sack_blocks = vec_len (tc->rcv_opts.sacks);
 
-  tcp_test_rcv_sacks (tc, 0, &rs);
+  tcp_test_rcv_sacks (tc, 0, &ac);
   if (verbose)
     vlib_cli_output (vm, "\nsb added [500, 1000]:\n%U",
 		     format_tcp_scoreboard, sb, tc);
   TCP_TEST ((sb->sacked_bytes == 500), "sacked bytes %d", sb->sacked_bytes);
-  TCP_TEST ((rs.last_sacked_bytes == 500), "last sacked bytes %d", rs.last_sacked_bytes);
+  TCP_TEST ((ac.last_sacked_bytes == 500), "last sacked bytes %d", ac.last_sacked_bytes);
   TCP_TEST ((sb->lost_bytes == 500), "lost bytes %u", sb->lost_bytes);
 
   vec_reset_length (tc->rcv_opts.sacks);
@@ -798,15 +805,15 @@ tcp_test_sack_rx (vlib_main_t * vm, unformat_input_t * input)
   block.end = 400;
   vec_add1 (tc->rcv_opts.sacks, block);
   tc->rcv_opts.n_sack_blocks = vec_len (tc->rcv_opts.sacks);
-  tcp_test_rcv_sacks (tc, 100, &rs);
+  tcp_test_rcv_sacks (tc, 100, &ac);
   if (verbose)
     vlib_cli_output (vm, "\nsb added [0, 100] [300, 400]:\n%U",
 		     format_tcp_scoreboard, sb, tc);
   TCP_TEST ((pool_elts (sb->holes) == 2),
 	    "scoreboard has %d elements", pool_elts (sb->holes));
   TCP_TEST ((sb->sacked_bytes == 600), "sacked bytes %d", sb->sacked_bytes);
-  TCP_TEST ((rs.last_sacked_bytes == 100), "last sacked bytes %d", rs.last_sacked_bytes);
-  TCP_TEST ((rs.last_bytes_delivered == 0), "last bytes delivered %d", rs.last_bytes_delivered);
+  TCP_TEST ((ac.last_sacked_bytes == 100), "last sacked bytes %d", ac.last_sacked_bytes);
+  TCP_TEST ((ac.last_bytes_delivered == 0), "last bytes delivered %d", ac.last_bytes_delivered);
   /* Hole should be split in 2 lost holes that add up to 300 */
   TCP_TEST ((sb->lost_bytes == 300), "lost bytes %u", sb->lost_bytes);
   TCP_TEST ((sb->reorder == 7), "reorder %u", sb->reorder);
@@ -817,9 +824,9 @@ tcp_test_sack_rx (vlib_main_t * vm, unformat_input_t * input)
    * Step 1. Ack [100 200] which delivers 100 of the bytes lost
    */
   tc->snd_una = 100;
-  tcp_test_rcv_sacks (tc, 200, &rs);
+  tcp_test_rcv_sacks (tc, 200, &ac);
   TCP_TEST ((sb->sacked_bytes == 600), "sacked bytes %d", sb->sacked_bytes);
-  TCP_TEST ((rs.last_bytes_delivered == 0), "last bytes delivered %d", rs.last_bytes_delivered);
+  TCP_TEST ((ac.last_bytes_delivered == 0), "last bytes delivered %d", ac.last_bytes_delivered);
   TCP_TEST ((sb->lost_bytes == 200), "lost bytes %u", sb->lost_bytes);
 
   /*
@@ -827,30 +834,30 @@ tcp_test_sack_rx (vlib_main_t * vm, unformat_input_t * input)
    * as reneging.
    */
   tc->snd_una = 200;
-  tcp_test_rcv_sacks (tc, 300, &rs);
+  tcp_test_rcv_sacks (tc, 300, &ac);
   if (verbose)
     vlib_cli_output (vm, "\nacked [100, 300] in two steps:\n%U",
 		     format_tcp_scoreboard, sb, tc);
   TCP_TEST ((sb->sacked_bytes == 600), "sacked bytes %d", sb->sacked_bytes);
   TCP_TEST ((sb->lost_bytes == 100), "lost bytes %u", sb->lost_bytes);
-  TCP_TEST ((rs.last_bytes_delivered == 0), "last bytes delivered %d", rs.last_bytes_delivered);
-  TCP_TEST ((sb->is_reneging), "is reneging");
+  TCP_TEST ((ac.last_bytes_delivered == 0), "last bytes delivered %d", ac.last_bytes_delivered);
+  TCP_TEST ((tcp_scoreboard_is_reneging (sb)), "is reneging");
 
   /*
    * Ack [300 500]. Delivers reneged segment [300 400] and reneges bytes
    * above 500
    */
   tc->snd_una = 300;
-  tcp_test_rcv_sacks (tc, 500, &rs);
+  tcp_test_rcv_sacks (tc, 500, &ac);
   if (verbose)
     vlib_cli_output (vm, "\nacked [400, 500]:\n%U", format_tcp_scoreboard, sb,
 		     tc);
   TCP_TEST ((pool_elts (sb->holes) == 0),
 	    "scoreboard has %d elements", pool_elts (sb->holes));
   TCP_TEST ((sb->sacked_bytes == 500), "sacked bytes %d", sb->sacked_bytes);
-  TCP_TEST ((rs.last_sacked_bytes == 0), "last sacked bytes %d", rs.last_sacked_bytes);
-  TCP_TEST ((rs.last_bytes_delivered == 100), "last bytes delivered %d", rs.last_bytes_delivered);
-  TCP_TEST ((sb->is_reneging), "is reneging");
+  TCP_TEST ((ac.last_sacked_bytes == 0), "last sacked bytes %d", ac.last_sacked_bytes);
+  TCP_TEST ((ac.last_bytes_delivered == 100), "last bytes delivered %d", ac.last_bytes_delivered);
+  TCP_TEST ((tcp_scoreboard_is_reneging (sb)), "is reneging");
   TCP_TEST ((sb->head == TCP_INVALID_SACK_HOLE_INDEX), "head %u", sb->head);
   TCP_TEST ((sb->tail == TCP_INVALID_SACK_HOLE_INDEX), "tail %u", sb->tail);
 
@@ -858,13 +865,13 @@ tcp_test_sack_rx (vlib_main_t * vm, unformat_input_t * input)
    * Ack up to 1000 to deliver all bytes
    */
   tc->snd_una = 500;
-  tcp_test_rcv_sacks (tc, 1000, &rs);
+  tcp_test_rcv_sacks (tc, 1000, &ac);
   if (verbose)
     vlib_cli_output (vm, "\nAck high sacked:\n%U", format_tcp_scoreboard, sb,
 		     tc);
-  TCP_TEST ((rs.last_sacked_bytes == 0), "last sacked bytes %d", rs.last_sacked_bytes);
-  TCP_TEST ((rs.last_bytes_delivered == 500), "last bytes delivered %d", rs.last_bytes_delivered);
-  TCP_TEST ((!sb->is_reneging), "is not reneging");
+  TCP_TEST ((ac.last_sacked_bytes == 0), "last sacked bytes %d", ac.last_sacked_bytes);
+  TCP_TEST ((ac.last_bytes_delivered == 500), "last bytes delivered %d", ac.last_bytes_delivered);
+  TCP_TEST ((!tcp_scoreboard_is_reneging (sb)), "is not reneging");
 
   /*
    * Add [1200, 1500] and test that [1000, 1200] is lost (bytes condition)
@@ -877,19 +884,19 @@ tcp_test_sack_rx (vlib_main_t * vm, unformat_input_t * input)
   block.end = 1500;
   vec_add1 (tc->rcv_opts.sacks, block);
   tc->rcv_opts.n_sack_blocks = vec_len (tc->rcv_opts.sacks);
-  tcp_test_rcv_sacks (tc, 1000, &rs);
+  tcp_test_rcv_sacks (tc, 1000, &ac);
   if (verbose)
     vlib_cli_output (vm, "\nacked [1200, 1500] test first hole is lost:\n%U",
 		     format_tcp_scoreboard, sb, tc);
   TCP_TEST ((pool_elts (sb->holes) == 2), "scoreboard has %d elements",
 	    pool_elts (sb->holes));
   TCP_TEST ((sb->sacked_bytes == 300), "sacked bytes %d", sb->sacked_bytes);
-  TCP_TEST ((rs.last_sacked_bytes == 300), "last sacked bytes %d", rs.last_sacked_bytes);
-  TCP_TEST ((rs.last_bytes_delivered == 0), "last bytes delivered %d", rs.last_bytes_delivered);
+  TCP_TEST ((ac.last_sacked_bytes == 300), "last sacked bytes %d", ac.last_sacked_bytes);
+  TCP_TEST ((ac.last_bytes_delivered == 0), "last bytes delivered %d", ac.last_bytes_delivered);
   /* No bytes lost because of reorder */
   TCP_TEST ((sb->lost_bytes == 0), "lost bytes %u", sb->lost_bytes);
   TCP_TEST ((sb->reorder == 7), "reorder %u", sb->reorder);
-  TCP_TEST ((!sb->is_reneging), "is not reneging");
+  TCP_TEST ((!tcp_scoreboard_is_reneging (sb)), "is not reneging");
 
   /*
    * Restart
@@ -911,11 +918,11 @@ tcp_test_sack_rx (vlib_main_t * vm, unformat_input_t * input)
   vec_add1 (tc->rcv_opts.sacks, block);
   tc->rcv_opts.n_sack_blocks = vec_len (tc->rcv_opts.sacks);
 
-  tcp_test_rcv_sacks (tc, 0, &rs);
+  tcp_test_rcv_sacks (tc, 0, &ac);
 
   TCP_TEST ((sb->sacked_bytes == 400), "sacked bytes %d", sb->sacked_bytes);
-  TCP_TEST ((rs.last_sacked_bytes == 400), "last sacked bytes %d", rs.last_sacked_bytes);
-  TCP_TEST ((!sb->is_reneging), "is not reneging");
+  TCP_TEST ((ac.last_sacked_bytes == 400), "last sacked bytes %d", ac.last_sacked_bytes);
+  TCP_TEST ((!tcp_scoreboard_is_reneging (sb)), "is not reneging");
 
   /*
    * Renege, sack all of the remaining bytes and cover some rxt bytes
@@ -924,12 +931,12 @@ tcp_test_sack_rx (vlib_main_t * vm, unformat_input_t * input)
   tc->rcv_opts.sacks[0].start = 500;
   tc->rcv_opts.sacks[0].end = 1000;
 
-  tcp_test_rcv_sacks (tc, 100, &rs);
+  tcp_test_rcv_sacks (tc, 100, &ac);
 
   TCP_TEST ((sb->sacked_bytes == 900), "sacked bytes %d", sb->sacked_bytes);
-  TCP_TEST ((rs.last_sacked_bytes == 500), "last sacked bytes %d", rs.last_sacked_bytes);
-  TCP_TEST (sb->is_reneging, "is reneging");
-  TCP_TEST ((rs.rxt_sacked == 300), "last rxt sacked bytes %d", rs.rxt_sacked);
+  TCP_TEST ((ac.last_sacked_bytes == 500), "last sacked bytes %d", ac.last_sacked_bytes);
+  TCP_TEST (tcp_scoreboard_is_reneging (sb), "is reneging");
+  TCP_TEST ((ac.rxt_sacked == 300), "last rxt sacked bytes %d", ac.rxt_sacked);
 
   /*
    * Reorder estimate must keep learning during congestion recovery. A segment
@@ -955,7 +962,7 @@ tcp_test_sack_rx (vlib_main_t * vm, unformat_input_t * input)
   block.end = 3000;
   vec_add1 (tc->rcv_opts.sacks, block);
   tc->rcv_opts.n_sack_blocks = vec_len (tc->rcv_opts.sacks);
-  tcp_test_rcv_sacks (tc, 0, &rs);
+  tcp_test_rcv_sacks (tc, 0, &ac);
   TCP_TEST ((sb->high_sacked == 3000), "high sacked %u", sb->high_sacked);
   TCP_TEST ((sb->reorder == TCP_DUPACK_THRESHOLD), "reorder still floor %u", sb->reorder);
 
@@ -966,7 +973,7 @@ tcp_test_sack_rx (vlib_main_t * vm, unformat_input_t * input)
   block.end = 450;
   vec_add1 (tc->rcv_opts.sacks, block);
   tc->rcv_opts.n_sack_blocks = vec_len (tc->rcv_opts.sacks);
-  tcp_test_rcv_sacks (tc, 0, &rs);
+  tcp_test_rcv_sacks (tc, 0, &ac);
   TCP_TEST ((sb->reorder == 18), "reorder grew in recovery %u", sb->reorder);
 
   /*
@@ -987,7 +994,7 @@ tcp_test_sack_rx (vlib_main_t * vm, unformat_input_t * input)
   block.end = 3000;
   vec_add1 (tc->rcv_opts.sacks, block);
   tc->rcv_opts.n_sack_blocks = vec_len (tc->rcv_opts.sacks);
-  tcp_test_rcv_sacks (tc, 0, &rs);
+  tcp_test_rcv_sacks (tc, 0, &ac);
   TCP_TEST ((sb->reorder == TCP_DUPACK_THRESHOLD), "reorder floor %u", sb->reorder);
 
   /* Everything below the frontier has now been retransmitted */
@@ -997,7 +1004,7 @@ tcp_test_sack_rx (vlib_main_t * vm, unformat_input_t * input)
   block.end = 450;
   vec_add1 (tc->rcv_opts.sacks, block);
   tc->rcv_opts.n_sack_blocks = vec_len (tc->rcv_opts.sacks);
-  tcp_test_rcv_sacks (tc, 0, &rs);
+  tcp_test_rcv_sacks (tc, 0, &ac);
   TCP_TEST ((sb->reorder == TCP_DUPACK_THRESHOLD), "reorder unchanged below high_rxt %u",
 	    sb->reorder);
 
@@ -1023,7 +1030,7 @@ tcp_test_sack_rx (vlib_main_t * vm, unformat_input_t * input)
   block.end = 3000;
   vec_add1 (tc->rcv_opts.sacks, block);
   tc->rcv_opts.n_sack_blocks = vec_len (tc->rcv_opts.sacks);
-  tcp_test_rcv_sacks (tc, 0, &rs);
+  tcp_test_rcv_sacks (tc, 0, &ac);
   TCP_TEST ((sb->high_sacked == 3000), "high sacked %u", sb->high_sacked);
 
   vec_reset_length (tc->rcv_opts.sacks);
@@ -1031,7 +1038,7 @@ tcp_test_sack_rx (vlib_main_t * vm, unformat_input_t * input)
   block.end = 450;
   vec_add1 (tc->rcv_opts.sacks, block);
   tc->rcv_opts.n_sack_blocks = vec_len (tc->rcv_opts.sacks);
-  tcp_test_rcv_sacks (tc, 0, &rs);
+  tcp_test_rcv_sacks (tc, 0, &ac);
   TCP_TEST ((sb->reorder == TCP_DUPACK_THRESHOLD), "reorder unchanged after rescue rxt %u",
 	    sb->reorder);
 
@@ -1054,7 +1061,7 @@ tcp_test_sack_rx (vlib_main_t * vm, unformat_input_t * input)
   vec_add1 (tc->rcv_opts.sacks, block);
   tc->snd_una = tc->snd_nxt = 1969067947;
 
-  tcp_test_rcv_sacks (tc, tc->snd_una, &rs);
+  tcp_test_rcv_sacks (tc, tc->snd_una, &ac);
 
   /*
    * Exercise nested received SACK blocks:
@@ -1099,13 +1106,13 @@ tcp_test_sack_rx (vlib_main_t * vm, unformat_input_t * input)
   sb->rescue_rxt = tc->snd_nxt;
   sb->sacked_bytes = 67000;
 
-  tcp_test_rcv_sacks (tc, tc->snd_una, &rs);
+  tcp_test_rcv_sacks (tc, tc->snd_una, &ac);
 
   TCP_TEST ((sb->high_sacked == 102700), "high sacked %u", sb->high_sacked);
   TCP_TEST ((sb->sacked_bytes == 67400), "sacked bytes %u", sb->sacked_bytes);
-  TCP_TEST ((rs.last_sacked_bytes == 400), "last sacked bytes %u", rs.last_sacked_bytes);
+  TCP_TEST ((ac.last_sacked_bytes == 400), "last sacked bytes %u", ac.last_sacked_bytes);
   TCP_TEST ((sb->lost_bytes == 35200), "lost bytes %u", sb->lost_bytes);
-  TCP_TEST ((!sb->is_reneging), "is not reneging");
+  TCP_TEST ((!tcp_scoreboard_is_reneging (sb)), "is not reneging");
 
   /*
    * Reclassify an rto-forced loss using only SACK evidence. With no SACKed
@@ -1134,7 +1141,7 @@ tcp_test_sack_rx (vlib_main_t * vm, unformat_input_t * input)
   vec_add1 (tc->rcv_opts.sacks, block);
   tc->rcv_opts.flags |= TCP_OPTS_FLAG_SACK;
   tc->rcv_opts.n_sack_blocks = vec_len (tc->rcv_opts.sacks);
-  tcp_test_rcv_sacks (tc, tc->snd_una, &rs);
+  tcp_test_rcv_sacks (tc, tc->snd_una, &ac);
   TCP_TEST ((sb->lost_bytes == 300), "SACK marks bytes lost %u", sb->lost_bytes);
 
   tcp_sack_recompute_loss (tc);
@@ -1150,6 +1157,15 @@ tcp_test_sack_rx (vlib_main_t * vm, unformat_input_t * input)
   TCP_TEST ((sb->sacked_bytes == 0), "empty scoreboard has no sacked bytes %u", sb->sacked_bytes);
   TCP_TEST ((sb->lost_bytes == 0), "empty scoreboard has no lost bytes %u", sb->lost_bytes);
 
+  sb->flags |= TCP_DSACK_HISTORY;
+  tcp_scoreboard_set_reneging (sb, 1, 0);
+  scoreboard_clear (sb);
+  TCP_TEST ((sb->flags & (TCP_DSACK_HISTORY | TCP_DSACK_INELIGIBLE)) ==
+		(TCP_DSACK_HISTORY | TCP_DSACK_INELIGIBLE) &&
+	      !tcp_scoreboard_is_reneging (sb),
+	    "scoreboard clear preserves D-SACK state while clearing reneging");
+  sb->flags &= ~(TCP_DSACK_HISTORY | TCP_DSACK_INELIGIBLE);
+
   /*
    * Clear
    */
@@ -1162,7 +1178,7 @@ tcp_test_sack_rx (vlib_main_t * vm, unformat_input_t * input)
 static u32
 tcp_test_dsack_rxt_count (tcp_connection_t *tc)
 {
-  return (tc->dsack_flags & TCP_DSACK_RXT_ACTIVE) ? pool_elts (tc->dsack_rxt) - 1 : 0;
+  return (tc->sack_sb.flags & TCP_DSACK_RXT_ACTIVE) ? pool_elts (tc->dsack_rxt) - 1 : 0;
 }
 
 static tcp_dsack_rxt_t *
@@ -1170,7 +1186,7 @@ tcp_test_dsack_rxt_at (tcp_connection_t *tc, u32 position)
 {
   u32 index;
 
-  ASSERT (tc->dsack_flags & TCP_DSACK_RXT_ACTIVE);
+  ASSERT (tc->sack_sb.flags & TCP_DSACK_RXT_ACTIVE);
   index = tc->dsack_rxt[0].head;
   while (position--)
     {
@@ -1185,7 +1201,7 @@ static int
 tcp_test_dsack_rx (vlib_main_t *vm)
 {
   tcp_connection_t _tc, *tc = &_tc;
-  tcp_rate_sample_t rs = {};
+  tcp_ack_ctx_t ac = {};
   sack_block_t block;
 
 #define DSACK_RX_INIT()                                                                            \
@@ -1195,9 +1211,10 @@ tcp_test_dsack_rx (vlib_main_t *vm)
       tc->snd_mss = 100;                                                                           \
       tc->snd_una = 1000;                                                                          \
       tc->snd_nxt = 2000;                                                                          \
+      tc->snd_wnd_max = 1000;                                                                      \
       tc->snd_congestion = 1600;                                                                   \
       tc->rcv_opts.flags = TCP_OPTS_FLAG_SACK_PERMITTED | TCP_OPTS_FLAG_SACK;                      \
-      rs.ack_flags = 0;                                                                            \
+      ac.ack_flags = 0;                                                                            \
       scoreboard_init (&tc->sack_sb);                                                              \
     }                                                                                              \
   while (0)
@@ -1222,8 +1239,8 @@ tcp_test_dsack_rx (vlib_main_t *vm)
   block.end = 900;
   vec_add1 (tc->rcv_opts.sacks, block);
   tc->rcv_opts.n_sack_blocks = 1;
-  tcp_test_rcv_sacks (tc, 700, &rs);
-  TCP_TEST (!(rs.ack_flags & TCP_ACK_F_DSACK),
+  tcp_test_rcv_sacks (tc, 700, &ac);
+  TCP_TEST (!(ac.ack_flags & TCP_ACK_F_DSACK),
 	    "D-SACK classification uses packet ACK instead of snd_una");
 
   /* Old ACKs outside recovery process D-SACK evidence without touching the
@@ -1239,8 +1256,8 @@ tcp_test_dsack_rx (vlib_main_t *vm)
   block.end = 1200;
   vec_add1 (tc->rcv_opts.sacks, block);
   tc->rcv_opts.n_sack_blocks = 1;
-  tcp_rcv_dsack (tc, 1200, &rs);
-  TCP_TEST ((rs.ack_flags & (TCP_ACK_F_DSACK | TCP_ACK_F_DSACK_SPURIOUS)) ==
+  tcp_rcv_dsack (tc, 1200, &ac);
+  TCP_TEST ((ac.ack_flags & (TCP_ACK_F_DSACK | TCP_ACK_F_DSACK_SPURIOUS)) ==
 	      (TCP_ACK_F_DSACK | TCP_ACK_F_DSACK_SPURIOUS),
 	    "old ACK D-SACK proves retained retransmission spurious");
   TCP_TEST (tc->sack_sb.head == TCP_INVALID_SACK_HOLE_INDEX && !tc->sack_sb.sacked_bytes,
@@ -1251,9 +1268,9 @@ tcp_test_dsack_rx (vlib_main_t *vm)
   block.end = 900;
   vec_add1 (tc->rcv_opts.sacks, block);
   tc->rcv_opts.n_sack_blocks = 1;
-  tcp_test_rcv_sacks (tc, 1000, &rs);
-  TCP_TEST (rs.ack_flags & TCP_ACK_F_DSACK, "detect D-SACK below cumulative ACK");
-  TCP_TEST (tc->dsack_flags & TCP_DSACK_UNDO_DISABLED,
+  tcp_test_rcv_sacks (tc, 1000, &ac);
+  TCP_TEST (ac.ack_flags & TCP_ACK_F_DSACK, "detect D-SACK below cumulative ACK");
+  TCP_TEST (tc->sack_sb.flags & TCP_DSACK_UNDO_DISABLED,
 	    "D-SACK for untracked data disables congestion undo");
   TCP_TEST (vec_len (tc->rcv_opts.sacks) == 0,
 	    "remove below-ACK D-SACK before scoreboard processing");
@@ -1266,8 +1283,8 @@ tcp_test_dsack_rx (vlib_main_t *vm)
   block.end = 1500;
   vec_add1 (tc->rcv_opts.sacks, block);
   tc->rcv_opts.n_sack_blocks = 2;
-  tcp_test_rcv_sacks (tc, 1000, &rs);
-  TCP_TEST (rs.ack_flags & TCP_ACK_F_DSACK, "detect above-ACK D-SACK contained by second block");
+  tcp_test_rcv_sacks (tc, 1000, &ac);
+  TCP_TEST (ac.ack_flags & TCP_ACK_F_DSACK, "detect above-ACK D-SACK contained by second block");
   TCP_TEST (vec_len (tc->rcv_opts.sacks) == 1 && tc->rcv_opts.sacks[0].start == 1100 &&
 	      tc->rcv_opts.sacks[0].end == 1500,
 	    "preserve containing SACK block for scoreboard processing");
@@ -1280,9 +1297,69 @@ tcp_test_dsack_rx (vlib_main_t *vm)
   block.end = 1500;
   vec_add1 (tc->rcv_opts.sacks, block);
   tc->rcv_opts.n_sack_blocks = 2;
-  tcp_test_rcv_sacks (tc, 1000, &rs);
-  TCP_TEST (!(rs.ack_flags & TCP_ACK_F_DSACK),
+  tcp_test_rcv_sacks (tc, 1000, &ac);
+  TCP_TEST (!(ac.ack_flags & TCP_ACK_F_DSACK),
 	    "do not classify uncontained above-ACK block as D-SACK");
+
+  DSACK_RX_RESET ();
+  tc->snd_wnd_max = 100;
+  block.start = 800;
+  block.end = 1000;
+  vec_add1 (tc->rcv_opts.sacks, block);
+  tc->rcv_opts.n_sack_blocks = 1;
+  tcp_test_rcv_sacks (tc, 1000, &ac);
+  TCP_TEST (!(ac.ack_flags & TCP_ACK_F_DSACK),
+	    "ignore dubious D-SACK larger than maximum advertised window");
+
+  DSACK_RX_RESET ();
+  block.start = 1900;
+  block.end = 2100;
+  vec_add1 (tc->rcv_opts.sacks, block);
+  block.start = 1800;
+  block.end = 2200;
+  vec_add1 (tc->rcv_opts.sacks, block);
+  tc->rcv_opts.n_sack_blocks = 2;
+  tcp_test_rcv_sacks (tc, 1000, &ac);
+  TCP_TEST (!(ac.ack_flags & TCP_ACK_F_DSACK) && !(tc->sack_sb.flags & TCP_DSACK_UNDO_DISABLED),
+	    "ignore future D-SACK without disabling undo");
+
+  DSACK_RX_RESET ();
+  block.start = tc->snd_nxt + 0x7ffffff0;
+  block.end = block.start + 100;
+  vec_add1 (tc->rcv_opts.sacks, block);
+  tc->rcv_opts.n_sack_blocks = 1;
+  tcp_test_rcv_sacks (tc, 1000, &ac);
+  TCP_TEST (!(ac.ack_flags & TCP_ACK_F_DSACK) && !(tc->sack_sb.flags & TCP_DSACK_UNDO_DISABLED),
+	    "ignore wrap-ambiguous D-SACK without disabling undo");
+
+  DSACK_RX_RESET ();
+  tc->flags = TCP_CONN_FAST_RECOVERY | TCP_CONN_RECOVERY;
+  tcp_dsack_track_retransmit (tc, 1100, 1200);
+  block.start = 950;
+  block.end = 1050;
+  vec_add1 (tc->rcv_opts.sacks, block);
+  block.start = 900;
+  block.end = 1100;
+  vec_add1 (tc->rcv_opts.sacks, block);
+  tc->rcv_opts.n_sack_blocks = 2;
+  tcp_test_rcv_sacks (tc, 900, &ac);
+  TCP_TEST (!(ac.ack_flags & TCP_ACK_F_DSACK) && tc->dsack_pending_bytes == 100 &&
+	      !(tc->sack_sb.flags & TCP_DSACK_UNDO_DISABLED),
+	    "ignore snd_una-straddling D-SACK without changing history");
+
+  DSACK_RX_RESET ();
+  tc->flags = TCP_CONN_FAST_RECOVERY | TCP_CONN_RECOVERY;
+  tc->snd_una = 900;
+  tcp_dsack_track_retransmit (tc, 950, 1100);
+  tc->snd_una = 1000;
+  block.start = 950;
+  block.end = 1100;
+  vec_add1 (tc->rcv_opts.sacks, block);
+  tc->rcv_opts.n_sack_blocks = 1;
+  tcp_test_rcv_sacks (tc, 1200, &ac);
+  TCP_TEST ((ac.ack_flags & (TCP_ACK_F_DSACK | TCP_ACK_F_DSACK_SPURIOUS)) ==
+	      (TCP_ACK_F_DSACK | TCP_ACK_F_DSACK_SPURIOUS),
+	    "accept D-SACK below advancing ACK across prior snd_una");
 
   /* One retransmission, acknowledged through the recovery point and reported
    * duplicate, is sufficient evidence for undo. */
@@ -1296,8 +1373,8 @@ tcp_test_dsack_rx (vlib_main_t *vm)
   block.end = 1200;
   vec_add1 (tc->rcv_opts.sacks, block);
   tc->rcv_opts.n_sack_blocks = 1;
-  tcp_test_rcv_sacks (tc, tc->snd_una, &rs);
-  TCP_TEST ((rs.ack_flags & (TCP_ACK_F_DSACK | TCP_ACK_F_DSACK_SPURIOUS)) ==
+  tcp_test_rcv_sacks (tc, tc->snd_una, &ac);
+  TCP_TEST ((ac.ack_flags & (TCP_ACK_F_DSACK | TCP_ACK_F_DSACK_SPURIOUS)) ==
 	      (TCP_ACK_F_DSACK | TCP_ACK_F_DSACK_SPURIOUS),
 	    "D-SACK proves single retransmission episode spurious");
 
@@ -1313,8 +1390,8 @@ tcp_test_dsack_rx (vlib_main_t *vm)
   block.end = 1200;
   vec_add1 (tc->rcv_opts.sacks, block);
   tc->rcv_opts.n_sack_blocks = 1;
-  tcp_test_rcv_sacks (tc, tc->snd_una, &rs);
-  TCP_TEST (seq_lt (tc->snd_una, tc->snd_congestion) && (rs.ack_flags & TCP_ACK_F_DSACK_SPURIOUS),
+  tcp_test_rcv_sacks (tc, tc->snd_una, &ac);
+  TCP_TEST (seq_lt (tc->snd_una, tc->snd_congestion) && (ac.ack_flags & TCP_ACK_F_DSACK_SPURIOUS),
 	    "non-advancing D-SACK proves recovery spurious before the recovery point");
 
   /* Every retransmitted range must be D-SACKed; one spurious retransmission
@@ -1331,24 +1408,24 @@ tcp_test_dsack_rx (vlib_main_t *vm)
   block.end = 1200;
   vec_add1 (tc->rcv_opts.sacks, block);
   tc->rcv_opts.n_sack_blocks = 1;
-  tcp_test_rcv_sacks (tc, tc->snd_congestion, &rs);
-  TCP_TEST (!(rs.ack_flags & TCP_ACK_F_DSACK_SPURIOUS),
+  tcp_test_rcv_sacks (tc, tc->snd_congestion, &ac);
+  TCP_TEST (!(ac.ack_flags & TCP_ACK_F_DSACK_SPURIOUS),
 	    "advancing D-SACK does not discard another retransmission's history");
-  TCP_TEST (tc->dsack_pending_bytes == 100 && !(tc->dsack_flags & TCP_DSACK_RXT_ACTIVE),
+  TCP_TEST (tc->dsack_pending_bytes == 100 && !(tc->sack_sb.flags & TCP_DSACK_RXT_ACTIVE),
 	    "first D-SACK leaves aggregate evidence for one retransmission");
   tc->snd_una = tc->snd_congestion;
   tcp_cong_recovery_off (tc);
   vec_reset_length (tc->rcv_opts.sacks);
-  rs.ack_flags = 0;
+  ac.ack_flags = 0;
   block.start = 1200;
   block.end = 1300;
   vec_add1 (tc->rcv_opts.sacks, block);
   tc->rcv_opts.flags |= TCP_OPTS_FLAG_SACK;
   tc->rcv_opts.n_sack_blocks = 1;
-  tcp_test_rcv_sacks (tc, tc->snd_una + 100, &rs);
-  TCP_TEST (rs.ack_flags & TCP_ACK_F_DSACK_SPURIOUS,
+  tcp_test_rcv_sacks (tc, tc->snd_una + 100, &ac);
+  TCP_TEST (ac.ack_flags & TCP_ACK_F_DSACK_SPURIOUS,
 	    "all retransmissions D-SACKed makes episode undo eligible");
-  TCP_TEST (!tc->dsack_pending_bytes && !(tc->dsack_flags & TCP_DSACK_RXT_ACTIVE),
+  TCP_TEST (!tc->dsack_pending_bytes && !(tc->sack_sb.flags & TCP_DSACK_RXT_ACTIVE),
 	    "D-SACKed retransmissions need no retained exact ranges");
 
   /* ACKed retransmissions retire to aggregate state. A later retransmission
@@ -1362,12 +1439,12 @@ tcp_test_dsack_rx (vlib_main_t *vm)
   block.end = 1200;
   vec_add1 (tc->rcv_opts.sacks, block);
   tc->rcv_opts.n_sack_blocks = 1;
-  tcp_test_rcv_sacks (tc, 1300, &rs);
-  TCP_TEST (!(tc->dsack_flags & TCP_DSACK_RXT_ACTIVE) && tc->dsack_pending_bytes == 100,
+  tcp_test_rcv_sacks (tc, 1300, &ac);
+  TCP_TEST (!(tc->sack_sb.flags & TCP_DSACK_RXT_ACTIVE) && tc->dsack_pending_bytes == 100,
 	    "cumulative ACK retires exact D-SACK ranges to aggregate state");
   tc->snd_una = 1300;
   tcp_dsack_track_retransmit (tc, 1300, 1400);
-  TCP_TEST ((tc->dsack_flags & TCP_DSACK_RXT_ACTIVE) && tcp_test_dsack_rxt_count (tc) == 1 &&
+  TCP_TEST ((tc->sack_sb.flags & TCP_DSACK_RXT_ACTIVE) && tcp_test_dsack_rxt_count (tc) == 1 &&
 	      tcp_test_dsack_rxt_at (tc, 0)->start == 1300 &&
 	      tcp_test_dsack_rxt_at (tc, 0)->end == 1400 && tc->dsack_pending_bytes == 200,
 	    "new retransmission retains only active exact coverage");
@@ -1379,14 +1456,14 @@ tcp_test_dsack_rx (vlib_main_t *vm)
   tcp_dsack_recovery_clear (tc);
   tcp_dsack_track_retransmit (tc, 1100, 1300);
   tc->rcv_opts.flags = TCP_OPTS_FLAG_SACK_PERMITTED;
-  tcp_test_rcv_sacks (tc, 1200, &rs);
-  TCP_TEST ((tc->dsack_flags & TCP_DSACK_RXT_ACTIVE) && tcp_test_dsack_rxt_count (tc) == 1 &&
+  tcp_test_rcv_sacks (tc, 1200, &ac);
+  TCP_TEST ((tc->sack_sb.flags & TCP_DSACK_RXT_ACTIVE) && tcp_test_dsack_rxt_count (tc) == 1 &&
 	      tcp_test_dsack_rxt_at (tc, 0)->start == 1200 &&
 	      tcp_test_dsack_rxt_at (tc, 0)->end == 1300 && tc->dsack_pending_bytes == 200,
 	    "clean ACK trims acknowledged exact D-SACK history");
   tc->snd_una = 1200;
-  tcp_test_rcv_sacks (tc, 1300, &rs);
-  TCP_TEST (!(tc->dsack_flags & TCP_DSACK_RXT_ACTIVE) && tcp_dsack_has_history (tc) &&
+  tcp_test_rcv_sacks (tc, 1300, &ac);
+  TCP_TEST (!(tc->sack_sb.flags & TCP_DSACK_RXT_ACTIVE) && tcp_dsack_has_history (tc) &&
 	      tc->dsack_pending_bytes == 200,
 	    "clean ACK frees fully acknowledged exact D-SACK history");
 
@@ -1398,7 +1475,7 @@ tcp_test_dsack_rx (vlib_main_t *vm)
   tcp_dsack_track_retransmit (tc, 1300, 1400);
   TCP_TEST (pool_len (tc->dsack_rxt) == 3, "pool contains metadata and two ranges");
   tc->rcv_opts.flags = TCP_OPTS_FLAG_SACK_PERMITTED;
-  tcp_test_rcv_sacks (tc, 1200, &rs);
+  tcp_test_rcv_sacks (tc, 1200, &ac);
   tc->snd_una = 1200;
   tcp_dsack_track_retransmit (tc, 1500, 1600);
   TCP_TEST (
@@ -1414,11 +1491,11 @@ tcp_test_dsack_rx (vlib_main_t *vm)
   tcp_dsack_recovery_clear (tc);
   tcp_dsack_track_retransmit (tc, 1100, 1200);
   tcp_dsack_recovery_clear (tc);
-  TCP_TEST ((tc->dsack_flags & TCP_DSACK_RXT_ACTIVE) && !tcp_dsack_has_history (tc) &&
+  TCP_TEST ((tc->sack_sb.flags & TCP_DSACK_RXT_ACTIVE) && !tcp_dsack_has_history (tc) &&
 	      !tc->dsack_pending_bytes,
 	    "episode clear preserves active retransmission ranges");
   tcp_dsack_recovery_init (tc);
-  TCP_TEST ((tc->dsack_flags & TCP_DSACK_RXT_ACTIVE) && tcp_dsack_has_history (tc) &&
+  TCP_TEST ((tc->sack_sb.flags & TCP_DSACK_RXT_ACTIVE) && tcp_dsack_has_history (tc) &&
 	      tc->dsack_pending_bytes == 100,
 	    "new recovery seeds aggregate D-SACK accounting from active ranges");
 
@@ -1440,11 +1517,11 @@ tcp_test_dsack_rx (vlib_main_t *vm)
       block.end = block.start + tc->snd_mss;
       vec_add1 (tc->rcv_opts.sacks, block);
       tc->rcv_opts.n_sack_blocks = 1;
-      clib_memset (&rs, 0, sizeof (rs));
-      tcp_rcv_dsack (tc, tc->snd_nxt, &rs);
+      clib_memset (&ac, 0, sizeof (ac));
+      tcp_rcv_dsack (tc, tc->snd_nxt, &ac);
     }
-  TCP_TEST (!(tc->dsack_flags & TCP_DSACK_RXT_OVERFLOW) && tcp_test_dsack_rxt_count (tc) == 1 &&
-	      (rs.ack_flags & TCP_ACK_F_DSACK_SPURIOUS),
+  TCP_TEST (!(tc->sack_sb.flags & TCP_DSACK_RXT_OVERFLOW) && tcp_test_dsack_rxt_count (tc) == 1 &&
+	      (ac.ack_flags & TCP_ACK_F_DSACK_SPURIOUS),
 	    "per-segment D-SACKs retain compact history beyond the range limit");
 
   /* A fragmented recovery can retain at most a bounded number of ranges.
@@ -1456,13 +1533,14 @@ tcp_test_dsack_rx (vlib_main_t *vm)
   for (u32 i = 0; i < TCP_MAX_DSACK_RXT_RANGES; i++)
     tcp_dsack_track_retransmit (tc, 1000 + 200 * i, 1100 + 200 * i);
   TCP_TEST (tcp_test_dsack_rxt_count (tc) == TCP_MAX_DSACK_RXT_RANGES &&
-	      !(tc->dsack_flags & TCP_DSACK_RXT_OVERFLOW),
+	      !(tc->sack_sb.flags & TCP_DSACK_RXT_OVERFLOW),
 	    "retain D-SACK retransmit ranges up to the limit");
   tcp_dsack_track_retransmit (tc, 1000 + 200 * TCP_MAX_DSACK_RXT_RANGES,
 			      1100 + 200 * TCP_MAX_DSACK_RXT_RANGES);
-  TCP_TEST (!(tc->dsack_flags & TCP_DSACK_RXT_ACTIVE) && (tc->dsack_flags & TCP_DSACK_INELIGIBLE) &&
-	      (tc->dsack_flags & TCP_DSACK_RXT_OVERFLOW) &&
-	      !(tc->dsack_flags & TCP_DSACK_UNDO_DISABLED),
+  TCP_TEST (!(tc->sack_sb.flags & TCP_DSACK_RXT_ACTIVE) &&
+	      (tc->sack_sb.flags & TCP_DSACK_INELIGIBLE) &&
+	      (tc->sack_sb.flags & TCP_DSACK_RXT_OVERFLOW) &&
+	      !(tc->sack_sb.flags & TCP_DSACK_UNDO_DISABLED),
 	    "range overflow abandons only the current D-SACK undo episode");
   tc->snd_una = tc->snd_congestion;
   tcp_cong_recovery_off (tc);
@@ -1470,19 +1548,19 @@ tcp_test_dsack_rx (vlib_main_t *vm)
   block.end = 900;
   vec_add1 (tc->rcv_opts.sacks, block);
   tc->rcv_opts.n_sack_blocks = 1;
-  tcp_rcv_dsack (tc, tc->snd_una, &rs);
-  TCP_TEST ((rs.ack_flags & TCP_ACK_F_DSACK) && !(rs.ack_flags & TCP_ACK_F_DSACK_SPURIOUS) &&
-	      !(tc->dsack_flags & TCP_DSACK_UNDO_DISABLED),
+  tcp_rcv_dsack (tc, tc->snd_una, &ac);
+  TCP_TEST ((ac.ack_flags & TCP_ACK_F_DSACK) && !(ac.ack_flags & TCP_ACK_F_DSACK_SPURIOUS) &&
+	      !(tc->sack_sb.flags & TCP_DSACK_UNDO_DISABLED),
 	    "delayed D-SACK after overflow does not disable future undo");
   vec_reset_length (tc->rcv_opts.sacks);
   tc->rcv_opts.flags = TCP_OPTS_FLAG_SACK_PERMITTED;
-  rs.ack_flags = 0;
-  tcp_test_rcv_sacks (tc, tc->snd_una + 100, &rs);
-  TCP_TEST (tcp_dsack_has_history (tc) && (tc->dsack_flags & TCP_DSACK_RXT_OVERFLOW),
+  ac.ack_flags = 0;
+  tcp_test_rcv_sacks (tc, tc->snd_una + 100, &ac);
+  TCP_TEST (tcp_dsack_has_history (tc) && (tc->sack_sb.flags & TCP_DSACK_RXT_OVERFLOW),
 	    "ACK progress retains the overflowed recovery episode");
   tcp_dsack_recovery_init (tc);
   TCP_TEST (!tcp_dsack_has_history (tc) &&
-	      !(tc->dsack_flags & (TCP_DSACK_INELIGIBLE | TCP_DSACK_RXT_OVERFLOW)),
+	      !(tc->sack_sb.flags & (TCP_DSACK_INELIGIBLE | TCP_DSACK_RXT_OVERFLOW)),
 	    "next recovery retires the overflowed recovery episode");
 
   /* D-SACK matching updates only aggregate state and never splits active
@@ -1499,9 +1577,9 @@ tcp_test_dsack_rx (vlib_main_t *vm)
   block.end = 1200;
   vec_add1 (tc->rcv_opts.sacks, block);
   tc->rcv_opts.n_sack_blocks = 2;
-  tcp_rcv_dsack (tc, tc->snd_una, &rs);
-  TCP_TEST ((tc->dsack_flags & TCP_DSACK_RXT_ACTIVE) &&
-	      !(tc->dsack_flags & TCP_DSACK_RXT_OVERFLOW) &&
+  tcp_rcv_dsack (tc, tc->snd_una, &ac);
+  TCP_TEST ((tc->sack_sb.flags & TCP_DSACK_RXT_ACTIVE) &&
+	      !(tc->sack_sb.flags & TCP_DSACK_RXT_OVERFLOW) &&
 	      tcp_test_dsack_rxt_count (tc) == TCP_MAX_DSACK_RXT_RANGES &&
 	      tc->dsack_pending_bytes == TCP_MAX_DSACK_RXT_RANGES * 100 - 50,
 	    "D-SACK matching preserves compact active history");
@@ -1517,20 +1595,20 @@ tcp_test_dsack_rx (vlib_main_t *vm)
   block.end = 1200;
   vec_add1 (tc->rcv_opts.sacks, block);
   tc->rcv_opts.n_sack_blocks = 1;
-  tcp_test_rcv_sacks (tc, tc->snd_congestion, &rs);
-  TCP_TEST (!(rs.ack_flags & TCP_ACK_F_DSACK_SPURIOUS) && tc->dsack_pending_bytes == 100 &&
-	      (tc->dsack_flags & TCP_DSACK_INELIGIBLE),
+  tcp_test_rcv_sacks (tc, tc->snd_congestion, &ac);
+  TCP_TEST (!(ac.ack_flags & TCP_ACK_F_DSACK_SPURIOUS) && tc->dsack_pending_bytes == 100 &&
+	      (tc->sack_sb.flags & TCP_DSACK_INELIGIBLE),
 	    "one D-SACK accounts one ambiguous retransmission copy");
   tc->snd_una = tc->snd_congestion;
   tcp_cong_recovery_off (tc);
   vec_reset_length (tc->rcv_opts.sacks);
-  rs.ack_flags = 0;
+  ac.ack_flags = 0;
   vec_add1 (tc->rcv_opts.sacks, block);
   tc->rcv_opts.flags |= TCP_OPTS_FLAG_SACK;
   tc->rcv_opts.n_sack_blocks = 1;
-  tcp_test_rcv_sacks (tc, tc->snd_una, &rs);
-  TCP_TEST (!(rs.ack_flags & TCP_ACK_F_DSACK_SPURIOUS) &&
-	      !(tc->dsack_flags & TCP_DSACK_UNDO_DISABLED) && !tc->dsack_pending_bytes,
+  tcp_test_rcv_sacks (tc, tc->snd_una, &ac);
+  TCP_TEST (!(ac.ack_flags & TCP_ACK_F_DSACK_SPURIOUS) &&
+	      !(tc->sack_sb.flags & TCP_DSACK_UNDO_DISABLED) && !tc->dsack_pending_bytes,
 	    "repeated D-SACK accounts the second copy without enabling undo");
 
   /* A D-SACK range containing bytes that were not retransmitted is network
@@ -1548,10 +1626,10 @@ tcp_test_dsack_rx (vlib_main_t *vm)
   block.end = 1500;
   vec_add1 (tc->rcv_opts.sacks, block);
   tc->rcv_opts.n_sack_blocks = 2;
-  tcp_rcv_dsack (tc, tc->snd_una, &rs);
-  TCP_TEST (!(tc->dsack_flags & TCP_DSACK_RXT_ACTIVE) &&
-	      (tc->dsack_flags & TCP_DSACK_UNDO_DISABLED) &&
-	      !(rs.ack_flags & TCP_ACK_F_DSACK_SPURIOUS),
+  tcp_rcv_dsack (tc, tc->snd_una, &ac);
+  TCP_TEST (!(tc->sack_sb.flags & TCP_DSACK_RXT_ACTIVE) &&
+	      (tc->sack_sb.flags & TCP_DSACK_UNDO_DISABLED) &&
+	      !(ac.ack_flags & TCP_ACK_F_DSACK_SPURIOUS),
 	    "active D-SACK gap disables undo and discards history");
 
   /* Overlapping D-SACK evidence cannot credit more bytes than remain
@@ -1566,19 +1644,19 @@ tcp_test_dsack_rx (vlib_main_t *vm)
   block.end = 1200;
   vec_add1 (tc->rcv_opts.sacks, block);
   tc->rcv_opts.n_sack_blocks = 1;
-  tcp_test_rcv_sacks (tc, tc->snd_una, &rs);
-  TCP_TEST (!(rs.ack_flags & TCP_ACK_F_DSACK_SPURIOUS),
+  tcp_test_rcv_sacks (tc, tc->snd_una, &ac);
+  TCP_TEST (!(ac.ack_flags & TCP_ACK_F_DSACK_SPURIOUS),
 	    "partial D-SACK does not prove the whole retransmission duplicate");
   vec_reset_length (tc->rcv_opts.sacks);
-  rs.ack_flags = 0;
+  ac.ack_flags = 0;
   block.start = 1150;
   block.end = 1300;
   vec_add1 (tc->rcv_opts.sacks, block);
   tc->rcv_opts.flags |= TCP_OPTS_FLAG_SACK;
   tc->rcv_opts.n_sack_blocks = 1;
-  tcp_test_rcv_sacks (tc, tc->snd_una, &rs);
-  TCP_TEST (!(rs.ack_flags & TCP_ACK_F_DSACK_SPURIOUS) &&
-	      (tc->dsack_flags & TCP_DSACK_INELIGIBLE) && tc->dsack_pending_bytes == 100,
+  tcp_test_rcv_sacks (tc, tc->snd_una, &ac);
+  TCP_TEST (!(ac.ack_flags & TCP_ACK_F_DSACK_SPURIOUS) &&
+	      (tc->sack_sb.flags & TCP_DSACK_INELIGIBLE) && tc->dsack_pending_bytes == 100,
 	    "overlapping D-SACK cannot exceed pending retransmit evidence");
 
   /* Rescue, repeated-RTO and reneging paths make an episode ineligible
@@ -1587,7 +1665,7 @@ tcp_test_dsack_rx (vlib_main_t *vm)
   tc->flags |= TCP_CONN_FAST_RECOVERY | TCP_CONN_RECOVERY;
   tcp_dsack_recovery_clear (tc);
   tcp_dsack_track_retransmit (tc, 1100, 1200);
-  tc->dsack_flags |= TCP_DSACK_INELIGIBLE;
+  tc->sack_sb.flags |= TCP_DSACK_INELIGIBLE;
   tcp_dsack_track_retransmit (tc, 1150, 1250);
   tc->snd_una = tc->snd_congestion;
   tcp_cong_recovery_off (tc);
@@ -1595,10 +1673,10 @@ tcp_test_dsack_rx (vlib_main_t *vm)
   block.end = 1250;
   vec_add1 (tc->rcv_opts.sacks, block);
   tc->rcv_opts.n_sack_blocks = 1;
-  tcp_test_rcv_sacks (tc, tc->snd_una, &rs);
-  TCP_TEST ((tc->dsack_flags & TCP_DSACK_INELIGIBLE) &&
-	      !(tc->dsack_flags & TCP_DSACK_UNDO_DISABLED) &&
-	      !(rs.ack_flags & TCP_ACK_F_DSACK_SPURIOUS),
+  tcp_test_rcv_sacks (tc, tc->snd_una, &ac);
+  TCP_TEST ((tc->sack_sb.flags & TCP_DSACK_INELIGIBLE) &&
+	      !(tc->sack_sb.flags & TCP_DSACK_UNDO_DISABLED) &&
+	      !(ac.ack_flags & TCP_ACK_F_DSACK_SPURIOUS),
 	    "ambiguous retransmit path is ineligible but remains recognized");
 
   /* Union deletion must preserve the sorted range invariant. Otherwise an
@@ -1609,7 +1687,7 @@ tcp_test_dsack_rx (vlib_main_t *vm)
   tcp_dsack_track_retransmit (tc, 1100, 1200);
   tcp_dsack_track_retransmit (tc, 1250, 1400);
   tcp_dsack_track_retransmit (tc, 1600, 1700);
-  tc->dsack_flags |= TCP_DSACK_INELIGIBLE;
+  tc->sack_sb.flags |= TCP_DSACK_INELIGIBLE;
   tcp_dsack_track_retransmit (tc, 1100, 1300);
   TCP_TEST (tcp_test_dsack_rxt_count (tc) == 2 && tcp_test_dsack_rxt_at (tc, 0)->start == 1100 &&
 	      tcp_test_dsack_rxt_at (tc, 0)->end == 1400 &&
@@ -1622,10 +1700,10 @@ tcp_test_dsack_rx (vlib_main_t *vm)
   block.end = 1400;
   vec_add1 (tc->rcv_opts.sacks, block);
   tc->rcv_opts.n_sack_blocks = 1;
-  tcp_test_rcv_sacks (tc, tc->snd_una, &rs);
-  TCP_TEST ((tc->dsack_flags & TCP_DSACK_INELIGIBLE) &&
-	      !(tc->dsack_flags & TCP_DSACK_UNDO_DISABLED) &&
-	      !(rs.ack_flags & TCP_ACK_F_DSACK_SPURIOUS),
+  tcp_test_rcv_sacks (tc, tc->snd_una, &ac);
+  TCP_TEST ((tc->sack_sb.flags & TCP_DSACK_INELIGIBLE) &&
+	      !(tc->sack_sb.flags & TCP_DSACK_UNDO_DISABLED) &&
+	      !(ac.ack_flags & TCP_ACK_F_DSACK_SPURIOUS),
 	    "D-SACK after a multi-range union matches retained history");
 
   /* Eifel may undo first and retain an ineligible history solely to recognize
@@ -1635,21 +1713,21 @@ tcp_test_dsack_rx (vlib_main_t *vm)
   tc->flags |= TCP_CONN_FAST_RECOVERY | TCP_CONN_RECOVERY;
   tcp_dsack_recovery_clear (tc);
   tcp_dsack_track_retransmit (tc, 1100, 1200);
-  tc->dsack_flags |= TCP_DSACK_INELIGIBLE;
+  tc->sack_sb.flags |= TCP_DSACK_INELIGIBLE;
   tc->snd_una = tc->snd_congestion;
   tcp_cong_recovery_off (tc);
   block.start = 1100;
   block.end = 1200;
   vec_add1 (tc->rcv_opts.sacks, block);
   tc->rcv_opts.n_sack_blocks = 1;
-  tcp_test_rcv_sacks (tc, tc->snd_una, &rs);
-  TCP_TEST (!(rs.ack_flags & TCP_ACK_F_DSACK_SPURIOUS) &&
-	      !(tc->dsack_flags & TCP_DSACK_UNDO_DISABLED),
+  tcp_test_rcv_sacks (tc, tc->snd_una, &ac);
+  TCP_TEST (!(ac.ack_flags & TCP_ACK_F_DSACK_SPURIOUS) &&
+	      !(tc->sack_sb.flags & TCP_DSACK_UNDO_DISABLED),
 	    "late D-SACK matching Eifel history neither re-undoes nor disables");
   vec_reset_length (tc->rcv_opts.sacks);
-  rs.ack_flags = 0;
+  ac.ack_flags = 0;
   tc->rcv_opts.flags = TCP_OPTS_FLAG_SACK_PERMITTED;
-  tcp_test_rcv_sacks (tc, tc->snd_una + 100, &rs);
+  tcp_test_rcv_sacks (tc, tc->snd_una + 100, &ac);
   TCP_TEST (tcp_dsack_has_history (tc), "ordinary ACK progress retains incomplete D-SACK history");
   tcp_dsack_recovery_init (tc);
   TCP_TEST (!tcp_dsack_has_history (tc), "next recovery retires incomplete D-SACK history");
@@ -1666,17 +1744,17 @@ tcp_test_dsack_rx (vlib_main_t *vm)
   block.end = 1200;
   vec_add1 (tc->rcv_opts.sacks, block);
   tc->rcv_opts.n_sack_blocks = 1;
-  tcp_test_rcv_sacks (tc, tc->snd_una, &rs);
+  tcp_test_rcv_sacks (tc, tc->snd_una, &ac);
   TCP_TEST (tc->sack_sb.sacked_bytes == 100, "retain prior SACK history");
   vec_reset_length (tc->rcv_opts.sacks);
-  rs.ack_flags = 0;
+  ac.ack_flags = 0;
   block.start = 1000;
   block.end = 1100;
   vec_add1 (tc->rcv_opts.sacks, block);
   tc->rcv_opts.flags |= TCP_OPTS_FLAG_SACK;
   tc->rcv_opts.n_sack_blocks = 1;
-  tcp_test_rcv_sacks (tc, 1200, &rs);
-  TCP_TEST (!tc->sack_sb.sacked_bytes && (rs.ack_flags & TCP_ACK_F_DSACK_SPURIOUS),
+  tcp_test_rcv_sacks (tc, 1200, &ac);
+  TCP_TEST (!tc->sack_sb.sacked_bytes && (ac.ack_flags & TCP_ACK_F_DSACK_SPURIOUS),
 	    "use pre-processing SACK history when cumulative ACK drains scoreboard");
 
   DSACK_RX_RESET ();
@@ -1688,9 +1766,42 @@ tcp_test_dsack_rx (vlib_main_t *vm)
   block.end = 1200;
   vec_add1 (tc->rcv_opts.sacks, block);
   tc->rcv_opts.n_sack_blocks = 1;
-  tcp_test_rcv_sacks (tc, tc->snd_congestion, &rs);
-  TCP_TEST ((tc->dsack_flags & TCP_DSACK_INELIGIBLE) && !(rs.ack_flags & TCP_ACK_F_DSACK_SPURIOUS),
+  tcp_test_rcv_sacks (tc, tc->snd_congestion, &ac);
+  TCP_TEST ((tc->sack_sb.flags & TCP_DSACK_INELIGIBLE) &&
+	      !(ac.ack_flags & TCP_ACK_F_DSACK_SPURIOUS),
 	    "empty SACK history at snd_una keeps whole-ACK-loss reduction");
+
+  /* D-SACK evidence is finalized before the scoreboard applies ACK/SACK
+   * ranges. Reneging discovered later in the same ACK must revoke the
+   * provisional spurious-recovery result. */
+  DSACK_RX_RESET ();
+  tc->flags |= TCP_CONN_FAST_RECOVERY | TCP_CONN_RECOVERY;
+  tcp_dsack_recovery_clear (tc);
+  tcp_dsack_track_retransmit (tc, 1000, 1100);
+  block.start = 1100;
+  block.end = 1200;
+  vec_add1 (tc->rcv_opts.sacks, block);
+  tc->rcv_opts.n_sack_blocks = 1;
+  tcp_test_rcv_sacks (tc, tc->snd_una, &ac);
+  TCP_TEST (tc->sack_sb.sacked_bytes == 100, "retain adjacent SACK history before D-SACK");
+
+  vec_reset_length (tc->rcv_opts.sacks);
+  block.start = 1000;
+  block.end = 1100;
+  vec_add1 (tc->rcv_opts.sacks, block);
+  tc->rcv_opts.flags |= TCP_OPTS_FLAG_SACK;
+  tc->rcv_opts.n_sack_blocks = 1;
+  tcp_test_rcv_sacks (tc, 1100, &ac);
+  TCP_TEST ((ac.ack_flags & TCP_ACK_F_DSACK) && !(ac.ack_flags & TCP_ACK_F_DSACK_SPURIOUS) &&
+	      tcp_scoreboard_is_reneging (&tc->sack_sb) &&
+	      (tc->sack_sb.flags & TCP_DSACK_INELIGIBLE) && !tc->dsack_pending_bytes,
+	    "same-ACK scoreboard reneging revokes provisional D-SACK undo");
+
+  tcp_dsack_recovery_clear (tc);
+  TCP_TEST (tcp_scoreboard_is_reneging (&tc->sack_sb) &&
+	      !(tc->sack_sb.flags & TCP_DSACK_INELIGIBLE),
+	    "D-SACK clear preserves scoreboard reneging state");
+  tcp_scoreboard_set_reneging (&tc->sack_sb, 0, 0);
 
   if (vm)
     vlib_cli_output (vm, "D-SACK receive/undo tests passed");
@@ -1845,6 +1956,27 @@ tcp_test_sack_tx (vlib_main_t * vm, unformat_input_t * input)
 }
 
 static int
+tcp_test_snd_wnd_max (void)
+{
+  tcp_connection_t _tc, *tc = &_tc;
+
+  clib_memset (tc, 0, sizeof (*tc));
+
+  tc->snd_wnd_max = 1000;
+  tc->snd_una = 1000;
+  tc->snd_nxt = 1500;
+  tc->bytes_out = 800;
+  tc->bytes_retrans = 100;
+  TCP_TEST (tcp_old_ack_wnd (tc) == 200, "bound old ACK history by cumulatively acknowledged data");
+
+  tc->bytes_out = (1ULL << 32) + 2000;
+  TCP_TEST (tcp_old_ack_wnd (tc) == tc->snd_wnd_max,
+	    "retain maximum send-window bound across sequence wrap");
+
+  return 0;
+}
+
+static int
 tcp_test_sack (vlib_main_t * vm, unformat_input_t * input)
 {
   int res = 0;
@@ -1863,6 +1995,11 @@ tcp_test_sack (vlib_main_t * vm, unformat_input_t * input)
 	}
 
       if (tcp_test_dsack_rx (vm))
+	{
+	  return -1;
+	}
+
+      if (tcp_test_snd_wnd_max ())
 	{
 	  return -1;
 	}
@@ -2085,17 +2222,17 @@ tcp_test_cubic_init_epoch (tcp_connection_t *tc, clib_thread_index_t thread_inde
 static int
 tcp_test_cubic_compare_growth (tcp_connection_t *tc, tcp_connection_t *ref, u32 n_acks)
 {
-  tcp_rate_sample_t rs = { .bytes_acked = tc->snd_mss, .acked_and_sacked = tc->snd_mss };
+  tcp_ack_ctx_t ac = { .bytes_acked = tc->snd_mss, .acked_and_sacked = tc->snd_mss };
   u32 i;
 
   for (i = 0; i < n_acks; i++)
     {
-      tc->snd_una += rs.bytes_acked;
-      ref->snd_una += rs.bytes_acked;
+      tc->snd_una += ac.bytes_acked;
+      ref->snd_una += ac.bytes_acked;
       tc->cwnd_limited_seq = tc->snd_una;
       ref->cwnd_limited_seq = ref->snd_una;
-      tc->cc_algo->rcv_ack (tc, &rs);
-      ref->cc_algo->rcv_ack (ref, &rs);
+      tc->cc_algo->rcv_ack (tc, &ac);
+      ref->cc_algo->rcv_ack (ref, &ac);
       if (tc->cwnd != ref->cwnd || tc->cwnd_acc_bytes != ref->cwnd_acc_bytes)
 	{
 	  fformat (stderr,
@@ -2180,14 +2317,14 @@ tcp_test_cwnd_limited_marking (void)
   /* An ACK that starts before the marker covers data from a cwnd-limited
    * flight even if it cumulatively acknowledges data beyond the marker. */
   {
-    tcp_rate_sample_t rs = { .bytes_acked = 3 * snd_mss };
+    tcp_ack_ctx_t ac = { .bytes_acked = 3 * snd_mss };
 
     tc->snd_una = 200 * snd_mss;
     tc->cwnd_limited_seq = tc->snd_una - 2 * snd_mss;
-    TCP_TEST (tcp_cc_is_cwnd_limited (tc, &rs), "cumulative ACK crossing marker is cwnd-limited");
+    TCP_TEST (tcp_cc_is_cwnd_limited (tc, &ac), "cumulative ACK crossing marker is cwnd-limited");
 
-    rs.bytes_acked = snd_mss;
-    TCP_TEST (!tcp_cc_is_cwnd_limited (tc, &rs),
+    ac.bytes_acked = snd_mss;
+    TCP_TEST (!tcp_cc_is_cwnd_limited (tc, &ac),
 	      "cumulative ACK starting past marker is not cwnd-limited");
   }
 
@@ -2200,7 +2337,7 @@ tcp_test_cwnd_limited_growth (void)
   const tcp_cc_algorithm_type_e cc_types[] = { TCP_CC_NEWRENO, TCP_CC_CUBIC };
   const char *cc_names[] = { "newreno", "cubic" };
   const u32 snd_mss = 1000, initial_cwnd = 10 * snd_mss, n_app_limited_acks = 128;
-  tcp_rate_sample_t rs = { .bytes_acked = snd_mss, .acked_and_sacked = snd_mss };
+  tcp_ack_ctx_t ac = { .bytes_acked = snd_mss, .acked_and_sacked = snd_mss };
   tcp_connection_t _tc, *tc = &_tc;
   u32 i, j;
 
@@ -2215,11 +2352,11 @@ tcp_test_cwnd_limited_growth (void)
       tc->tx_fifo_size = 1 << 30;
 
       /* None of these ACKs cover data from a cwnd-limited flight. */
-      tc->cwnd_limited_seq = tc->snd_una - rs.bytes_acked;
+      tc->cwnd_limited_seq = tc->snd_una - ac.bytes_acked;
       for (j = 0; j < n_app_limited_acks; j++)
 	{
-	  tc->cc_algo->rcv_ack (tc, &rs);
-	  tc->snd_una += rs.bytes_acked;
+	  tc->cc_algo->rcv_ack (tc, &ac);
+	  tc->snd_una += ac.bytes_acked;
 	}
       TCP_TEST ((tc->cwnd == initial_cwnd), "%s does not grow over %u app-limited ACKs",
 		cc_names[i], n_app_limited_acks);
@@ -2227,12 +2364,12 @@ tcp_test_cwnd_limited_growth (void)
       /* Extending the marker through the ACK permits normal slow-start
        * growth. */
       tc->cwnd_limited_seq = tc->snd_una;
-      tc->cc_algo->rcv_ack (tc, &rs);
+      tc->cc_algo->rcv_ack (tc, &ac);
       TCP_TEST ((tc->cwnd == initial_cwnd + snd_mss), "%s grows when cwnd-limited", cc_names[i]);
 
       /* Once cumulative ACKs pass the marker, growth stops again. */
-      tc->snd_una += rs.bytes_acked;
-      tc->cc_algo->rcv_ack (tc, &rs);
+      tc->snd_una += ac.bytes_acked;
+      tc->cc_algo->rcv_ack (tc, &ac);
       TCP_TEST ((tc->cwnd == initial_cwnd + snd_mss), "%s expires cwnd-limited marker",
 		cc_names[i]);
 
@@ -2254,7 +2391,7 @@ tcp_test_cubic_app_limited (void)
 {
   const clib_thread_index_t thread_index = 0;
   const u32 snd_mss = 1000;
-  tcp_rate_sample_t rs = { .bytes_acked = snd_mss, .acked_and_sacked = snd_mss };
+  tcp_ack_ctx_t ac = { .bytes_acked = snd_mss, .acked_and_sacked = snd_mss };
   tcp_connection_t _tc, *tc = &_tc, _ref, *ref = &_ref;
   u32 initial_cwnd;
 
@@ -2265,8 +2402,8 @@ tcp_test_cubic_app_limited (void)
   /* The ACK at time 2 belongs to a flight that did not exhaust cwnd. */
   tcp_test_set_time (thread_index, 2);
   tc->snd_una = 2 * snd_mss;
-  tc->cwnd_limited_seq = tc->snd_una - rs.bytes_acked;
-  tc->cc_algo->rcv_ack (tc, &rs);
+  tc->cwnd_limited_seq = tc->snd_una - ac.bytes_acked;
+  tc->cc_algo->rcv_ack (tc, &ac);
   TCP_TEST ((tc->cwnd == initial_cwnd), "cubic pauses on an app-limited ACK");
 
   /* At time 10 the sender becomes cwnd-limited without first draining the
@@ -2286,24 +2423,24 @@ tcp_test_cubic_app_limited (void)
   tcp_test_cubic_init_epoch (tc, thread_index, snd_mss, 100);
   tcp_test_set_time (thread_index, 21);
   tc->snd_una = 2 * snd_mss;
-  tc->cwnd_limited_seq = tc->snd_una - rs.bytes_acked;
-  tc->cc_algo->rcv_ack (tc, &rs);
+  tc->cwnd_limited_seq = tc->snd_una - ac.bytes_acked;
+  tc->cc_algo->rcv_ack (tc, &ac);
   tc->delivered_time = tcp_time_now_us (thread_index);
 
   tcp_test_set_time (thread_index, 30);
   tc->cc_algo->event (tc, TCP_CC_EVT_START_TX);
   tcp_test_set_time (thread_index, 31);
-  tc->snd_una += rs.bytes_acked;
-  tc->cwnd_limited_seq = tc->snd_una - rs.bytes_acked;
-  tc->cc_algo->rcv_ack (tc, &rs);
+  tc->snd_una += ac.bytes_acked;
+  tc->cwnd_limited_seq = tc->snd_una - ac.bytes_acked;
+  tc->cc_algo->rcv_ack (tc, &ac);
   tc->delivered_time = tcp_time_now_us (thread_index);
 
   tcp_test_set_time (thread_index, 40);
   tc->cc_algo->event (tc, TCP_CC_EVT_START_TX);
   tcp_test_set_time (thread_index, 41);
-  tc->snd_una += rs.bytes_acked;
-  tc->cwnd_limited_seq = tc->snd_una - rs.bytes_acked;
-  tc->cc_algo->rcv_ack (tc, &rs);
+  tc->snd_una += ac.bytes_acked;
+  tc->cwnd_limited_seq = tc->snd_una - ac.bytes_acked;
+  tc->cc_algo->rcv_ack (tc, &ac);
   tc->delivered_time = tcp_time_now_us (thread_index);
 
   /* When bulk transmission resumes, the first cwnd-limited ACK resumes the
@@ -3025,7 +3162,7 @@ tcp_test_rto_rpc (void *argp)
   a->prev_cwnd_after_first = tc->prev_cwnd;
   a->ssthresh_after_first = tc->ssthresh;
   a->dsack_history_after_first = tcp_dsack_has_history (tc);
-  a->dsack_ineligible_after_first = (tc->dsack_flags & TCP_DSACK_INELIGIBLE) != 0;
+  a->dsack_ineligible_after_first = (tc->sack_sb.flags & TCP_DSACK_INELIGIBLE) != 0;
 
   /* Emulate ACK progress without ending recovery, then fire a second RTO. */
   tc->rto_boff = 0;
@@ -3040,13 +3177,13 @@ tcp_test_rto_rpc (void *argp)
   a->rxt_delivered_after_second = tc->rxt_delivered;
   a->second_ssthresh = tc->ssthresh;
   a->second_prev_cwnd = tc->prev_cwnd;
-  a->dsack_ineligible_after_second = (tc->dsack_flags & TCP_DSACK_INELIGIBLE) != 0;
+  a->dsack_ineligible_after_second = (tc->sack_sb.flags & TCP_DSACK_INELIGIBLE) != 0;
 
   /* A retransmitted range may be counted delivered and later reneged. In
    * that case high_rxt still covers the head but no retransmitted bytes are
    * left to retire before sending its replacement. */
   tc->rxt_delivered = tc->snd_rxt_bytes;
-  tc->sack_sb.is_reneging = 1;
+  tcp_scoreboard_set_reneging (&tc->sack_sb, 1, 0);
   tcp_timer_reset (&wrk->timer_wheel, tc, TCP_TIMER_RETRANSMIT);
   tcp_timer_retransmit_handler (tc);
   a->rxt_flight_after_reneging = tc->snd_rxt_bytes - tc->rxt_delivered;
@@ -3533,17 +3670,17 @@ tcp_test_rto_reduce_once_e2e (vlib_main_t *vm, unformat_input_t *input)
    */
   {
     tcp_connection_t _stc, *stc = &_stc;
-    tcp_rate_sample_t _srs, *srs = &_srs;
+    tcp_ack_ctx_t _ac, *ac = &_ac;
     u32 mss = 1460;
 
 #define ARM_SPURIOUS()                                                                             \
   do                                                                                               \
     {                                                                                              \
       clib_memset (stc, 0, sizeof (*stc));                                                         \
-      clib_memset (srs, 0, sizeof (*srs));                                                         \
+      clib_memset (ac, 0, sizeof (*ac));                                                           \
       stc->snd_mss = mss;                                                                          \
       stc->flags |= TCP_CONN_FAST_RECOVERY;                                                        \
-      srs->bytes_acked = 2 * mss;                                                                  \
+      ac->bytes_acked = 2 * mss;                                                                   \
       stc->snd_una = 10000;                                                                        \
       stc->snd_congestion = stc->snd_una + 10 * mss;                                               \
       stc->snd_rxt_ts = 1000;                                                                      \
@@ -3555,7 +3692,7 @@ tcp_test_rto_reduce_once_e2e (vlib_main_t *vm, unformat_input_t *input)
 
     /* Base: all conditions met -> spurious. */
     ARM_SPURIOUS ();
-    if (!TCP_TEST_I ((tcp_cc_is_spurious_retransmit (stc, srs)),
+    if (!TCP_TEST_I ((tcp_cc_is_spurious_retransmit (stc, ac)),
 		     "eifel: spurious on partial cumulative ack, tsecr < snd_rxt_ts, "
 		     "no loss"))
       {
@@ -3566,7 +3703,7 @@ tcp_test_rto_reduce_once_e2e (vlib_main_t *vm, unformat_input_t *input)
     /* Also valid for rto recovery (TCP_CONN_RECOVERY), not just fast recovery. */
     ARM_SPURIOUS ();
     stc->flags = TCP_CONN_RECOVERY;
-    if (!TCP_TEST_I ((tcp_cc_is_spurious_retransmit (stc, srs)),
+    if (!TCP_TEST_I ((tcp_cc_is_spurious_retransmit (stc, ac)),
 		     "eifel: also fires for rto recovery"))
       {
 	rv = 1;
@@ -3578,7 +3715,7 @@ tcp_test_rto_reduce_once_e2e (vlib_main_t *vm, unformat_input_t *input)
     ARM_SPURIOUS ();
     stc->flags = TCP_CONN_RECOVERY;
     stc->sack_sb.lost_bytes = mss;
-    if (!TCP_TEST_I ((tcp_cc_is_spurious_retransmit (stc, srs)),
+    if (!TCP_TEST_I ((tcp_cc_is_spurious_retransmit (stc, ac)),
 		     "eifel: rto retransmit spurious despite outstanding loss"))
       {
 	rv = 1;
@@ -3588,7 +3725,7 @@ tcp_test_rto_reduce_once_e2e (vlib_main_t *vm, unformat_input_t *input)
     /* Negative: no retransmit stamped (snd_rxt_ts == 0), nothing to undo. */
     ARM_SPURIOUS ();
     stc->snd_rxt_ts = 0;
-    if (!TCP_TEST_I ((!tcp_cc_is_spurious_retransmit (stc, srs)),
+    if (!TCP_TEST_I ((!tcp_cc_is_spurious_retransmit (stc, ac)),
 		     "eifel: not spurious without a retransmit timestamp"))
       {
 	rv = 1;
@@ -3599,7 +3736,7 @@ tcp_test_rto_reduce_once_e2e (vlib_main_t *vm, unformat_input_t *input)
      * loss remains outstanding. The response handles that as a fresh event. */
     ARM_SPURIOUS ();
     stc->sack_sb.lost_bytes = mss;
-    if (!TCP_TEST_I ((tcp_cc_is_spurious_retransmit (stc, srs)),
+    if (!TCP_TEST_I ((tcp_cc_is_spurious_retransmit (stc, ac)),
 		     "eifel: fast retransmit spurious despite other outstanding loss"))
       {
 	rv = 1;
@@ -3610,7 +3747,7 @@ tcp_test_rto_reduce_once_e2e (vlib_main_t *vm, unformat_input_t *input)
      * RFC 3522 Sec. 3.2 (e.g. rto from losing all acks) -> keep the reduction. */
     ARM_SPURIOUS ();
     stc->snd_una = stc->snd_congestion;
-    if (!TCP_TEST_I ((!tcp_cc_is_spurious_retransmit (stc, srs)),
+    if (!TCP_TEST_I ((!tcp_cc_is_spurious_retransmit (stc, ac)),
 		     "eifel: not spurious on a full-flight ack"))
       {
 	rv = 1;
@@ -3621,7 +3758,7 @@ tcp_test_rto_reduce_once_e2e (vlib_main_t *vm, unformat_input_t *input)
      * retransmit -> the retransmit was needed). */
     ARM_SPURIOUS ();
     stc->rcv_opts.tsecr = stc->snd_rxt_ts;
-    if (!TCP_TEST_I ((!tcp_cc_is_spurious_retransmit (stc, srs)),
+    if (!TCP_TEST_I ((!tcp_cc_is_spurious_retransmit (stc, ac)),
 		     "eifel: not spurious when tsecr >= snd_rxt_ts"))
       {
 	rv = 1;
@@ -3631,7 +3768,7 @@ tcp_test_rto_reduce_once_e2e (vlib_main_t *vm, unformat_input_t *input)
     /* Negative: no timestamp option -> Eifel not applicable. */
     ARM_SPURIOUS ();
     stc->rcv_opts.flags = 0;
-    if (!TCP_TEST_I ((!tcp_cc_is_spurious_retransmit (stc, srs)),
+    if (!TCP_TEST_I ((!tcp_cc_is_spurious_retransmit (stc, ac)),
 		     "eifel: not spurious without the timestamp option"))
       {
 	rv = 1;
@@ -4734,7 +4871,7 @@ tcp_test_tamper_dsack_early_undo (vlib_main_t *vm)
   tcp_e2e_ctx_t _ctx, *ctx = &_ctx;
   tcp_connection_t *client_tc, *server_tc;
   tcp_tamper_rule_t *ack_rule, *loss_rule, *release_rule;
-  tcp_rate_sample_t seed_rs = { 0 };
+  tcp_ack_ctx_t seed_ac = { 0 };
   sack_block_t seed_sack, dsack;
   session_t *client_s, *server_s;
   const u32 n_segments = 8;
@@ -4829,13 +4966,13 @@ tcp_test_tamper_dsack_early_undo (vlib_main_t *vm)
   vec_add1 (client_tc->rcv_opts.sacks, seed_sack);
   client_tc->rcv_opts.n_sack_blocks = 1;
   client_tc->rcv_opts.flags |= TCP_OPTS_FLAG_SACK;
-  tcp_rcv_sacks (client_tc, spurious_seq, &seed_rs);
+  tcp_test_ack_handle_feedback (client_tc, spurious_seq, &seed_ac);
   if (!TCP_TEST_I ((client_tc->sack_sb.sacked_bytes != 0),
 		   "dsack_early: prior SACK history seeded "
 		   "(una %u, nxt %u, block %u-%u, sacked %u, last %u)",
 		   client_tc->snd_una - client_tc->iss, client_tc->snd_nxt - client_tc->iss,
 		   seed_sack.start - client_tc->iss, seed_sack.end - client_tc->iss,
-		   client_tc->sack_sb.sacked_bytes, seed_rs.last_sacked_bytes))
+		   client_tc->sack_sb.sacked_bytes, seed_ac.last_sacked_bytes))
     {
       rv = 1;
       goto cleanup;
@@ -4878,7 +5015,8 @@ tcp_test_tamper_dsack_early_undo (vlib_main_t *vm)
 		   "dsack flags 0x%x, rxt ranges %u)",
 		   ack_matches_before, ack_rule->n_matched, vec_len (server_tc->snd_sacks),
 		   client_tc->tr_occurences - tr_before, client_tc->fr_occurences - fr_before,
-		   client_tc->flags, client_tc->dsack_flags, tcp_test_dsack_rxt_count (client_tc)))
+		   client_tc->flags, client_tc->sack_sb.flags,
+		   tcp_test_dsack_rxt_count (client_tc)))
     {
       rv = 1;
       goto cleanup;
@@ -4911,7 +5049,7 @@ tcp_test_tamper_dsack_early_undo (vlib_main_t *vm)
 		   client_tc->tr_occurences - tr_before, client_tc->fr_occurences - fr_before,
 		   client_tc->flags, client_tc->sack_sb.lost_bytes, loss_rule->n_matched,
 		   loss_rule->n_dropped, client_tc->snd_una - client_tc->iss,
-		   client_tc->snd_nxt - client_tc->iss, client_tc->dsack_flags,
+		   client_tc->snd_nxt - client_tc->iss, client_tc->sack_sb.flags,
 		   tcp_test_dsack_rxt_count (client_tc)))
     {
       rv = 1;
@@ -5269,7 +5407,7 @@ static int
 tcp_test_delivery (vlib_main_t * vm, unformat_input_t * input)
 {
   clib_thread_index_t thread_index = 0, snd_una, *min_seqs = 0;
-  tcp_rate_sample_t _rs = { 0 }, *rs = &_rs;
+  tcp_ack_ctx_t _ac = { 0 }, *ac = &_ac;
   tcp_connection_t _tc, *tc = &_tc;
   int __clib_unused verbose = 0, i;
   u64 rate = 1000, burst = 100;
@@ -5325,19 +5463,19 @@ tcp_test_delivery (vlib_main_t * vm, unformat_input_t * input)
 
   /* 2) check delivery rate at time 2 */
   tcp_test_set_time (thread_index, 2);
-  tc->snd_una = tc->snd_nxt = burst;
-  rs->bytes_acked = burst;
-
-  tcp_bt_sample_delivery_rate (tc, rs);
+  tc->snd_nxt = burst;
+  clib_memset (ac, 0, sizeof (*ac));
+  tcp_test_ack_handle_feedback (tc, burst, ac);
+  tc->snd_una = burst;
 
   TCP_TEST (tcp_bt_is_sane (bt), "tracker should be sane");
   TCP_TEST (pool_elts (bt->samples) == 0, "sample should've been consumed");
   TCP_TEST (tc->delivered_time == 2, "delivered time should be 2");
   TCP_TEST (tc->delivered == burst, "delivered should be 100");
-  TCP_TEST (rs->interval_time == 1, "ack time should be 1");
-  TCP_TEST (rs->delivered == burst, "delivered should be 100");
-  TCP_TEST (rs->prior_delivered == 0, "sample delivered should be 0");
-  TCP_TEST (!(rs->flags & TCP_BTS_IS_RXT), "not retransmitted");
+  TCP_TEST (ac->interval_time == 1, "ack time should be 1");
+  TCP_TEST (ac->delivered == burst, "delivered should be 100");
+  TCP_TEST (ac->prior_delivered == 0, "sample delivered should be 0");
+  TCP_TEST (!(ac->flags & TCP_BTS_IS_RXT), "not retransmitted");
   TCP_TEST (tc->first_tx_time == 1, "first_tx_time %u", tc->first_tx_time);
 
   /* 3) track second burst at time 2 */
@@ -5363,20 +5501,20 @@ tcp_test_delivery (vlib_main_t * vm, unformat_input_t * input)
 
   /* 5) check delivery rate at time 4 */
   tcp_test_set_time (thread_index, 4);
-  tc->snd_una = tc->snd_nxt;
-  rs->bytes_acked = 2 * burst;
-
-  tcp_bt_sample_delivery_rate (tc, rs);
+  ack = tc->snd_nxt;
+  clib_memset (ac, 0, sizeof (*ac));
+  tcp_test_ack_handle_feedback (tc, ack, ac);
+  tc->snd_una = ack;
 
   TCP_TEST (tcp_bt_is_sane (bt), "tracker should be sane");
   TCP_TEST (pool_elts (bt->samples) == 0, "sample should've been consumed");
   TCP_TEST (tc->delivered_time == 4, "delivered time should be 4");
   TCP_TEST (tc->delivered == 3 * burst, "delivered should be 300 is %u",
 	    tc->delivered);
-  TCP_TEST (rs->interval_time == 2, "ack time should be 2");
-  TCP_TEST (rs->delivered == 2 * burst, "delivered should be 200");
-  TCP_TEST (rs->prior_delivered == burst, "delivered should be 100");
-  TCP_TEST (!(rs->flags & TCP_BTS_IS_RXT), "not retransmitted");
+  TCP_TEST (ac->interval_time == 2, "ack time should be 2");
+  TCP_TEST (ac->delivered == 2 * burst, "delivered should be 200");
+  TCP_TEST (ac->prior_delivered == burst, "delivered should be 100");
+  TCP_TEST (!(ac->flags & TCP_BTS_IS_RXT), "not retransmitted");
   TCP_TEST (tc->first_tx_time == 2, "first_tx_time %u", tc->first_tx_time);
 
   /*
@@ -5426,11 +5564,8 @@ tcp_test_delivery (vlib_main_t * vm, unformat_input_t * input)
   vec_add1 (tc->rcv_opts.sacks, block);
   tc->rcv_opts.flags |= TCP_OPTS_FLAG_SACK;
   tc->rcv_opts.n_sack_blocks = vec_len (tc->rcv_opts.sacks);
-  tcp_test_rcv_sacks (tc, ack, rs);
-  rs->bytes_acked = ack - tc->snd_una;
+  tcp_test_rcv_sacks (tc, ack, ac);
   tc->snd_una = ack;
-
-  tcp_bt_sample_delivery_rate (tc, rs);
 
   TCP_TEST (tcp_bt_is_sane (bt), "tracker should be sane");
   TCP_TEST (pool_elts (bt->samples) == 7, "there should be 7 samples %u",
@@ -5440,13 +5575,11 @@ tcp_test_delivery (vlib_main_t * vm, unformat_input_t * input)
 	    3 * burst + 30, tc->delivered);
   /* All 3 samples have the same delivered number of bytes. So the first is
    * the reference for delivery estimate. */
-  TCP_TEST (rs->interval_time == 4, "ack time should be 4 is %.2f",
-	    rs->interval_time);
-  TCP_TEST (rs->delivered == 30, "delivered should be 30");
-  TCP_TEST (rs->prior_delivered == 3 * burst,
-	    "sample delivered should be %u", 3 * burst);
-  TCP_TEST (!(rs->flags & TCP_BTS_IS_RXT), "not retransmitted");
-  TCP_TEST (!(rs->flags & TCP_BTS_IS_APP_LIMITED), "not app limited");
+  TCP_TEST (ac->interval_time == 4, "ack time should be 4 is %.2f", ac->interval_time);
+  TCP_TEST (ac->delivered == 30, "delivered should be 30");
+  TCP_TEST (ac->prior_delivered == 3 * burst, "sample delivered should be %u", 3 * burst);
+  TCP_TEST (!(ac->flags & TCP_BTS_IS_RXT), "not retransmitted");
+  TCP_TEST (!(ac->flags & TCP_BTS_IS_APP_LIMITED), "not app limited");
   /* All 3 samples have the same delivered number of bytes. The first
    * sets the first tx time */
   TCP_TEST (tc->first_tx_time == 4, "first_tx_time %u", tc->first_tx_time);
@@ -5516,11 +5649,8 @@ tcp_test_delivery (vlib_main_t * vm, unformat_input_t * input)
   block = (sack_block_t) { .start = snd_una + 2 * burst + 50, .end = snd_una + 2 * burst + 60 };
   vec_add1 (tc->rcv_opts.sacks, block);
   tc->rcv_opts.n_sack_blocks = vec_len (tc->rcv_opts.sacks);
-  tcp_test_rcv_sacks (tc, ack, rs);
-  rs->bytes_acked = ack - tc->snd_una;
+  tcp_test_rcv_sacks (tc, ack, ac);
   tc->snd_una = ack;
-
-  tcp_bt_sample_delivery_rate (tc, rs);
 
   TCP_TEST (tcp_bt_is_sane (bt), "tracker should be sane");
   TCP_TEST (pool_elts (bt->samples) == 6, "num samples should be 6 is %u", pool_elts (bt->samples));
@@ -5530,15 +5660,13 @@ tcp_test_delivery (vlib_main_t * vm, unformat_input_t * input)
   /* A rxt was acked and delivered time for it is 8 (last ack time) so
    * ack_time is 2 (8 - 10). However, first_tx_time for rxt was 4 and rxt
    * time 9. Therefore snd_time is 5 (9 - 4)*/
-  TCP_TEST (rs->interval_time == 5, "ack time should be 5 is %.2f",
-	    rs->interval_time);
+  TCP_TEST (ac->interval_time == 5, "ack time should be 5 is %.2f", ac->interval_time);
   /* delivered_now - delivered_rxt ~ 5 * burst + 30 - 3 * burst - 30 */
-  TCP_TEST (rs->delivered == 2 * burst, "delivered should be 200 is %u", rs->delivered);
-  TCP_TEST (rs->prior_delivered == 3 * burst + 30,
-	    "sample delivered should be %u", 3 * burst + 30);
-  TCP_TEST (rs->flags & TCP_BTS_IS_RXT, "is retransmitted");
+  TCP_TEST (ac->delivered == 2 * burst, "delivered should be 200 is %u", ac->delivered);
+  TCP_TEST (ac->prior_delivered == 3 * burst + 30, "sample delivered should be %u", 3 * burst + 30);
+  TCP_TEST (ac->flags & TCP_BTS_IS_RXT, "is retransmitted");
   /* Sample is app limited because of the retransmits */
-  TCP_TEST (rs->flags & TCP_BTS_IS_APP_LIMITED, "is app limited");
+  TCP_TEST (ac->flags & TCP_BTS_IS_APP_LIMITED, "is app limited");
   TCP_TEST (tc->app_limited, "app limited should be set");
   TCP_TEST (tc->first_tx_time == 9, "first_tx_time %u", tc->first_tx_time);
 
@@ -5551,14 +5679,11 @@ tcp_test_delivery (vlib_main_t * vm, unformat_input_t * input)
   vec_reset_length (tc->rcv_opts.sacks);
   tc->rcv_opts.flags &= ~TCP_OPTS_FLAG_SACK;
   tc->rcv_opts.n_sack_blocks = 0;
-  tcp_test_rcv_sacks (tc, ack, rs);
-  rs->bytes_acked = ack - tc->snd_una;
+  tcp_test_rcv_sacks (tc, ack, ac);
   tc->snd_una = ack;
-  TCP_TEST (rs->last_bytes_delivered == 30,
+  TCP_TEST (ac->last_bytes_delivered == 30,
 	    "cumulative ACK recognizes 30 previously delivered bytes is %u",
-	    rs->last_bytes_delivered);
-
-  tcp_bt_sample_delivery_rate (tc, rs);
+	    ac->last_bytes_delivered);
 
   TCP_TEST (tcp_bt_is_sane (bt), "tracker should be sane");
   TCP_TEST (pool_elts (bt->samples) == 0, "num samples should be 0 is %u",
@@ -5572,15 +5697,13 @@ tcp_test_delivery (vlib_main_t * vm, unformat_input_t * input)
   /* Delivered time at retransmit was 8 so ack_time is 11 - 8 = 3. However,
    * first_tx_time for rxt was 4 and rxt time was 9. Therefore snd_time
    * is 9 - 4 = 5 */
-  TCP_TEST (rs->interval_time == 5, "ack time should be 5 is %.2f",
-	    rs->interval_time);
+  TCP_TEST (ac->interval_time == 5, "ack time should be 5 is %.2f", ac->interval_time);
   /* delivered_now - delivered_rxt ~ 7 * burst - 3 * burst - 30.
    * That's because we didn't retransmit any new segment. */
-  TCP_TEST (rs->delivered == 4 * burst - 30, "delivered should be 370 is %u", rs->delivered);
-  TCP_TEST (rs->prior_delivered == 3 * burst + 30,
-	    "sample delivered should be %u", 3 * burst + 30);
-  TCP_TEST (rs->flags & TCP_BTS_IS_RXT, "is retransmitted");
-  TCP_TEST (rs->flags & TCP_BTS_IS_APP_LIMITED, "is app limited");
+  TCP_TEST (ac->delivered == 4 * burst - 30, "delivered should be 370 is %u", ac->delivered);
+  TCP_TEST (ac->prior_delivered == 3 * burst + 30, "sample delivered should be %u", 3 * burst + 30);
+  TCP_TEST (ac->flags & TCP_BTS_IS_RXT, "is retransmitted");
+  TCP_TEST (ac->flags & TCP_BTS_IS_APP_LIMITED, "is app limited");
   TCP_TEST (tc->app_limited == 0, "app limited should be cleared");
   TCP_TEST (tc->first_tx_time == 9, "first_tx_time %u", tc->first_tx_time);
 
@@ -5631,7 +5754,7 @@ static int
 tcp_test_sack_backend_trace (tcp_test_sack_backend_t backend, tcp_test_sack_snapshot_t *snapshots)
 {
   tcp_connection_t _tc = {}, *tc = &_tc;
-  tcp_rate_sample_t rs;
+  tcp_ack_ctx_t ac;
   sack_block_t blocks[3];
   u32 acks[] = { 0, 100, 100, 450 };
   u32 n_blocks[] = { 3, 3, 1, 2 };
@@ -5664,17 +5787,20 @@ tcp_test_sack_backend_trace (tcp_test_sack_backend_t backend, tcp_test_sack_snap
 	vec_add1 (tc->rcv_opts.sacks, blocks[j]);
       tc->rcv_opts.n_sack_blocks = vec_len (tc->rcv_opts.sacks);
 
-      tcp_test_rcv_sacks (tc, acks[i], &rs);
+      tcp_test_rcv_sacks (tc, acks[i], &ac);
+      TCP_TEST (vec_len (tc->rcv_opts.sacks) == n_blocks[i],
+		"%s keeps only received sack blocks at step %u",
+		tcp_test_sack_backend_names[backend], i);
       snapshots[i] = (tcp_test_sack_snapshot_t) {
 	.sacked_bytes = tc->sack_sb.sacked_bytes,
 	.lost_bytes = tc->sack_sb.lost_bytes,
 	.high_sacked = tc->sack_sb.high_sacked,
 	.reorder = tc->sack_sb.reorder,
-	.last_sacked_bytes = rs.last_sacked_bytes,
-	.last_bytes_delivered = rs.last_bytes_delivered,
-	.rxt_sacked = rs.rxt_sacked,
-	.last_lost = rs.last_lost,
-	.is_reneging = tc->sack_sb.is_reneging,
+	.last_sacked_bytes = ac.last_sacked_bytes,
+	.last_bytes_delivered = ac.last_bytes_delivered,
+	.rxt_sacked = ac.rxt_sacked,
+	.last_lost = ac.last_lost,
+	.is_reneging = tcp_scoreboard_is_reneging (&tc->sack_sb),
       };
 
       if (backend == TCP_TEST_SACK_BACKEND_BT)
@@ -5685,10 +5811,7 @@ tcp_test_sack_backend_trace (tcp_test_sack_backend_t backend, tcp_test_sack_snap
 		    "BT mode does not allocate scoreboard holes at step %u", i);
 	}
 
-      rs.bytes_acked = acks[i] - tc->snd_una;
       tc->snd_una = acks[i];
-      if (backend == TCP_TEST_SACK_BACKEND_BT)
-	tcp_bt_sample_delivery_rate (tc, &rs);
     }
 
   tcp_test_sack_backend_cleanup (tc, backend);
@@ -5747,7 +5870,7 @@ tcp_test_bt_scoreboard_random (u32 base, u32 seed, tcp_test_bt_sb_mode_t mode)
 {
   tcp_connection_t _default_tc = {}, _bt_tc = {};
   tcp_connection_t *default_tc = &_default_tc, *bt_tc = &_bt_tc;
-  tcp_rate_sample_t default_rs, bt_rs;
+  tcp_ack_ctx_t default_ac, bt_ac;
   sack_block_t block;
   u32 ack, end, flight = 8192, high_rxt, i, j, n_blocks, offset, span;
   u8 rescue_active = 0, same;
@@ -5831,26 +5954,23 @@ tcp_test_bt_scoreboard_random (u32 base, u32 seed, tcp_test_bt_sb_mode_t mode)
 	  bt_tc->rcv_opts.flags &= ~TCP_OPTS_FLAG_SACK;
 	}
 
-      clib_memset (&default_rs, 0, sizeof (default_rs));
-      clib_memset (&bt_rs, 0, sizeof (bt_rs));
-      tcp_rcv_sacks (default_tc, ack, &default_rs);
-      tcp_rcv_sacks (bt_tc, ack, &bt_rs);
+      clib_memset (&default_ac, 0, sizeof (default_ac));
+      clib_memset (&bt_ac, 0, sizeof (bt_ac));
+      tcp_test_ack_handle_feedback (default_tc, ack, &default_ac);
+      tcp_test_ack_handle_feedback (bt_tc, ack, &bt_ac);
 
-      /* Production completes deferred BT cumulative-ACK accounting after
-       * snd_una and bytes_acked are updated. Compare backends after that full
-       * per-ACK sequence rather than halfway through it. */
-      default_rs.bytes_acked = bt_rs.bytes_acked = ack - default_tc->snd_una;
+      /* Both range backends consumed and finalized the same ACK feedback. */
       default_tc->snd_una = bt_tc->snd_una = ack;
-      tcp_bt_sample_delivery_rate (bt_tc, &bt_rs);
 
       same = default_tc->sack_sb.sacked_bytes == bt_tc->sack_sb.sacked_bytes &&
 	     default_tc->sack_sb.lost_bytes == bt_tc->sack_sb.lost_bytes &&
 	     default_tc->sack_sb.high_sacked == bt_tc->sack_sb.high_sacked &&
 	     default_tc->sack_sb.reorder == bt_tc->sack_sb.reorder &&
-	     default_tc->sack_sb.is_reneging == bt_tc->sack_sb.is_reneging &&
-	     default_rs.last_sacked_bytes == bt_rs.last_sacked_bytes &&
-	     default_rs.last_bytes_delivered == bt_rs.last_bytes_delivered &&
-	     default_rs.rxt_sacked == bt_rs.rxt_sacked && default_rs.last_lost == bt_rs.last_lost &&
+	     tcp_scoreboard_is_reneging (&default_tc->sack_sb) ==
+	       tcp_scoreboard_is_reneging (&bt_tc->sack_sb) &&
+	     default_ac.last_sacked_bytes == bt_ac.last_sacked_bytes &&
+	     default_ac.last_bytes_delivered == bt_ac.last_bytes_delivered &&
+	     default_ac.rxt_sacked == bt_ac.rxt_sacked && default_ac.last_lost == bt_ac.last_lost &&
 	     tcp_bt_is_sane (bt_tc->bt) && bt_tc->sack_sb.head == TCP_INVALID_SACK_HOLE_INDEX;
       TCP_TEST (same,
 		"random BT scoreboard trace matches default at step %u "
@@ -5859,8 +5979,8 @@ tcp_test_bt_scoreboard_random (u32 base, u32 seed, tcp_test_bt_sb_mode_t mode)
 		i, base, mode, default_tc->sack_sb.sacked_bytes, bt_tc->sack_sb.sacked_bytes,
 		default_tc->sack_sb.lost_bytes, bt_tc->sack_sb.lost_bytes,
 		default_tc->sack_sb.high_sacked, bt_tc->sack_sb.high_sacked,
-		default_tc->sack_sb.reorder, bt_tc->sack_sb.reorder, default_rs.rxt_sacked,
-		bt_rs.rxt_sacked, default_rs.last_lost, bt_rs.last_lost);
+		default_tc->sack_sb.reorder, bt_tc->sack_sb.reorder, default_ac.rxt_sacked,
+		bt_ac.rxt_sacked, default_ac.last_lost, bt_ac.last_lost);
 
       /* Rescue is only valid after SACK processing has established an
        * outstanding range from which the rescue retransmit was selected. */
@@ -5886,7 +6006,7 @@ static int
 tcp_test_bt_reorder (void)
 {
   tcp_connection_t _tc = {}, *tc = &_tc;
-  tcp_rate_sample_t rs = {};
+  tcp_ack_ctx_t ac = {};
   sack_block_t block;
 
   tc->snd_mss = 100;
@@ -5907,12 +6027,12 @@ tcp_test_bt_reorder (void)
   block = (sack_block_t) { .start = 2400, .end = 3000 };
   vec_add1 (tc->rcv_opts.sacks, block);
   tc->rcv_opts.n_sack_blocks = 1;
-  tcp_test_rcv_sacks (tc, 0, &rs);
+  tcp_test_rcv_sacks (tc, 0, &ac);
 
   vec_reset_length (tc->rcv_opts.sacks);
   block = (sack_block_t) { .start = 300, .end = 400 };
   vec_add1 (tc->rcv_opts.sacks, block);
-  tcp_test_rcv_sacks (tc, 0, &rs);
+  tcp_test_rcv_sacks (tc, 0, &ac);
   TCP_TEST (tc->sack_sb.reorder == TCP_DUPACK_THRESHOLD,
 	    "BT old retransmit does not grow reorder above floor: %u", tc->sack_sb.reorder);
   TCP_TEST (tcp_bt_is_sane (tc->bt), "BT remains sane after old retransmit sack");
@@ -5932,7 +6052,7 @@ tcp_test_bt_reorder (void)
   block = (sack_block_t) { .start = 2400, .end = 3000 };
   vec_add1 (tc->rcv_opts.sacks, block);
   tc->rcv_opts.n_sack_blocks = 1;
-  tcp_test_rcv_sacks (tc, 0, &rs);
+  tcp_test_rcv_sacks (tc, 0, &ac);
 
   /* Rescue retransmits the highest outstanding range without advancing
    * HighRxt. It must not suppress learning from unrelated original data. */
@@ -5941,7 +6061,7 @@ tcp_test_bt_reorder (void)
   vec_reset_length (tc->rcv_opts.sacks);
   block = (sack_block_t) { .start = 300, .end = 400 };
   vec_add1 (tc->rcv_opts.sacks, block);
-  tcp_test_rcv_sacks (tc, 0, &rs);
+  tcp_test_rcv_sacks (tc, 0, &ac);
   TCP_TEST (tc->sack_sb.reorder == 27, "BT original data grows reorder after rescue: %u",
 	    tc->sack_sb.reorder);
 
@@ -5951,7 +6071,7 @@ tcp_test_bt_reorder (void)
   vec_reset_length (tc->rcv_opts.sacks);
   block = (sack_block_t) { .start = 2300, .end = 2400 };
   vec_add1 (tc->rcv_opts.sacks, block);
-  tcp_test_rcv_sacks (tc, 0, &rs);
+  tcp_test_rcv_sacks (tc, 0, &ac);
   TCP_TEST (tc->sack_sb.reorder == TCP_DUPACK_THRESHOLD,
 	    "BT rescue retransmit does not grow reorder above floor: %u", tc->sack_sb.reorder);
   TCP_TEST (tcp_bt_is_sane (tc->bt), "BT remains sane after rescue reorder checks");
@@ -5966,7 +6086,7 @@ tcp_test_bt_retransmit_ranges (void)
 {
   tcp_connection_t _default_tc = {}, _bt_tc = {};
   tcp_connection_t *default_tc = &_default_tc, *bt_tc = &_bt_tc;
-  tcp_rate_sample_t default_rs = {}, bt_rs = {};
+  tcp_ack_ctx_t default_ac = {}, bt_ac = {};
   sack_scoreboard_hole_t *hole;
   tcp_rxt_range_t range;
   sack_block_t blocks[] = {
@@ -5994,8 +6114,8 @@ tcp_test_bt_retransmit_ranges (void)
     }
   default_tc->rcv_opts.n_sack_blocks = ARRAY_LEN (blocks);
   bt_tc->rcv_opts.n_sack_blocks = ARRAY_LEN (blocks);
-  tcp_rcv_sacks (default_tc, 0, &default_rs);
-  tcp_rcv_sacks (bt_tc, 0, &bt_rs);
+  tcp_test_ack_handle_feedback (default_tc, 0, &default_ac);
+  tcp_test_ack_handle_feedback (bt_tc, 0, &bt_ac);
   tcp_sack_init_rxt (default_tc, 0);
   tcp_sack_init_rxt (bt_tc, 0);
   hole = scoreboard_get_hole (&default_tc->sack_sb, default_tc->sack_sb.cur_rxt_hole);
@@ -6040,12 +6160,12 @@ tcp_test_bt_retransmit_ranges (void)
   vec_add1 (bt_tc->rcv_opts.sacks, blocks[0]);
   default_tc->rcv_opts.n_sack_blocks = 1;
   bt_tc->rcv_opts.n_sack_blocks = 1;
-  clib_memset (&default_rs, 0, sizeof (default_rs));
-  clib_memset (&bt_rs, 0, sizeof (bt_rs));
-  tcp_rcv_sacks (default_tc, 100, &default_rs);
-  tcp_rcv_sacks (bt_tc, 100, &bt_rs);
-  TCP_TEST (default_rs.rxt_sacked == bt_rs.rxt_sacked && bt_rs.rxt_sacked == 200,
-	    "BT retransmission delivery accounting matches default: %u", bt_rs.rxt_sacked);
+  clib_memset (&default_ac, 0, sizeof (default_ac));
+  clib_memset (&bt_ac, 0, sizeof (bt_ac));
+  tcp_test_ack_handle_feedback (default_tc, 100, &default_ac);
+  tcp_test_ack_handle_feedback (bt_tc, 100, &bt_ac);
+  TCP_TEST (default_ac.rxt_sacked == bt_ac.rxt_sacked && bt_ac.rxt_sacked == 200,
+	    "BT retransmission delivery accounting matches default: %u", bt_ac.rxt_sacked);
   TCP_TEST (default_tc->sack_sb.sacked_bytes == bt_tc->sack_sb.sacked_bytes &&
 	      default_tc->sack_sb.lost_bytes == bt_tc->sack_sb.lost_bytes,
 	    "BT recovery ACK/SACK aggregates match default");
@@ -6065,7 +6185,7 @@ static int
 tcp_test_bt_cumulative_ack (void)
 {
   tcp_connection_t _tc = {}, *tc = &_tc;
-  tcp_rate_sample_t rs = {};
+  tcp_ack_ctx_t ac = {};
   tcp_bt_sample_t *head;
 
   tc->snd_mss = 100;
@@ -6075,21 +6195,18 @@ tcp_test_bt_cumulative_ack (void)
   tcp_bt_track_tx (tc, 300);
   tc->snd_nxt = 300;
 
-  /* A clean cumulative ACK has no SACK block and therefore bypasses the
-   * generic SACK preparation path. Delivery sampling must retire its prefix
-   * and advance the byte tracker's scoreboard boundaries. */
-  tcp_test_rcv_sacks (tc, 100, &rs);
-  TCP_TEST (!(rs.ack_flags & TCP_ACK_F_BT_PROCESSED),
-	    "clean BT cumulative ACK is deferred to delivery sampling");
-  TCP_TEST (pool_elts (tc->bt->samples) == 1,
-	    "SACK preparation leaves a clean BT cumulative ACK untouched");
-  rs.bytes_acked = 100;
+  /* A clean cumulative ACK retires its tracker prefix and finalizes delivery
+   * in the same feedback pass. */
+  tcp_test_rcv_sacks (tc, 100, &ac);
+  head = pool_elt_at_index (tc->bt->samples, tc->bt->head);
+  TCP_TEST (pool_elts (tc->bt->samples) == 1 && head->min_seq == 100,
+	    "feedback pass retires the clean cumulative ACK once");
+  TCP_TEST (tc->delivered == 100, "feedback pass finalizes cumulative delivery");
   tc->snd_una = 100;
-  tcp_bt_sample_delivery_rate (tc, &rs);
 
   head = pool_elt_at_index (tc->bt->samples, tc->bt->head);
   TCP_TEST (head->min_seq == 100 && tc->delivered == 100,
-	    "BT delivery sampling retires a clean cumulative ACK");
+	    "committing snd_una does not revisit a clean cumulative ACK");
   TCP_TEST (tc->sack_sb.high_sacked == 100 && tc->bt->sack_loss_high == 100,
 	    "clean cumulative ACK advances BT scoreboard boundaries");
 
@@ -6102,17 +6219,15 @@ tcp_test_bt_cumulative_ack (void)
   tcp_bt_track_rxt (tc, 100, 200);
   tc->sack_sb.high_rxt = 200;
 
-  tcp_test_rcv_sacks (tc, 200, &rs);
-  TCP_TEST (!(rs.ack_flags & TCP_ACK_F_BT_PROCESSED),
-	    "recovery cumulative ACK is deferred to one accounted tracker walk");
-  rs.bytes_acked = 100;
+  tcp_test_rcv_sacks (tc, 200, &ac);
+  TCP_TEST (tc->sack_sb.lost_bytes == 100 && ac.rxt_sacked == 100,
+	    "feedback pass accounts the recovery cumulative ACK once");
   tc->snd_una = 200;
-  tcp_bt_sample_delivery_rate (tc, &rs);
 
   TCP_TEST (tc->sack_sb.lost_bytes == 100,
 	    "BT cumulative ACK retires lost bytes during recovery: %u", tc->sack_sb.lost_bytes);
-  TCP_TEST (rs.rxt_sacked == 100, "BT cumulative ACK accounts retransmitted delivery: %u",
-	    rs.rxt_sacked);
+  TCP_TEST (ac.rxt_sacked == 100, "BT cumulative ACK accounts retransmitted delivery: %u",
+	    ac.rxt_sacked);
   TCP_TEST (tc->sack_sb.high_sacked == 200 && tc->bt->sack_loss_high == 200,
 	    "recovery cumulative ACK advances BT scoreboard boundaries");
   TCP_TEST (tcp_bt_is_sane (tc->bt) && tcp_bt_is_sane_post_recovery (tc),
@@ -6129,7 +6244,7 @@ static int
 tcp_test_bt_reneging_delivery (void)
 {
   tcp_connection_t _tc = {}, *tc = &_tc;
-  tcp_rate_sample_t rs = {};
+  tcp_ack_ctx_t ac = {};
   tcp_bt_sample_t *bts;
   sack_block_t block;
 
@@ -6143,9 +6258,8 @@ tcp_test_bt_reneging_delivery (void)
   block = (sack_block_t) { .start = 100, .end = 200 };
   vec_add1 (tc->rcv_opts.sacks, block);
   tc->rcv_opts.n_sack_blocks = 1;
-  tcp_test_rcv_sacks (tc, 0, &rs);
-  TCP_TEST (rs.ack_flags & TCP_ACK_F_BT_PROCESSED, "BT SACK processing records its tracker walk");
-  tcp_bt_sample_delivery_rate (tc, &rs);
+  tcp_test_rcv_sacks (tc, 0, &ac);
+  TCP_TEST (ac.last_sacked_bytes == 100, "BT SACK feedback is finalized once");
   TCP_TEST (tc->delivered == 100, "BT credits the initial SACK once: %u", tc->delivered);
 
   /* Cumulative ACK of the prefix leaves the formerly SACKed range at the
@@ -6153,13 +6267,12 @@ tcp_test_bt_reneging_delivery (void)
   vec_reset_length (tc->rcv_opts.sacks);
   tc->rcv_opts.flags &= ~TCP_OPTS_FLAG_SACK;
   tc->rcv_opts.n_sack_blocks = 0;
-  tcp_test_rcv_sacks (tc, 100, &rs);
-  TCP_TEST (rs.ack_flags & TCP_ACK_F_BT_PROCESSED,
-	    "BT cumulative ACK after SACK history records its tracker walk");
-  rs.bytes_acked = 100;
+  tcp_test_rcv_sacks (tc, 100, &ac);
+  TCP_TEST (tcp_scoreboard_is_reneging (&tc->sack_sb),
+	    "BT cumulative ACK resolves reneging before delivery finalization");
   tc->snd_una = 100;
-  tcp_bt_sample_delivery_rate (tc, &rs);
-  TCP_TEST (tc->sack_sb.is_reneging, "BT detects SACK reneging at the tracker head");
+  TCP_TEST (tcp_scoreboard_is_reneging (&tc->sack_sb),
+	    "BT detects SACK reneging at the tracker head");
   TCP_TEST (tc->delivered == 200, "BT credits only the new cumulative ACK: %u", tc->delivered);
 
   TCP_TEST (tcp_sack_handle_reneging (tc), "BT handles the pending SACK reneging");
@@ -6171,17 +6284,15 @@ tcp_test_bt_reneging_delivery (void)
 
   tcp_bt_track_rxt (tc, 100, 200);
   tc->sack_sb.high_rxt = 200;
-  tcp_test_rcv_sacks (tc, 200, &rs);
-  rs.bytes_acked = 100;
+  tcp_test_rcv_sacks (tc, 200, &ac);
   tc->snd_una = 200;
-  tcp_bt_sample_delivery_rate (tc, &rs);
 
-  TCP_TEST (rs.last_bytes_delivered == 100,
-	    "reneged range is recognized as previously delivered: %u", rs.last_bytes_delivered);
-  TCP_TEST (tc->delivered == 200 && rs.acked_and_sacked == 0,
+  TCP_TEST (ac.last_bytes_delivered == 100,
+	    "reneged range is recognized as previously delivered: %u", ac.last_bytes_delivered);
+  TCP_TEST (tc->delivered == 200 && ac.acked_and_sacked == 0,
 	    "reneged range is not credited twice: delivered %u acked-and-sacked %u", tc->delivered,
-	    rs.acked_and_sacked);
-  TCP_TEST (rs.prior_delivered == 0 && tcp_bt_is_sane (tc->bt),
+	    ac.acked_and_sacked);
+  TCP_TEST (ac.prior_delivered == 0 && tcp_bt_is_sane (tc->bt),
 	    "reneged range does not create an unanchored rate sample");
 
   vec_free (tc->rcv_opts.sacks);
@@ -6200,31 +6311,27 @@ tcp_test_bt_reneging_delivery (void)
   block = (sack_block_t) { .start = 100, .end = 200 };
   vec_add1 (tc->rcv_opts.sacks, block);
   tc->rcv_opts.n_sack_blocks = 1;
-  tcp_test_rcv_sacks (tc, 0, &rs);
-  tcp_bt_sample_delivery_rate (tc, &rs);
+  tcp_test_rcv_sacks (tc, 0, &ac);
 
   vec_reset_length (tc->rcv_opts.sacks);
   tc->rcv_opts.flags &= ~TCP_OPTS_FLAG_SACK;
   tc->rcv_opts.n_sack_blocks = 0;
-  tcp_test_rcv_sacks (tc, 100, &rs);
-  rs.bytes_acked = 100;
+  tcp_test_rcv_sacks (tc, 100, &ac);
   tc->snd_una = 100;
-  tcp_bt_sample_delivery_rate (tc, &rs);
   TCP_TEST (tcp_sack_handle_reneging (tc), "BT handles reneging before re-SACK");
 
   block = (sack_block_t) { .start = 150, .end = 200 };
   vec_add1 (tc->rcv_opts.sacks, block);
   tc->rcv_opts.flags |= TCP_OPTS_FLAG_SACK;
   tc->rcv_opts.n_sack_blocks = 1;
-  tcp_test_rcv_sacks (tc, 100, &rs);
-  tcp_bt_sample_delivery_rate (tc, &rs);
+  tcp_test_rcv_sacks (tc, 100, &ac);
 
-  TCP_TEST (rs.last_sacked_bytes == 50 && rs.last_bytes_delivered == 50,
-	    "re-SACK identifies 50 previously delivered bytes: %u/%u", rs.last_sacked_bytes,
-	    rs.last_bytes_delivered);
-  TCP_TEST (tc->delivered == 200 && rs.acked_and_sacked == 0,
+  TCP_TEST (ac.last_sacked_bytes == 50 && ac.last_bytes_delivered == 50,
+	    "re-SACK identifies 50 previously delivered bytes: %u/%u", ac.last_sacked_bytes,
+	    ac.last_bytes_delivered);
+  TCP_TEST (tc->delivered == 200 && ac.acked_and_sacked == 0,
 	    "re-SACK does not credit delivery twice: delivered %u acked-and-sacked %u",
-	    tc->delivered, rs.acked_and_sacked);
+	    tc->delivered, ac.acked_and_sacked);
   TCP_TEST (tc->sack_sb.sacked_bytes == 50 && tcp_bt_is_sane_post_recovery (tc),
 	    "re-SACK restores current SACK state without aggregate drift");
 
@@ -6239,7 +6346,7 @@ static int
 tcp_test_bt_repeat_sack (void)
 {
   tcp_connection_t _tc = {}, *tc = &_tc;
-  tcp_rate_sample_t rs = {};
+  tcp_ack_ctx_t ac = {};
   sack_block_t block;
   u32 i, n_samples;
 
@@ -6253,22 +6360,22 @@ tcp_test_bt_repeat_sack (void)
   block = (sack_block_t) { .start = 100, .end = 900 };
   vec_add1 (tc->rcv_opts.sacks, block);
   tc->rcv_opts.n_sack_blocks = 1;
-  tcp_test_rcv_sacks (tc, 0, &rs);
+  tcp_test_rcv_sacks (tc, 0, &ac);
 
   n_samples = pool_elts (tc->bt->samples);
-  TCP_TEST (rs.last_sacked_bytes == 800 && tc->sack_sb.sacked_bytes == 800,
-	    "initial SACK accounts 800 bytes: %u/%u", rs.last_sacked_bytes,
+  TCP_TEST (ac.last_sacked_bytes == 800 && tc->sack_sb.sacked_bytes == 800,
+	    "initial SACK accounts 800 bytes: %u/%u", ac.last_sacked_bytes,
 	    tc->sack_sb.sacked_bytes);
   TCP_TEST (n_samples == 3, "initial SACK creates three ranges: %u", n_samples);
 
   for (i = 2; i < 9; i++)
     {
       tc->rcv_opts.sacks[0].start = i * 100;
-      tcp_test_rcv_sacks (tc, 0, &rs);
+      tcp_test_rcv_sacks (tc, 0, &ac);
 
-      TCP_TEST (rs.last_sacked_bytes == 0 && rs.last_lost == 0,
-		"repeat SACK has no accounting delta at step %u: %u/%u", i, rs.last_sacked_bytes,
-		rs.last_lost);
+      TCP_TEST (ac.last_sacked_bytes == 0 && ac.last_lost == 0,
+		"repeat SACK has no accounting delta at step %u: %u/%u", i, ac.last_sacked_bytes,
+		ac.last_lost);
       TCP_TEST (pool_elts (tc->bt->samples) == n_samples,
 		"repeat SACK does not fragment samples at step %u: %u", i,
 		pool_elts (tc->bt->samples));
@@ -6276,9 +6383,9 @@ tcp_test_bt_repeat_sack (void)
 
   /* Skipping the already SACKed prefix must still find new coverage after it. */
   tc->rcv_opts.sacks[0] = (sack_block_t) { .start = 200, .end = 950 };
-  tcp_test_rcv_sacks (tc, 0, &rs);
-  TCP_TEST (rs.last_sacked_bytes == 50 && tc->sack_sb.sacked_bytes == 850,
-	    "overlap accounts only its new suffix: %u/%u", rs.last_sacked_bytes,
+  tcp_test_rcv_sacks (tc, 0, &ac);
+  TCP_TEST (ac.last_sacked_bytes == 50 && tc->sack_sb.sacked_bytes == 850,
+	    "overlap accounts only its new suffix: %u/%u", ac.last_sacked_bytes,
 	    tc->sack_sb.sacked_bytes);
   TCP_TEST (pool_elts (tc->bt->samples) == n_samples && tcp_bt_is_sane (tc->bt) &&
 	      tcp_bt_is_sane_post_recovery (tc),
@@ -6296,7 +6403,7 @@ static int
 tcp_test_bt_sack_bridge (void)
 {
   tcp_connection_t _tc = {}, *tc = &_tc;
-  tcp_rate_sample_t rs = {};
+  tcp_ack_ctx_t ac = {};
   tcp_bt_sample_t *bts;
   sack_block_t block;
 
@@ -6310,15 +6417,15 @@ tcp_test_bt_sack_bridge (void)
   block = (sack_block_t) { .start = 100, .end = 200 };
   vec_add1 (tc->rcv_opts.sacks, block);
   tc->rcv_opts.n_sack_blocks = 1;
-  tcp_test_rcv_sacks (tc, 0, &rs);
+  tcp_test_rcv_sacks (tc, 0, &ac);
 
   tc->rcv_opts.sacks[0] = (sack_block_t) { .start = 300, .end = 400 };
-  tcp_test_rcv_sacks (tc, 0, &rs);
+  tcp_test_rcv_sacks (tc, 0, &ac);
   TCP_TEST (pool_elts (tc->bt->samples) == 4,
 	    "separate SACK islands retain the intervening sample: %u", pool_elts (tc->bt->samples));
 
   tc->rcv_opts.sacks[0] = (sack_block_t) { .start = 200, .end = 300 };
-  tcp_test_rcv_sacks (tc, 50, &rs);
+  tcp_test_rcv_sacks (tc, 50, &ac);
 
   bts = pool_elt_at_index (tc->bt->samples, tc->bt->head);
   bts = pool_elt_at_index (tc->bt->samples, bts->next);
@@ -6341,7 +6448,7 @@ static int
 tcp_test_bt_incremental_sack_loss (void)
 {
   tcp_connection_t _tc = {}, *tc = &_tc;
-  tcp_rate_sample_t rs = {};
+  tcp_ack_ctx_t ac = {};
   sack_block_t block;
   u32 i;
 
@@ -6359,41 +6466,41 @@ tcp_test_bt_incremental_sack_loss (void)
   block = (sack_block_t) { .start = 700, .end = 800 };
   vec_add1 (tc->rcv_opts.sacks, block);
   tc->rcv_opts.n_sack_blocks = 1;
-  tcp_test_rcv_sacks (tc, 0, &rs);
+  tcp_test_rcv_sacks (tc, 0, &ac);
   TCP_TEST (tc->sack_sb.lost_bytes == 0 && tc->bt->sack_loss_high == 0,
 	    "one SACK block does not advance loss boundary: %u/%u", tc->sack_sb.lost_bytes,
 	    tc->bt->sack_loss_high);
 
   tc->rcv_opts.sacks[0] = (sack_block_t) { .start = 500, .end = 600 };
-  tcp_test_rcv_sacks (tc, 0, &rs);
+  tcp_test_rcv_sacks (tc, 0, &ac);
   TCP_TEST (tc->sack_sb.lost_bytes == 0 && tc->bt->sack_loss_high == 0,
 	    "two SACK blocks do not advance loss boundary: %u/%u", tc->sack_sb.lost_bytes,
 	    tc->bt->sack_loss_high);
 
   tc->rcv_opts.sacks[0] = (sack_block_t) { .start = 900, .end = 1000 };
-  tcp_test_rcv_sacks (tc, 0, &rs);
-  TCP_TEST (rs.last_lost == 500 && tc->sack_sb.lost_bytes == 500 && tc->bt->sack_loss_high == 500,
-	    "third SACK block marks initial loss prefix: %u/%u/%u", rs.last_lost,
+  tcp_test_rcv_sacks (tc, 0, &ac);
+  TCP_TEST (ac.last_lost == 500 && ac.lost == 500 && tc->lost == 500 &&
+	      tc->sack_sb.lost_bytes == 500 && tc->bt->sack_loss_high == 500,
+	    "third SACK block marks initial loss prefix: %u/%u/%u/%u", ac.last_lost, ac.lost,
 	    tc->sack_sb.lost_bytes, tc->bt->sack_loss_high);
 
   vec_reset_length (tc->rcv_opts.sacks);
   block = (sack_block_t) { .start = 800, .end = 900 };
   vec_add1 (tc->rcv_opts.sacks, block);
   tc->rcv_opts.n_sack_blocks = 1;
-  tcp_test_rcv_sacks (tc, 0, &rs);
-  TCP_TEST (rs.last_lost == 100 && tc->sack_sb.lost_bytes == 600 && tc->bt->sack_loss_high == 700,
+  tcp_test_rcv_sacks (tc, 0, &ac);
+  TCP_TEST (ac.last_lost == 100 && ac.lost == 600 && tc->lost == 600 &&
+	      tc->sack_sb.lost_bytes == 600 && tc->bt->sack_loss_high == 700,
 	    "new SACK marks only newly exposed loss interval: lost %u/%u high %u "
 	    "sacked %u/%u scoreboard-high %u reorder %u",
-	    rs.last_lost, tc->sack_sb.lost_bytes, tc->bt->sack_loss_high, rs.last_sacked_bytes,
+	    ac.last_lost, tc->sack_sb.lost_bytes, tc->bt->sack_loss_high, ac.last_sacked_bytes,
 	    tc->sack_sb.sacked_bytes, tc->sack_sb.high_sacked, tc->sack_sb.reorder);
 
   vec_reset_length (tc->rcv_opts.sacks);
   tc->rcv_opts.flags &= ~TCP_OPTS_FLAG_SACK;
   tc->rcv_opts.n_sack_blocks = 0;
-  tcp_test_rcv_sacks (tc, 800, &rs);
-  rs.bytes_acked = 800;
+  tcp_test_rcv_sacks (tc, 800, &ac);
   tc->snd_una = 800;
-  tcp_bt_sample_delivery_rate (tc, &rs);
   TCP_TEST (tc->sack_sb.lost_bytes == 0 && tc->sack_sb.sacked_bytes == 200 &&
 	      tc->bt->sack_loss_high == 800,
 	    "cumulative ACK retires aggregates and advances loss boundary: %u/%u/%u",
@@ -6419,7 +6526,7 @@ tcp_test_bt_incremental_sack_loss (void)
   block = (sack_block_t) { .start = 300, .end = 400 };
   vec_add1 (tc->rcv_opts.sacks, block);
   tc->rcv_opts.n_sack_blocks = 1;
-  tcp_test_rcv_sacks (tc, 0, &rs);
+  tcp_test_rcv_sacks (tc, 0, &ac);
   tcp_bt_rxt_mark_lost (tc);
   TCP_TEST (tc->sack_sb.lost_bytes == 300 && tc->bt->sack_loss_high == 0,
 	    "RTO loss does not advance SACK boundary: %u/%u", tc->sack_sb.lost_bytes,
@@ -6431,7 +6538,7 @@ tcp_test_bt_incremental_sack_loss (void)
 	    tc->bt->sack_loss_high);
 
   tc->rcv_opts.sacks[0] = (sack_block_t) { .start = 400, .end = 600 };
-  tcp_test_rcv_sacks (tc, 0, &rs);
+  tcp_test_rcv_sacks (tc, 0, &ac);
   TCP_TEST (tc->sack_sb.lost_bytes == 300 && tc->bt->sack_loss_high == 300,
 	    "new evidence establishes SACK loss boundary: %u/%u", tc->sack_sb.lost_bytes,
 	    tc->bt->sack_loss_high);
@@ -6453,7 +6560,7 @@ static int
 tcp_test_bt_retransmit_range_cache (void)
 {
   tcp_connection_t _tc = {}, *tc = &_tc;
-  tcp_rate_sample_t rs = {};
+  tcp_ack_ctx_t ac = {};
   tcp_rxt_range_t range;
   sack_block_t block;
   u8 can_rescue = 0, snd_limited = 0;
@@ -6482,10 +6589,8 @@ tcp_test_bt_retransmit_range_cache (void)
   /* Model one partial retransmission and an ACK below HighRxt. There is no SACK
    * state to recompute, so the ACK-only fast path keeps the range-end cache. */
   tc->sack_sb.high_rxt = 50;
-  tcp_test_rcv_sacks (tc, 25, &rs);
-  rs.bytes_acked = 25;
+  tcp_test_rcv_sacks (tc, 25, &ac);
   tc->snd_una = 25;
-  tcp_bt_sample_delivery_rate (tc, &rs);
   TCP_TEST (tc->bt->cur_rxt != TCP_BTS_INVALID_INDEX && tc->bt->cur_rxt_end == 400,
 	    "clean ACK preserves the active retransmit range cache");
   TCP_TEST (tc->sack_sb.lost_bytes == 375 && tcp_bt_is_sane_post_recovery (tc),
@@ -6498,7 +6603,7 @@ tcp_test_bt_retransmit_range_cache (void)
   vec_add1 (tc->rcv_opts.sacks, block);
   tc->rcv_opts.flags |= TCP_OPTS_FLAG_SACK;
   tc->rcv_opts.n_sack_blocks = 1;
-  tcp_test_rcv_sacks (tc, 25, &rs);
+  tcp_test_rcv_sacks (tc, 25, &ac);
   TCP_TEST (tc->bt->cur_rxt_end == tc->sack_sb.high_rxt,
 	    "new SACK invalidates the retransmit range cache");
 
@@ -6523,7 +6628,7 @@ tcp_test_bt_retransmit_range_cache_skip_sacked (void)
 {
   tcp_connection_t _default_tc = {}, _bt_tc = {};
   tcp_connection_t *default_tc = &_default_tc, *bt_tc = &_bt_tc;
-  tcp_rate_sample_t default_rs = {}, bt_rs = {};
+  tcp_ack_ctx_t default_ac = {}, bt_ac = {};
   sack_scoreboard_hole_t *hole;
   tcp_rxt_range_t range;
   sack_block_t blocks[] = {
@@ -6549,8 +6654,8 @@ tcp_test_bt_retransmit_range_cache_skip_sacked (void)
       vec_add1 (bt_tc->rcv_opts.sacks, blocks[i]);
     }
   default_tc->rcv_opts.n_sack_blocks = bt_tc->rcv_opts.n_sack_blocks = ARRAY_LEN (blocks);
-  tcp_rcv_sacks (default_tc, 0, &default_rs);
-  tcp_rcv_sacks (bt_tc, 0, &bt_rs);
+  tcp_test_ack_handle_feedback (default_tc, 0, &default_ac);
+  tcp_test_ack_handle_feedback (bt_tc, 0, &bt_ac);
 
   default_tc->flags = bt_tc->flags = TCP_CONN_FAST_RECOVERY | TCP_CONN_RECOVERY;
   default_tc->snd_congestion = bt_tc->snd_congestion = 1000;
@@ -6695,7 +6800,7 @@ tcp_test_bt_rxt_over_sacked (void)
 {
   tcp_connection_t _default_tc = {}, _bt_tc = {};
   tcp_connection_t *default_tc = &_default_tc, *bt_tc = &_bt_tc;
-  tcp_rate_sample_t default_rs, bt_rs;
+  tcp_ack_ctx_t default_ac, bt_ac;
   sack_block_t block;
 
   default_tc->snd_mss = bt_tc->snd_mss = 100;
@@ -6715,8 +6820,8 @@ tcp_test_bt_rxt_over_sacked (void)
   vec_add1 (default_tc->rcv_opts.sacks, block);
   vec_add1 (bt_tc->rcv_opts.sacks, block);
   default_tc->rcv_opts.n_sack_blocks = bt_tc->rcv_opts.n_sack_blocks = 1;
-  tcp_test_rcv_sacks (default_tc, 0, &default_rs);
-  tcp_test_rcv_sacks (bt_tc, 0, &bt_rs);
+  tcp_test_rcv_sacks (default_tc, 0, &default_ac);
+  tcp_test_rcv_sacks (bt_tc, 0, &bt_ac);
 
   TCP_TEST (bt_tc->sack_sb.sacked_bytes == default_tc->sack_sb.sacked_bytes &&
 	      bt_tc->sack_sb.sacked_bytes == 150,
@@ -6763,8 +6868,8 @@ tcp_test_bt_rxt_over_sacked (void)
   vec_add1 (default_tc->rcv_opts.sacks, block);
   vec_add1 (bt_tc->rcv_opts.sacks, block);
   default_tc->rcv_opts.n_sack_blocks = bt_tc->rcv_opts.n_sack_blocks = 1;
-  tcp_test_rcv_sacks (default_tc, 0, &default_rs);
-  tcp_test_rcv_sacks (bt_tc, 0, &bt_rs);
+  tcp_test_rcv_sacks (default_tc, 0, &default_ac);
+  tcp_test_rcv_sacks (bt_tc, 0, &bt_ac);
 
   TCP_TEST (bt_tc->sack_sb.sacked_bytes == default_tc->sack_sb.sacked_bytes &&
 	      bt_tc->sack_sb.sacked_bytes == 250,
@@ -6772,8 +6877,8 @@ tcp_test_bt_rxt_over_sacked (void)
   TCP_TEST (bt_tc->sack_sb.lost_bytes == default_tc->sack_sb.lost_bytes &&
 	      bt_tc->sack_sb.lost_bytes == 50,
 	    "BT lost bytes match default on next ack: %u", bt_tc->sack_sb.lost_bytes);
-  TCP_TEST (bt_rs.last_sacked_bytes == default_rs.last_sacked_bytes &&
-	      bt_rs.last_lost == default_rs.last_lost,
+  TCP_TEST (bt_ac.last_sacked_bytes == default_ac.last_sacked_bytes &&
+	      bt_ac.last_lost == default_ac.last_lost,
 	    "BT per-ack deltas match default on next ack");
   TCP_TEST (tcp_bt_is_sane_post_recovery (bt_tc), "BT aggregates match samples on next ack");
 
@@ -6791,7 +6896,7 @@ static int
 tcp_test_bt_rxt_merge_over_sacked (void)
 {
   tcp_connection_t _tc = {}, *tc = &_tc;
-  tcp_rate_sample_t rs;
+  tcp_ack_ctx_t ac;
   sack_block_t block;
 
   tc->snd_mss = 100;
@@ -6804,7 +6909,7 @@ tcp_test_bt_rxt_merge_over_sacked (void)
   block = (sack_block_t) { .start = 200, .end = 300 };
   vec_add1 (tc->rcv_opts.sacks, block);
   tc->rcv_opts.n_sack_blocks = 1;
-  tcp_test_rcv_sacks (tc, 0, &rs);
+  tcp_test_rcv_sacks (tc, 0, &ac);
   TCP_TEST (tc->sack_sb.sacked_bytes == 100, "sacked bytes are %u", tc->sack_sb.sacked_bytes);
 
   tc->flags = TCP_CONN_FAST_RECOVERY | TCP_CONN_RECOVERY;
@@ -6900,7 +7005,7 @@ tcp_test_bt_rxt_across_sacked_island (void)
 {
   tcp_connection_t _default_tc = {}, _bt_tc = {};
   tcp_connection_t *default_tc = &_default_tc, *bt_tc = &_bt_tc;
-  tcp_rate_sample_t default_rs, bt_rs;
+  tcp_ack_ctx_t default_ac, bt_ac;
   tcp_bt_sample_t *bts;
   sack_block_t block;
 
@@ -6918,8 +7023,8 @@ tcp_test_bt_rxt_across_sacked_island (void)
   vec_add1 (default_tc->rcv_opts.sacks, block);
   vec_add1 (bt_tc->rcv_opts.sacks, block);
   default_tc->rcv_opts.n_sack_blocks = bt_tc->rcv_opts.n_sack_blocks = 1;
-  tcp_test_rcv_sacks (default_tc, 0, &default_rs);
-  tcp_test_rcv_sacks (bt_tc, 0, &bt_rs);
+  tcp_test_rcv_sacks (default_tc, 0, &default_ac);
+  tcp_test_rcv_sacks (bt_tc, 0, &bt_ac);
 
   default_tc->flags = bt_tc->flags = TCP_CONN_FAST_RECOVERY | TCP_CONN_RECOVERY;
   default_tc->snd_congestion = bt_tc->snd_congestion = 200;
@@ -6948,12 +7053,12 @@ tcp_test_bt_rxt_across_sacked_island (void)
   vec_add1 (default_tc->rcv_opts.sacks, block);
   vec_add1 (bt_tc->rcv_opts.sacks, block);
   default_tc->rcv_opts.n_sack_blocks = bt_tc->rcv_opts.n_sack_blocks = 1;
-  tcp_test_rcv_sacks (default_tc, 0, &default_rs);
-  tcp_test_rcv_sacks (bt_tc, 0, &bt_rs);
+  tcp_test_rcv_sacks (default_tc, 0, &default_ac);
+  tcp_test_rcv_sacks (bt_tc, 0, &bt_ac);
 
-  TCP_TEST (bt_rs.rxt_sacked == default_rs.rxt_sacked && bt_rs.rxt_sacked == 40,
-	    "BT counts retransmitted suffix delivery: %u", bt_rs.rxt_sacked);
-  TCP_TEST (bt_rs.flags & TCP_BTS_IS_RXT, "BT marks the suffix rate sample as RTT-ambiguous");
+  TCP_TEST (bt_ac.rxt_sacked == default_ac.rxt_sacked && bt_ac.rxt_sacked == 40,
+	    "BT counts retransmitted suffix delivery: %u", bt_ac.rxt_sacked);
+  TCP_TEST (bt_ac.flags & TCP_BTS_IS_RXT, "BT marks the suffix rate sample as RTT-ambiguous");
   TCP_TEST (tcp_bt_is_sane (bt_tc->bt) && tcp_bt_is_sane_post_recovery (bt_tc),
 	    "BT remains sane after SACKing retransmitted suffix");
 
@@ -7004,12 +7109,13 @@ tcp_test_bt_dsack (void)
 {
   tcp_connection_t _tc = {}, *tc = &_tc;
   tcp_bt_sample_t *bts;
-  tcp_rate_sample_t rs = {};
+  tcp_ack_ctx_t ac = {};
   sack_block_t block;
   u32 matched, samples;
 
   tc->snd_mss = 100;
   tc->snd_una = tc->snd_nxt = 1000;
+  tc->snd_wnd_max = 1000;
   tc->snd_congestion = 1600;
   tc->flags = TCP_CONN_FAST_RECOVERY | TCP_CONN_RECOVERY;
   tc->rcv_opts.flags = TCP_OPTS_FLAG_SACK_PERMITTED | TCP_OPTS_FLAG_SACK;
@@ -7025,14 +7131,24 @@ tcp_test_bt_dsack (void)
   tc->flags = TCP_CONN_FAST_RECOVERY | TCP_CONN_RECOVERY;
   tcp_dsack_recovery_init (tc);
   TCP_TEST (tc->dsack_pending_bytes == 100 && tc->dsack_history_start == 1000 &&
-	      (tc->dsack_flags & TCP_DSACK_HISTORY),
+	      (tc->sack_sb.flags & TCP_DSACK_HISTORY),
 	    "BT seeds D-SACK accounting from an active retransmission");
 
+  block = (sack_block_t) { .start = 950, .end = 1050 };
+  vec_add1 (tc->rcv_opts.sacks, block);
+  block = (sack_block_t) { .start = 900, .end = 1100 };
+  vec_add1 (tc->rcv_opts.sacks, block);
+  tc->rcv_opts.n_sack_blocks = 2;
+  tcp_test_ack_handle_feedback (tc, 900, &ac);
+  TCP_TEST (!(ac.ack_flags & TCP_ACK_F_DSACK) && tc->dsack_pending_bytes == 100 &&
+	      !(tc->sack_sb.flags & TCP_DSACK_UNDO_DISABLED) && tcp_bt_is_sane (tc->bt),
+	    "BT ignores snd_una-straddling D-SACK without changing history");
+  vec_reset_length (tc->rcv_opts.sacks);
+
   tc->rcv_opts.flags &= ~TCP_OPTS_FLAG_SACK;
-  tcp_rcv_sacks (tc, 1300, &rs);
-  rs.bytes_acked = 300;
+  clib_memset (&ac, 0, sizeof (ac));
+  tcp_test_ack_handle_feedback (tc, 1300, &ac);
   tc->snd_una = 1300;
-  tcp_bt_sample_delivery_rate (tc, &rs);
   bts = pool_elt_at_index (tc->bt->samples, tc->bt->head);
   TCP_TEST (bts->min_seq == tc->snd_una && tc->dsack_pending_bytes == 100,
 	    "BT frees ACKed samples and keeps aggregate D-SACK history");
@@ -7041,11 +7157,9 @@ tcp_test_bt_dsack (void)
   tc->snd_congestion = 1200;
   tcp_cong_recovery_off (tc);
   tc->rcv_opts.flags = TCP_OPTS_FLAG_SACK_PERMITTED;
-  clib_memset (&rs, 0, sizeof (rs));
-  tcp_rcv_sacks (tc, 1400, &rs);
-  rs.bytes_acked = 100;
+  clib_memset (&ac, 0, sizeof (ac));
+  tcp_test_ack_handle_feedback (tc, 1400, &ac);
   tc->snd_una = 1400;
-  tcp_bt_sample_delivery_rate (tc, &rs);
   TCP_TEST (tcp_dsack_has_history (tc) && tc->dsack_pending_bytes == 100,
 	    "BT retains D-SACK history across ordinary post-recovery ACKs");
 
@@ -7054,13 +7168,13 @@ tcp_test_bt_dsack (void)
   block = (sack_block_t) { .start = 1100, .end = 1200 };
   vec_add1 (tc->rcv_opts.sacks, block);
   tc->rcv_opts.n_sack_blocks = 1;
-  clib_memset (&rs, 0, sizeof (rs));
-  tcp_rcv_dsack (tc, 1200, &rs);
-  TCP_TEST (rs.ack_flags & TCP_ACK_F_DSACK, "BT recognizes D-SACK against ACKed history");
+  clib_memset (&ac, 0, sizeof (ac));
+  tcp_rcv_dsack (tc, 1200, &ac);
+  TCP_TEST (ac.ack_flags & TCP_ACK_F_DSACK, "BT recognizes D-SACK against ACKed history");
   TCP_TEST (!tc->dsack_pending_bytes, "BT accounts D-SACK evidence for ACKed samples");
-  TCP_TEST (!(tc->dsack_flags & (TCP_DSACK_INELIGIBLE | TCP_DSACK_UNDO_DISABLED)),
-	    "BT D-SACK history remains undo eligible: 0x%x", tc->dsack_flags);
-  TCP_TEST ((rs.ack_flags & (TCP_ACK_F_DSACK | TCP_ACK_F_DSACK_SPURIOUS)) ==
+  TCP_TEST (!(tc->sack_sb.flags & (TCP_DSACK_INELIGIBLE | TCP_DSACK_UNDO_DISABLED)),
+	    "BT D-SACK history remains undo eligible: 0x%x", tc->sack_sb.flags);
+  TCP_TEST ((ac.ack_flags & (TCP_ACK_F_DSACK | TCP_ACK_F_DSACK_SPURIOUS)) ==
 	      (TCP_ACK_F_DSACK | TCP_ACK_F_DSACK_SPURIOUS),
 	    "BT aggregate history proves a retransmission spurious");
 
@@ -7101,13 +7215,49 @@ tcp_test_bt_dsack (void)
   block = (sack_block_t) { .start = 1501, .end = 1600 };
   vec_add1 (tc->rcv_opts.sacks, block);
   tc->rcv_opts.n_sack_blocks = 2;
-  clib_memset (&rs, 0, sizeof (rs));
-  tcp_rcv_sacks (tc, 1500, &rs);
-  TCP_TEST ((rs.ack_flags & (TCP_ACK_F_DSACK | TCP_ACK_F_DSACK_SPURIOUS)) ==
+  clib_memset (&ac, 0, sizeof (ac));
+  tcp_test_ack_handle_feedback (tc, 1500, &ac);
+  TCP_TEST ((ac.ack_flags & (TCP_ACK_F_DSACK | TCP_ACK_F_DSACK_SPURIOUS)) ==
 	      (TCP_ACK_F_DSACK | TCP_ACK_F_DSACK_SPURIOUS),
 	    "BT processes D-SACK evidence before ACK and SACK sample retirement");
   TCP_TEST (!tc->dsack_pending_bytes && tcp_bt_is_sane (tc->bt),
 	    "BT keeps aggregate state sane after combined D-SACK processing");
+
+  /* A D-SACK can provisionally prove the retransmission spurious before the
+   * BT ACK walk exposes reneging. The final ACK result must reflect both. */
+  vec_free (tc->rcv_opts.sacks);
+  tcp_bt_cleanup (tc);
+  clib_memset (tc, 0, sizeof (*tc));
+  tc->snd_mss = 100;
+  tc->snd_una = 1000;
+  tc->snd_nxt = 1600;
+  tc->snd_wnd_max = 1000;
+  tc->snd_congestion = 1600;
+  tc->flags = TCP_CONN_FAST_RECOVERY | TCP_CONN_RECOVERY;
+  tc->rcv_opts.flags = TCP_OPTS_FLAG_SACK_PERMITTED | TCP_OPTS_FLAG_SACK;
+  scoreboard_init (&tc->sack_sb);
+  tcp_bt_init (tc);
+  tc->snd_nxt = tc->snd_una;
+  tcp_bt_track_tx (tc, 600);
+  tc->snd_nxt = 1600;
+  tcp_bt_track_rxt (tc, 1000, 1100);
+
+  block = (sack_block_t) { .start = 1100, .end = 1200 };
+  vec_add1 (tc->rcv_opts.sacks, block);
+  tc->rcv_opts.n_sack_blocks = 1;
+  tcp_test_rcv_sacks (tc, tc->snd_una, &ac);
+  TCP_TEST (tc->sack_sb.sacked_bytes == 100, "BT retains adjacent SACK history before D-SACK");
+
+  vec_reset_length (tc->rcv_opts.sacks);
+  block = (sack_block_t) { .start = 1000, .end = 1100 };
+  vec_add1 (tc->rcv_opts.sacks, block);
+  tc->rcv_opts.n_sack_blocks = 1;
+  tcp_test_rcv_sacks (tc, 1100, &ac);
+  TCP_TEST ((ac.ack_flags & TCP_ACK_F_DSACK) && !(ac.ack_flags & TCP_ACK_F_DSACK_SPURIOUS) &&
+	      tcp_scoreboard_is_reneging (&tc->sack_sb) &&
+	      (tc->sack_sb.flags & TCP_DSACK_INELIGIBLE) && !tc->dsack_pending_bytes &&
+	      tcp_bt_is_sane (tc->bt),
+	    "same-ACK BT reneging revokes provisional D-SACK undo");
 
   vec_free (tc->rcv_opts.sacks);
   tcp_bt_cleanup (tc);
@@ -7146,7 +7296,7 @@ static int
 tcp_test_bt (vlib_main_t * vm, unformat_input_t * input)
 {
   clib_thread_index_t thread_index = 0;
-  tcp_rate_sample_t _rs = { 0 }, *rs = &_rs;
+  tcp_ack_ctx_t _ac = { 0 }, *ac = &_ac;
   tcp_connection_t _tc, *tc = &_tc;
   fifo_segment_create_args_t _a, *a = &_a;
   fifo_segment_main_t _fsm = { 0 }, *fsm = &_fsm;
@@ -7226,10 +7376,9 @@ tcp_test_bt (vlib_main_t * vm, unformat_input_t * input)
   /* ACK:150 */
   /* --> [150:200] */
   tcp_test_set_time (thread_index, 3);
+  memset (ac, 0, sizeof (*ac));
+  tcp_test_ack_handle_feedback (tc, 150, ac);
   tc->snd_una = 150;
-  rs->bytes_acked = 150;
-  rs->last_sacked_bytes = 0;
-  tcp_bt_sample_delivery_rate (tc, rs);
 
   TCP_TEST (tcp_bt_is_sane (bt), "tracker should be sane");
   TCP_TEST (pool_elts (bt->samples) == 1, "should have 1 sample");
@@ -7309,7 +7458,7 @@ tcp_test_bt (vlib_main_t * vm, unformat_input_t * input)
   memset (tc, 0, sizeof (*tc));
   tcp_bt_init (tc);
   bt = tc->bt;
-  memset (rs, 0, sizeof (*rs));
+  memset (ac, 0, sizeof (*ac));
 
   for (i = 0; i < 3; i++)
     {
@@ -7355,7 +7504,7 @@ tcp_test_bt (vlib_main_t * vm, unformat_input_t * input)
   memset (tc, 0, sizeof (*tc));
   tcp_bt_init (tc);
   bt = tc->bt;
-  memset (rs, 0, sizeof (*rs));
+  memset (ac, 0, sizeof (*ac));
 
   /* One 300-byte burst at time 40, delivered baseline set by the tx. */
   tcp_test_set_time (thread_index, 40);
@@ -7442,23 +7591,21 @@ tcp_test_bt (vlib_main_t * vm, unformat_input_t * input)
 
   /* Delivery sampling continues after FIN and excludes the FIN sequence. */
   memset (tc, 0, sizeof (*tc));
-  memset (rs, 0, sizeof (*rs));
+  memset (ac, 0, sizeof (*ac));
   tcp_bt_init (tc);
   tcp_test_set_time (thread_index, 50);
   tcp_bt_track_tx (tc, 100);
   tc->snd_nxt = 101;
   tc->flags |= TCP_CONN_FINSNT;
-  tc->snd_una = 100;
-  rs->bytes_acked = 100;
   tcp_test_set_time (thread_index, 51);
-  tcp_bt_sample_delivery_rate (tc, rs);
-  TCP_TEST (tc->delivered == 100 && rs->acked_and_sacked == 100,
+  tcp_test_ack_handle_feedback (tc, 100, ac);
+  tc->snd_una = 100;
+  TCP_TEST (tc->delivered == 100 && ac->acked_and_sacked == 100,
 	    "data delivery remains sampled after FIN is sent");
+  memset (ac, 0, sizeof (*ac));
+  tcp_test_ack_handle_feedback (tc, 101, ac);
   tc->snd_una = 101;
-  memset (rs, 0, sizeof (*rs));
-  rs->bytes_acked = 1;
-  tcp_bt_sample_delivery_rate (tc, rs);
-  TCP_TEST (tc->delivered == 100 && rs->acked_and_sacked == 0,
+  TCP_TEST (tc->delivered == 100 && ac->acked_and_sacked == 0,
 	    "FIN acknowledgment is excluded from delivered bytes");
   tcp_bt_cleanup (tc);
 
