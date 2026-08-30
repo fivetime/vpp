@@ -57,7 +57,7 @@ permissions:
   actions: read
 
 concurrency:
-  group: ${{ inputs.GERRIT_PROJECT }}-${{ inputs.GERRIT_BRANCH }}-${{ inputs.GERRIT_CHANGE_NUMBER }}-${{ inputs.FDIO_NAMESPACE }}
+  group: ${{ github.workflow }}-${{ inputs.GERRIT_PROJECT }}-${{ inputs.GERRIT_BRANCH }}-${{ inputs.GERRIT_CHANGE_NUMBER }}-${{ inputs.FDIO_NAMESPACE }}
   cancel-in-progress: true
 
 jobs:
@@ -134,7 +134,7 @@ jobs:
       - start-verify
       - verify-checkstyle
     if: ${{ needs.verify-checkstyle.result == 'success' }}
-    uses: fdio/vpp/.github/workflows/vpp-verify-maketest.yml@c316a780f8f25c5d2386ef8fa085e90338300e3a
+    uses: fdio/vpp/.github/workflows/vpp-verify-maketest.yml@cbbb3d4cae9524b7b93a0fff7592555ff72462ea
     with:
       FDIO_NAMESPACE: ${{ inputs.FDIO_NAMESPACE }}
       GERRIT_BRANCH: ${{ inputs.GERRIT_BRANCH }}

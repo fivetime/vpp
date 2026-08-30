@@ -47,6 +47,16 @@ tcp_cc_undo_recovery (tcp_connection_t * tc)
 }
 
 static inline void
+tcp_cc_congestion_undo (tcp_connection_t *tc)
+{
+  tc->cwnd = clib_max (tc->cwnd, tc->prev_cwnd);
+  tc->ssthresh = clib_max (tc->ssthresh, tc->prev_ssthresh);
+  tcp_cc_undo_recovery (tc);
+  ASSERT (tc->rto_boff == 0);
+  TCP_EVT (TCP_EVT_CC_EVT, tc, 5);
+}
+
+static inline void
 tcp_cc_event (tcp_connection_t * tc, tcp_cc_event_t evt)
 {
   if (tc->cc_algo->event)
@@ -115,20 +125,6 @@ tcp_cc_is_cwnd_limited (const tcp_connection_t *tc, const tcp_ack_ctx_t *ac)
   return seq_lt (tc->snd_una - ac->bytes_acked, tc->cwnd_limited_seq);
 }
 
-/* Eifel spurious-retransmit detection (RFC 3522 Sec. 3.2). Spurious if the ack
- * echoes a timestamp older than the first retransmit (tsecr < snd_rxt_ts) and
- * leaves part of the flight outstanding (snd_una < snd_congestion). A
- * full-flight ack is ambiguous (e.g. an rto from losing all acks) and needs
- * dsack to disambiguate. Other outstanding loss is handled as a new recovery
- * event. Must be called on a cumulative ack in recovery. */
-static inline u8
-tcp_cc_is_spurious_retransmit (tcp_connection_t *tc, tcp_ack_ctx_t *ac)
-{
-  ASSERT (tcp_in_cong_recovery (tc) && ac->bytes_acked);
-  return (tc->snd_rxt_ts && seq_lt (tc->snd_una, tc->snd_congestion) &&
-	  tcp_opts_tstamp (&tc->rcv_opts) && timestamp_lt (tc->rcv_opts.tsecr, tc->snd_rxt_ts));
-}
-
 /**
  * Register exiting cc algo type
  */
@@ -140,9 +136,6 @@ void tcp_cc_algo_register (tcp_cc_algorithm_type_e type,
  */
 tcp_cc_algorithm_type_e tcp_cc_algo_new_type (const tcp_cc_algorithm_t * vft);
 tcp_cc_algorithm_t *tcp_cc_algo_get (tcp_cc_algorithm_type_e type);
-
-/** Enter fast recovery using the connection's negotiated ACK mechanism. */
-void tcp_cc_enter_recovery (tcp_connection_t *tc);
 
 void newreno_rcv_cong_ack (tcp_connection_t *tc, tcp_cc_ack_t ack_type, tcp_ack_ctx_t *ac);
 

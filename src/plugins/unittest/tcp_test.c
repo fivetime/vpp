@@ -1257,9 +1257,10 @@ tcp_test_dsack_rx (vlib_main_t *vm)
   vec_add1 (tc->rcv_opts.sacks, block);
   tc->rcv_opts.n_sack_blocks = 1;
   tcp_rcv_dsack (tc, 1200, &ac);
-  TCP_TEST ((ac.ack_flags & (TCP_ACK_F_DSACK | TCP_ACK_F_DSACK_SPURIOUS)) ==
-	      (TCP_ACK_F_DSACK | TCP_ACK_F_DSACK_SPURIOUS),
-	    "old ACK D-SACK proves retained retransmission spurious");
+  TCP_TEST (
+    (ac.ack_flags & (TCP_ACK_F_DSACK | TCP_ACK_F_DSACK_MATCHED | TCP_ACK_F_DSACK_SPURIOUS)) ==
+      (TCP_ACK_F_DSACK | TCP_ACK_F_DSACK_MATCHED | TCP_ACK_F_DSACK_SPURIOUS),
+    "old ACK D-SACK proves retained retransmission spurious");
   TCP_TEST (tc->sack_sb.head == TCP_INVALID_SACK_HOLE_INDEX && !tc->sack_sb.sacked_bytes,
 	    "old ACK D-SACK leaves scoreboard unchanged");
 
@@ -1269,7 +1270,8 @@ tcp_test_dsack_rx (vlib_main_t *vm)
   vec_add1 (tc->rcv_opts.sacks, block);
   tc->rcv_opts.n_sack_blocks = 1;
   tcp_test_rcv_sacks (tc, 1000, &ac);
-  TCP_TEST (ac.ack_flags & TCP_ACK_F_DSACK, "detect D-SACK below cumulative ACK");
+  TCP_TEST ((ac.ack_flags & TCP_ACK_F_DSACK) && !(ac.ack_flags & TCP_ACK_F_DSACK_MATCHED),
+	    "untracked D-SACK is detected but not matched");
   TCP_TEST (tc->sack_sb.flags & TCP_DSACK_UNDO_DISABLED,
 	    "D-SACK for untracked data disables congestion undo");
   TCP_TEST (vec_len (tc->rcv_opts.sacks) == 0,
@@ -1578,7 +1580,8 @@ tcp_test_dsack_rx (vlib_main_t *vm)
   vec_add1 (tc->rcv_opts.sacks, block);
   tc->rcv_opts.n_sack_blocks = 2;
   tcp_rcv_dsack (tc, tc->snd_una, &ac);
-  TCP_TEST ((tc->sack_sb.flags & TCP_DSACK_RXT_ACTIVE) &&
+  TCP_TEST ((ac.ack_flags & TCP_ACK_F_DSACK_MATCHED) &&
+	      (tc->sack_sb.flags & TCP_DSACK_RXT_ACTIVE) &&
 	      !(tc->sack_sb.flags & TCP_DSACK_RXT_OVERFLOW) &&
 	      tcp_test_dsack_rxt_count (tc) == TCP_MAX_DSACK_RXT_RANGES &&
 	      tc->dsack_pending_bytes == TCP_MAX_DSACK_RXT_RANGES * 100 - 50,
@@ -1627,10 +1630,10 @@ tcp_test_dsack_rx (vlib_main_t *vm)
   vec_add1 (tc->rcv_opts.sacks, block);
   tc->rcv_opts.n_sack_blocks = 2;
   tcp_rcv_dsack (tc, tc->snd_una, &ac);
-  TCP_TEST (!(tc->sack_sb.flags & TCP_DSACK_RXT_ACTIVE) &&
-	      (tc->sack_sb.flags & TCP_DSACK_UNDO_DISABLED) &&
-	      !(ac.ack_flags & TCP_ACK_F_DSACK_SPURIOUS),
-	    "active D-SACK gap disables undo and discards history");
+  TCP_TEST (
+    !(ac.ack_flags & TCP_ACK_F_DSACK_MATCHED) && !(tc->sack_sb.flags & TCP_DSACK_RXT_ACTIVE) &&
+      (tc->sack_sb.flags & TCP_DSACK_UNDO_DISABLED) && !(ac.ack_flags & TCP_ACK_F_DSACK_SPURIOUS),
+    "active D-SACK gap disables undo and discards history");
 
   /* Overlapping D-SACK evidence cannot credit more bytes than remain
    * pending for the episode. */
@@ -1655,7 +1658,7 @@ tcp_test_dsack_rx (vlib_main_t *vm)
   tc->rcv_opts.flags |= TCP_OPTS_FLAG_SACK;
   tc->rcv_opts.n_sack_blocks = 1;
   tcp_test_rcv_sacks (tc, tc->snd_una, &ac);
-  TCP_TEST (!(ac.ack_flags & TCP_ACK_F_DSACK_SPURIOUS) &&
+  TCP_TEST (!(ac.ack_flags & (TCP_ACK_F_DSACK_MATCHED | TCP_ACK_F_DSACK_SPURIOUS)) &&
 	      (tc->sack_sb.flags & TCP_DSACK_INELIGIBLE) && tc->dsack_pending_bytes == 100,
 	    "overlapping D-SACK cannot exceed pending retransmit evidence");
 
@@ -1701,10 +1704,10 @@ tcp_test_dsack_rx (vlib_main_t *vm)
   vec_add1 (tc->rcv_opts.sacks, block);
   tc->rcv_opts.n_sack_blocks = 1;
   tcp_test_rcv_sacks (tc, tc->snd_una, &ac);
-  TCP_TEST ((tc->sack_sb.flags & TCP_DSACK_INELIGIBLE) &&
-	      !(tc->sack_sb.flags & TCP_DSACK_UNDO_DISABLED) &&
-	      !(ac.ack_flags & TCP_ACK_F_DSACK_SPURIOUS),
-	    "D-SACK after a multi-range union matches retained history");
+  TCP_TEST (
+    (ac.ack_flags & TCP_ACK_F_DSACK_MATCHED) && (tc->sack_sb.flags & TCP_DSACK_INELIGIBLE) &&
+      !(tc->sack_sb.flags & TCP_DSACK_UNDO_DISABLED) && !(ac.ack_flags & TCP_ACK_F_DSACK_SPURIOUS),
+    "D-SACK after a multi-range union matches retained history");
 
   /* Eifel may undo first and retain an ineligible history solely to recognize
    * the later D-SACK. Matching that history is not network duplication and
@@ -1721,7 +1724,8 @@ tcp_test_dsack_rx (vlib_main_t *vm)
   vec_add1 (tc->rcv_opts.sacks, block);
   tc->rcv_opts.n_sack_blocks = 1;
   tcp_test_rcv_sacks (tc, tc->snd_una, &ac);
-  TCP_TEST (!(ac.ack_flags & TCP_ACK_F_DSACK_SPURIOUS) &&
+  TCP_TEST ((ac.ack_flags & TCP_ACK_F_DSACK_MATCHED) &&
+	      !(ac.ack_flags & TCP_ACK_F_DSACK_SPURIOUS) &&
 	      !(tc->sack_sb.flags & TCP_DSACK_UNDO_DISABLED),
 	    "late D-SACK matching Eifel history neither re-undoes nor disables");
   vec_reset_length (tc->rcv_opts.sacks);
@@ -3296,7 +3300,7 @@ tcp_test_headrtx_setup_rpc (void *argp)
 /*
  * Regression test for "reduce loss window once per rto congestion event".
  *
- * On each rto tcp_cc_rxt_timeout re-sets the loss cwnd, but the once-per-event
+ * On each rto tcp_loss_on_rto re-sets the loss cwnd, but the once-per-event
  * reduction (ssthresh via tcp_cc_congestion, the prev_cwnd/prev_ssthresh undo
  * snapshot, and the snd_rxt_ts Eifel reference) must run only for the rto that
  * starts the event. It must NOT re-run for a subsequent rto of the same,
@@ -3660,7 +3664,7 @@ tcp_test_rto_reduce_once_e2e (vlib_main_t *vm, unformat_input_t *input)
 
   /*
    * Spurious-retransmit detection predicate (RFC 3522 Sec. 3.2 Eifel),
-   * tcp_cc_is_spurious_retransmit: on a cumulative ack in recovery, decides
+   * tcp_loss_is_eifel_spurious: on a cumulative ack in recovery, decides
    * whether the window reduction was spurious (reordered/delayed data, not real
    * loss) and should be undone. Base state below is spurious; each case flips
    * one term. Spurious requires: retransmit stamped, part of the flight still
@@ -3692,7 +3696,7 @@ tcp_test_rto_reduce_once_e2e (vlib_main_t *vm, unformat_input_t *input)
 
     /* Base: all conditions met -> spurious. */
     ARM_SPURIOUS ();
-    if (!TCP_TEST_I ((tcp_cc_is_spurious_retransmit (stc, ac)),
+    if (!TCP_TEST_I ((tcp_loss_is_eifel_spurious (stc, ac)),
 		     "eifel: spurious on partial cumulative ack, tsecr < snd_rxt_ts, "
 		     "no loss"))
       {
@@ -3703,8 +3707,7 @@ tcp_test_rto_reduce_once_e2e (vlib_main_t *vm, unformat_input_t *input)
     /* Also valid for rto recovery (TCP_CONN_RECOVERY), not just fast recovery. */
     ARM_SPURIOUS ();
     stc->flags = TCP_CONN_RECOVERY;
-    if (!TCP_TEST_I ((tcp_cc_is_spurious_retransmit (stc, ac)),
-		     "eifel: also fires for rto recovery"))
+    if (!TCP_TEST_I ((tcp_loss_is_eifel_spurious (stc, ac)), "eifel: also fires for rto recovery"))
       {
 	rv = 1;
 	goto cleanup;
@@ -3715,7 +3718,7 @@ tcp_test_rto_reduce_once_e2e (vlib_main_t *vm, unformat_input_t *input)
     ARM_SPURIOUS ();
     stc->flags = TCP_CONN_RECOVERY;
     stc->sack_sb.lost_bytes = mss;
-    if (!TCP_TEST_I ((tcp_cc_is_spurious_retransmit (stc, ac)),
+    if (!TCP_TEST_I ((tcp_loss_is_eifel_spurious (stc, ac)),
 		     "eifel: rto retransmit spurious despite outstanding loss"))
       {
 	rv = 1;
@@ -3725,7 +3728,7 @@ tcp_test_rto_reduce_once_e2e (vlib_main_t *vm, unformat_input_t *input)
     /* Negative: no retransmit stamped (snd_rxt_ts == 0), nothing to undo. */
     ARM_SPURIOUS ();
     stc->snd_rxt_ts = 0;
-    if (!TCP_TEST_I ((!tcp_cc_is_spurious_retransmit (stc, ac)),
+    if (!TCP_TEST_I ((!tcp_loss_is_eifel_spurious (stc, ac)),
 		     "eifel: not spurious without a retransmit timestamp"))
       {
 	rv = 1;
@@ -3736,7 +3739,7 @@ tcp_test_rto_reduce_once_e2e (vlib_main_t *vm, unformat_input_t *input)
      * loss remains outstanding. The response handles that as a fresh event. */
     ARM_SPURIOUS ();
     stc->sack_sb.lost_bytes = mss;
-    if (!TCP_TEST_I ((tcp_cc_is_spurious_retransmit (stc, ac)),
+    if (!TCP_TEST_I ((tcp_loss_is_eifel_spurious (stc, ac)),
 		     "eifel: fast retransmit spurious despite other outstanding loss"))
       {
 	rv = 1;
@@ -3747,7 +3750,7 @@ tcp_test_rto_reduce_once_e2e (vlib_main_t *vm, unformat_input_t *input)
      * RFC 3522 Sec. 3.2 (e.g. rto from losing all acks) -> keep the reduction. */
     ARM_SPURIOUS ();
     stc->snd_una = stc->snd_congestion;
-    if (!TCP_TEST_I ((!tcp_cc_is_spurious_retransmit (stc, ac)),
+    if (!TCP_TEST_I ((!tcp_loss_is_eifel_spurious (stc, ac)),
 		     "eifel: not spurious on a full-flight ack"))
       {
 	rv = 1;
@@ -3758,7 +3761,7 @@ tcp_test_rto_reduce_once_e2e (vlib_main_t *vm, unformat_input_t *input)
      * retransmit -> the retransmit was needed). */
     ARM_SPURIOUS ();
     stc->rcv_opts.tsecr = stc->snd_rxt_ts;
-    if (!TCP_TEST_I ((!tcp_cc_is_spurious_retransmit (stc, ac)),
+    if (!TCP_TEST_I ((!tcp_loss_is_eifel_spurious (stc, ac)),
 		     "eifel: not spurious when tsecr >= snd_rxt_ts"))
       {
 	rv = 1;
@@ -3768,7 +3771,7 @@ tcp_test_rto_reduce_once_e2e (vlib_main_t *vm, unformat_input_t *input)
     /* Negative: no timestamp option -> Eifel not applicable. */
     ARM_SPURIOUS ();
     stc->rcv_opts.flags = 0;
-    if (!TCP_TEST_I ((!tcp_cc_is_spurious_retransmit (stc, ac)),
+    if (!TCP_TEST_I ((!tcp_loss_is_eifel_spurious (stc, ac)),
 		     "eifel: not spurious without the timestamp option"))
       {
 	rv = 1;
@@ -7174,9 +7177,10 @@ tcp_test_bt_dsack (void)
   TCP_TEST (!tc->dsack_pending_bytes, "BT accounts D-SACK evidence for ACKed samples");
   TCP_TEST (!(tc->sack_sb.flags & (TCP_DSACK_INELIGIBLE | TCP_DSACK_UNDO_DISABLED)),
 	    "BT D-SACK history remains undo eligible: 0x%x", tc->sack_sb.flags);
-  TCP_TEST ((ac.ack_flags & (TCP_ACK_F_DSACK | TCP_ACK_F_DSACK_SPURIOUS)) ==
-	      (TCP_ACK_F_DSACK | TCP_ACK_F_DSACK_SPURIOUS),
-	    "BT aggregate history proves a retransmission spurious");
+  TCP_TEST (
+    (ac.ack_flags & (TCP_ACK_F_DSACK | TCP_ACK_F_DSACK_MATCHED | TCP_ACK_F_DSACK_SPURIOUS)) ==
+      (TCP_ACK_F_DSACK | TCP_ACK_F_DSACK_MATCHED | TCP_ACK_F_DSACK_SPURIOUS),
+    "BT aggregate history proves a retransmission spurious");
 
   tcp_bt_dsack_recovery_clear (tc);
   tc->snd_una = 1400;
