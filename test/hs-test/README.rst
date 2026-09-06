@@ -209,6 +209,45 @@ to 107 bytes, which a readable ``RUN_ID`` would not fit.
 ``make cleanup-hst`` removes the containers of one run, selected by label. It uses
 the id recorded in ``.last_hst_run_id`` unless ``RUN_ID`` is given.
 
+Images are tagged with ``RUN_ID`` too, so ``make build`` in one checkout does not
+replace the VPP under test in the other. Topology files name images without a tag
+(``hs-test/nginx-server``); the run's tag is added when the container is created,
+so images from elsewhere are used as written. This costs build time rather than
+disk, because docker stores identical layers once.
+
+Every checkout that has been built leaves a set of images behind, and a rebuild
+only reclaims the ones it replaces. ``make clean-hst-images`` removes the images
+of one run, and ``make clean-hst-images-all`` removes the images of every run.
+Pass ``RUN_ID`` to clean up after a branch you are no longer on::
+
+    $ make clean-hst-images RUN_ID=review-46432
+    $ make clean-hst-images-all
+
+Both also remove ``.last_state_hash`` when it names an image they deleted, so the
+next ``make test`` rebuilds instead of skipping the build and failing on a missing
+image.
+
+Container CPUs are pinned and handed out from the start of the allocator's list, so
+two runs left to themselves pin to the same cores while the rest of the machine
+idles. Each run therefore reserves the cores it may use before Ginkgo starts, and no
+two runs are given the same core.
+
+The share is the usable cores divided by the number of runs, this one included, so
+nothing has to be passed on the command line. A run on its own reserves everything.
+When a second run starts it takes its share from the first, which notices at its
+next test and carries on with fewer cores; a third run splits the machine three
+ways, and so on. Reservations are keyed on the run's Ginkgo container, so a killed
+run releases its cores instead of holding them until the file is cleaned by hand.
+
+What has to fit is the total worker count across all runs, roughly one worker per
+four usable cores. On a 24 core machine that is about five workers, so two runs at
+``PARALLEL=3`` fit while two at ``PARALLEL=auto`` do not, and the second is left
+with a small share.
+
+``MW_PARALLEL=true`` allocates per NUMA node and needs whole nodes, so such a run
+takes the machine and is never trimmed: it will not start while other runs hold
+cores, and other runs will not start while it is going. Run it on its own.
+
 Two runs from the *same* checkout are not supported: Ginkgo compiles the suite to
 ``hs-test.test`` in the package directory and removes it when the run ends, so the
 runs would delete it under each other.

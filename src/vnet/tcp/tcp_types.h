@@ -87,7 +87,8 @@ typedef enum _tcp_timers
   _ (NO_TSO, "TSO off")                                                                            \
   _ (TSO, "TSO")                                                                                   \
   _ (NO_ENDPOINT, "No endpoint")                                                                   \
-  _ (TRACKED, "Tracked connection")
+  _ (TRACKED, "Tracked connection")                                                                \
+  _ (RACK, "RACK")
 
 typedef enum tcp_cfg_flag_bits_
 {
@@ -255,10 +256,33 @@ typedef enum tcp_ack_flag_
   TCP_ACK_F_SACK = 1 << 4,
   TCP_ACK_F_DETECT_LOSS = 1 << 5,
   TCP_ACK_F_DSACK_MATCHED = 1 << 6,
+  TCP_ACK_F_REO_WND_UPDATED = 1 << 7,
   TCP_ACK_F_SPURIOUS = TCP_ACK_F_DSACK_SPURIOUS | TCP_ACK_F_EIFEL_SPURIOUS,
 } __clib_packed tcp_ack_flag_t;
 
 #define TCP_BTS_INVALID_INDEX	((u32)~0)
+
+typedef struct
+{
+  u32 next;
+  u32 prev;
+} tcp_bt_tx_link_t;
+
+/** Optional index of byte-tracker samples ordered by transmission time.
+ *
+ * For a connection that requires transmit ordering from initialization, a
+ * null links vector means no retransmission has required building the
+ * index and the byte tracker's sequence list is also in transmission order.
+ * Once built, the index tracks non-SACKed samples unless a consumer
+ * explicitly removes them, and its storage remains allocated until byte
+ * tracker cleanup.
+ */
+typedef struct
+{
+  tcp_bt_tx_link_t *links;
+  u32 head;
+  u32 tail;
+} tcp_bt_tx_order_t;
 
 typedef enum tcp_bts_flags_
 {
@@ -268,6 +292,7 @@ typedef enum tcp_bts_flags_
   TCP_BTS_IS_RXT_LOST = 1 << 3,
   TCP_BTS_IS_DELIVERED = 1 << 4,
   TCP_BTS_IS_LOST = 1 << 5,
+  TCP_BTS_TX_LOST = 1 << 6,
 } __clib_packed tcp_bts_flags_t;
 
 typedef struct tcp_bt_sample_
@@ -333,6 +358,7 @@ typedef struct tcp_byte_tracker_
   u32 cur_rxt;			/**< Current retransmission sample */
   u32 cur_rxt_end;		/**< Cached range end; mutations reset to high_rxt */
   u32 sack_loss_high;		/**< Upper edge of SACK-derived lost prefix */
+  tcp_bt_tx_order_t tx_order;	/**< Optional transmission-order index */
 } tcp_byte_tracker_t;
 
 typedef enum _tcp_cc_algorithm_type

@@ -1,9 +1,8 @@
-name: periodic-vpp-verify-hst
+name: periodic-vpp-verify-asan-maketest
 
 on:
   schedule:
-    - cron: '0 1 * * *'  # Runs daily at 1am UTC
-    - cron: '0 13 * * *'  # Runs daily at 1pm UTC
+    - cron: '0 4 * * *'  # Runs daily at 4am UTC
   workflow_dispatch:
     inputs:
       FDIO_NAMESPACE:
@@ -28,15 +27,14 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  verify-hst-periodic:
+  verify-asan-maketest-periodic:
     # yamllint disable-line rule:line-length
-    name: hst-${{ matrix.os }}-${{ matrix.executor_arch }}-${{ matrix.build_type }}-${{ github.event.inputs.FDIO_NAMESPACE || 'prod' }}
+    name: asan-maketest-${{ matrix.os }}-${{ matrix.executor_arch }}-${{ matrix.build_type }}-${{ github.event.inputs.FDIO_NAMESPACE || 'prod' }}
     runs-on:
       - self-hosted
       - nomad
       - fdio:arch=${{ matrix.executor_arch }}
       - fdio:class=${{ matrix.class }}
-      - fdio:size=${{ matrix.size }}
       - fdio:namespace=${{ github.event.inputs.FDIO_NAMESPACE || 'prod' }}
       - fdio:os=${{ matrix.os }}
       - fdio:workflow=${{ github.run_id }}
@@ -45,28 +43,21 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Debug builds on aarch64
-          - build_type: 'debug'
-            os: 'ubuntu2204'
-            executor_arch: 'aarch64'
-            class: 'hst'
-            size: 'hst'
           # Debug builds on x86_64
           - build_type: 'debug'
-            os: 'ubuntu2204'
+            os: 'ubuntu2404'
             executor_arch: 'x86_64'
-            class: 'hst'
-            size: 'hst'
+            class: 'builder'
 
     env:
       FDIO_NAMESPACE: ${{ github.event.inputs.FDIO_NAMESPACE || 'prod' }}
       LOG_NAME: ""
       LOG_DIR: ""
       WORKSPACE: /scratch/docker-build/vpp
-      HS_TEST_DIR: /scratch/docker-build/vpp/test/hs-test
       CCACHE_DIR: /scratch/ccache/${{ matrix.os }}-${{ matrix.executor_arch }}
       MAKE_PARALLEL_JOBS: 16
-      TEST_JOBS: "auto"
+      MAKE_TEST_OS: 'ubuntu-24.04'
+      TEST_JOBS: 4
       TUI_LINE: "*******************************************************************"
 
     steps:
@@ -81,7 +72,7 @@ jobs:
         run: |
           set -euxo pipefail
           ts="$(date -u +%Y_%m_%d_%H%M%S_UTC)"
-          LOG_NAME="gha-vpp-periodic/vpp-verify-hst-master-${ts}-${{ matrix.build_type }}-${{ matrix.class }}-${{ matrix.os }}-${{ env.FDIO_NAMESPACE }}-${{ matrix.executor_arch }}"
+          LOG_NAME="gha-vpp-periodic/vpp-verify-asan-maketest-master-${ts}-${{ matrix.build_type }}-${{ matrix.class }}-${{ matrix.os }}-${{ env.FDIO_NAMESPACE }}-${{ matrix.executor_arch }}"
           echo "LOG_NAME=$LOG_NAME" >> "$GITHUB_ENV"
           LOG_DIR="$WORKSPACE/logs/$LOG_NAME"
           echo "LOG_DIR=$LOG_DIR" >> "$GITHUB_ENV"
@@ -120,15 +111,16 @@ jobs:
           WORKSPACE: ${{ env.WORKSPACE }}
           TUI_LINE: ${{ env.TUI_LINE }}
 
-      - name: HST VPP Build
+      - name: ASAN MAKETEST VPP Build
         # yamllint disable-line rule:line-length
-        uses: fdio/vpp/.github/actions/vpp-build@3c0b690a135be65922fec705983478351a1b80b6
+        uses: fdio/vpp/.github/actions/vpp-build@72cac6c0bc22441f24ca057a1be8919a083c578f
+        timeout-minutes: 90
         with:
           LOG_DIR: ${{ env.LOG_DIR }}
           WORKSPACE: ${{ env.WORKSPACE }}
           MAKE_PARALLEL_JOBS: ${{ env.MAKE_PARALLEL_JOBS }}
           BUILD_TYPE: ${{ matrix['build_type'] }}
-          BUILD_HST: 'true'
+          ENABLE_ASAN: 'true'
           TUI_LINE: ${{ env.TUI_LINE }}
 
       - name: Start Docker Daemon
@@ -137,16 +129,16 @@ jobs:
           START_DOCKER_SCRIPT: start-docker.sh
           TUI_LINE: ${{ env.TUI_LINE }}
 
-      - name: HST Test VPP
+      - name: ASAN MAKETEST VPP
         if: success()
-        uses: fdio/vpp/.github/actions/vpp-hst-test@e970dcebe57999d0c04c63a466bb95604fcf9b4d
-        timeout-minutes: 90
+        uses: fdio/vpp/.github/actions/vpp-make-test@03f35503fee57df2348617498db28fde557a3880
+        timeout-minutes: 180
         with:
           LOG_DIR: ${{ env.LOG_DIR }}
           WORKSPACE: ${{ env.WORKSPACE }}
-          BUILD_TYPE: ${{ matrix['build_type'] }}
-          HS_TEST_DIR: ${{ env.HS_TEST_DIR }}
+          BUILD_TYPE: ${{ matrix.build_type }}
           TEST_JOBS: ${{ env.TEST_JOBS }}
+          MAKE_TEST_OS: ${{ env.MAKE_TEST_OS }}
           TUI_LINE: ${{ env.TUI_LINE }}
 
       - name: AWS S3 Publish Logs

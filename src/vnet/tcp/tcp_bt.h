@@ -30,6 +30,26 @@ tcp_bt_opaque (tcp_connection_t *tc)
   return tc->bt + 1;
 }
 
+static_always_inline tcp_bt_tx_order_t *
+tcp_bt_tx_order (tcp_connection_t *tc)
+{
+  ASSERT (tc->bt != 0);
+  return &tc->bt->tx_order;
+}
+
+/* Compare transmissions by send time, then ending sequence. */
+static_always_inline u8
+tcp_bt_tx_sent_after (f64 ts, u32 end_seq, f64 other_ts, u32 other_end)
+{
+  return ts != other_ts ? ts > other_ts : seq_gt (end_seq, other_end);
+}
+
+/** Explicitly remove a sample from the transmit-order index. No-op if inactive. */
+void tcp_bt_tx_order_remove (tcp_byte_tracker_t *bt, tcp_bt_sample_t *bts);
+
+/** Build the transmit-order index from the byte tracker's sequence list. */
+void tcp_bt_tx_order_build (tcp_byte_tracker_t *bt);
+
 /**
  * Byte tracker cleanup
  *
@@ -45,7 +65,7 @@ void tcp_bt_cleanup (tcp_connection_t * tc);
  *
  * @param tc	connection whose tracker state should change
  * @param enable	non-zero to enable byte tracking
- * @return	0 on success, -1 if data is in flight
+ * @return	0 on success, -1 if data is in flight or RACK requires tracking
  */
 int tcp_bt_enable (tcp_connection_t *tc, u8 enable);
 /**
@@ -58,6 +78,7 @@ void tcp_bt_flush_samples (tcp_connection_t * tc);
  * Track a tcp tx burst
  *
  * @param tc	tcp connection
+ * @param len	bytes transmitted
  */
 void tcp_bt_track_tx (tcp_connection_t * tc, u32 len);
 /**
@@ -67,7 +88,14 @@ void tcp_bt_track_tx (tcp_connection_t * tc, u32 len);
  * @param start	start sequence number
  * @param end	end sequence number
  */
-void tcp_bt_track_rxt (tcp_connection_t * tc, u32 start, u32 end);
+void tcp_bt_track_rxt (tcp_connection_t *tc, u32 start, u32 end);
+
+/** Split the byte-tracker sample containing seq, if seq is an interior point. */
+void tcp_bt_split_at (tcp_connection_t *tc, u32 seq);
+
+/** Rewind retransmission selection to the sample containing seq. */
+void tcp_bt_rxt_rewind (tcp_connection_t *tc, u32 seq);
+
 /**
  * Apply cumulative ACK and prepared SACK ranges to the byte tracker
  *
@@ -84,17 +112,22 @@ u32 tcp_bt_dsack_mark_duplicate (tcp_connection_t *tc, u32 start, u32 end);
 void tcp_bt_recompute_sack_loss (tcp_connection_t *tc);
 void tcp_bt_init_rxt (tcp_connection_t *tc, u32 snd_una);
 void tcp_bt_rxt_mark_lost (tcp_connection_t *tc);
-u8 tcp_bt_handle_sack_reneging (tcp_connection_t *tc);
+/** Handle SACK reneging and optionally restore formerly SACKed samples to the
+ * transmit-order index. Consumers that immediately classify all restored
+ * samples can leave them unlinked. */
+u8 tcp_bt_handle_sack_reneging (tcp_connection_t *tc, u8 restore_tx_order);
 u8 tcp_bt_is_sane_post_recovery (tcp_connection_t *tc);
 u8 tcp_bt_next_rxt_range (tcp_connection_t *tc, u8 have_unsent, u8 *can_rescue, u8 *snd_limited,
 			  tcp_rxt_range_t *range);
+u8 tcp_bt_next_rack_rxt_range (tcp_connection_t *tc, tcp_rxt_range_t *range);
 u8 tcp_bt_last_rxt_range (tcp_connection_t *tc, tcp_rxt_range_t *range);
 /**
  * Check if sample to be generated is app limited
  *
- * @param tc	tcp connection
+ * @param tc		 tcp connection
+ * @param available_bytes unsent bytes available for transmission
  */
-void tcp_bt_check_app_limited (tcp_connection_t * tc);
+void tcp_bt_check_app_limited (tcp_connection_t *tc, u32 available_bytes);
 /**
  * Check if the byte tracker is in sane state
  *

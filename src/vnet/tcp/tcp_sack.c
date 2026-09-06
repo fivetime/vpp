@@ -411,7 +411,7 @@ tcp_sack_handle_reneging (tcp_connection_t *tc)
   sack_scoreboard_hole_t *hole;
 
   if (PREDICT_FALSE (tc->cfg_flags & TCP_CFG_F_BYTE_TRACKER))
-    return tcp_bt_handle_sack_reneging (tc);
+    return tcp_bt_handle_sack_reneging (tc, 1 /* restore_tx_order */);
 
   hole = scoreboard_first_hole (sb);
   if (!tcp_scoreboard_is_reneging (sb) && (!hole || hole->start == tc->snd_una))
@@ -1181,8 +1181,16 @@ tcp_ack_handle_full_feedback (tcp_connection_t *tc, u32 packet_ack, u32 ack, tcp
 	  tcp_dsack_update (tc, &dsack, ac);
 	}
     }
+
   if (!(ac->bytes_acked | (ac->ack_flags & TCP_ACK_F_SACK)))
-    return;
+    {
+      /* Only BT-backed RACK consumes D-SACK-only loss feedback. Avoid
+       * replaying an unchanged legacy scoreboard for this case. */
+      if ((ac->ack_flags & TCP_ACK_F_DSACK) &&
+	  PREDICT_FALSE (tc->cfg_flags & TCP_CFG_F_BYTE_TRACKER))
+	tcp_bt_apply_ack (tc, ack, high_sacked, ac);
+      return;
+    }
 
   tcp_sack_trace (tc, ack);
   if (PREDICT_FALSE (tc->cfg_flags & TCP_CFG_F_BYTE_TRACKER))
