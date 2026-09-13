@@ -77,12 +77,18 @@ void tcp_bt_flush_samples (tcp_connection_t * tc);
 /**
  * Track a tcp tx burst
  *
+ * Must be called before snd_nxt is advanced. The saved flight includes len.
+ *
  * @param tc	tcp connection
  * @param len	bytes transmitted
  */
 void tcp_bt_track_tx (tcp_connection_t * tc, u32 len);
 /**
  * Track a tcp retransmission
+ *
+ * Must be called after snd_rxt_bytes is advanced by end - start. The saved
+ * flight includes the new transmission and discounts any active copy it
+ * replaces.
  *
  * @param tc	tcp connection
  * @param start	start sequence number
