@@ -1322,18 +1322,14 @@ tcp_tlp_send_probe (tcp_connection_t *tc)
   outstanding = tc->snd_nxt - tc->snd_una;
   max_deq = transport_max_tx_dequeue (&tc->connection);
 
-  /* Prefer one unsent segment when the peer's receive window permits it. */
+  /* Prefer one unsent segment when the peer's receive window permits it.
+   * A TLP may exceed cwnd by one segment (RFC 8985, section 7.3). */
   if (max_deq > outstanding && tc->snd_wnd > outstanding)
     {
       available = clib_min (max_deq - outstanding, tc->snd_wnd - outstanding);
       available = clib_min (available, (u32) tc->snd_mss);
-      /* RFC 8985 permits a one-segment cwnd overshoot, but it can amplify
-       * drops under backpressure. Retransmit the tail unless new data fits. */
-      if (tcp_tlp_new_data_fits_cwnd (tc, available))
-	{
-	  tcp_bt_check_app_limited (tc, max_deq - outstanding);
-	  n_bytes = tcp_prepare_segment (wrk, tc, outstanding, available, &b);
-	}
+      tcp_bt_check_app_limited (tc, max_deq - outstanding);
+      n_bytes = tcp_prepare_segment (wrk, tc, outstanding, available, &b);
     }
 
   if (n_bytes)
@@ -1737,6 +1733,20 @@ tcp_fastrecovery_prr_snd_space (tcp_connection_t * tc)
   return space;
 }
 
+/* Fast recovery uses PRR unless the congestion-control algorithm supplies its
+ * own paced send allowance. */
+static inline u32
+tcp_cc_recovery_snd_space (tcp_connection_t *tc)
+{
+  if (tcp_in_recovery (tc))
+    return tcp_available_cc_snd_space (tc);
+
+  if (PREDICT_FALSE (tc->cc_algo->get_recovery_snd_space != 0))
+    return tc->cc_algo->get_recovery_snd_space (tc);
+
+  return (u32) tcp_fastrecovery_prr_snd_space (tc);
+}
+
 static inline u8
 tcp_max_tx_deq (tcp_connection_t * tc)
 {
@@ -1812,7 +1822,7 @@ tcp_retransmit_sack_inline (tcp_worker_ctx_t *wrk, tcp_connection_t *tc, u32 bur
   vlib_main_t *vm = wrk->vm;
   vlib_buffer_t *b = 0;
   sack_scoreboard_t *sb = &tc->sack_sb;
-  int snd_space;
+  u32 snd_space;
 
   ASSERT (tcp_in_cong_recovery (tc));
 
@@ -1827,10 +1837,7 @@ tcp_retransmit_sack_inline (tcp_worker_ctx_t *wrk, tcp_connection_t *tc, u32 bur
       return 0;
     }
 
-  if (tcp_in_recovery (tc))
-    snd_space = tcp_available_cc_snd_space (tc);
-  else
-    snd_space = tcp_fastrecovery_prr_snd_space (tc);
+  snd_space = tcp_cc_recovery_snd_space (tc);
   cc_limited = snd_space < burst_bytes;
 
   if (snd_space < tc->snd_mss)
@@ -1851,13 +1858,13 @@ tcp_retransmit_sack_inline (tcp_worker_ctx_t *wrk, tcp_connection_t *tc, u32 bur
 	  /* We are out of lost holes to retransmit so send some new data. */
 	  if (max_deq)
 	    {
-	      u32 n_segs_new, n_bytes_new;
-	      int av_wnd;
+	      u32 n_segs_new, n_bytes_new, av_wnd, outstanding;
 
 	      /* Make sure we don't exceed available window and leave space
 	       * for one more packet, to avoid zero window acks */
-	      av_wnd = (int) tc->snd_wnd - (tc->snd_nxt - tc->snd_una);
-	      av_wnd = clib_max (av_wnd - tc->snd_mss, 0);
+	      outstanding = tc->snd_nxt - tc->snd_una;
+	      av_wnd = tc->snd_wnd > outstanding ? tc->snd_wnd - outstanding : 0;
+	      av_wnd = av_wnd > tc->snd_mss ? av_wnd - tc->snd_mss : 0;
 	      snd_space = clib_min (snd_space, av_wnd);
 	      /* Low bound max_deq to mss to be able to send a segment even
 	       * when it is less than mss */
@@ -1865,7 +1872,9 @@ tcp_retransmit_sack_inline (tcp_worker_ctx_t *wrk, tcp_connection_t *tc, u32 bur
 		clib_min (clib_max (max_deq, tc->snd_mss), snd_space);
 	      burst_size = clib_min (burst_size - n_segs,
 				     snd_space / tc->snd_mss);
-	      burst_size = clib_min (burst_size, TCP_RXT_MAX_BURST);
+	      /* A model-owned recovery allowance is already bounded by the pacer. */
+	      if (!tc->cc_algo->get_recovery_snd_space)
+		burst_size = clib_min (burst_size, TCP_RXT_MAX_BURST);
 	      n_segs_new = tcp_transmit_unsent (wrk, tc, burst_size, max_deq);
 	      n_bytes_new = n_segs_new * tc->snd_mss;
 	      sent_bytes += clib_min (max_deq, n_bytes_new);
@@ -1980,7 +1989,8 @@ tcp_retransmit_no_sack (tcp_worker_ctx_t * wrk, tcp_connection_t * tc,
   u32 n_written = 0, offset = 0, bi, max_deq, n_segs_now, max_bytes;
   u32 burst_bytes, sent_bytes;
   vlib_main_t *vm = wrk->vm;
-  int snd_space, n_segs = 0;
+  u32 snd_space;
+  int n_segs = 0;
   u8 cc_limited = 0;
   vlib_buffer_t *b;
 
@@ -1998,10 +2008,7 @@ tcp_retransmit_no_sack (tcp_worker_ctx_t * wrk, tcp_connection_t * tc,
       return 0;
     }
 
-  if (tcp_in_recovery (tc))
-    snd_space = tcp_available_cc_snd_space (tc);
-  else
-    snd_space = tcp_fastrecovery_prr_snd_space (tc);
+  snd_space = tcp_cc_recovery_snd_space (tc);
   cc_limited = snd_space < burst_bytes;
 
   if (!tcp_fastrecovery_first (tc))
