@@ -2351,32 +2351,73 @@ tcp_test_bbr (vlib_main_t *vm, unformat_input_t *input)
   vec_free (state);
   tcp_test_bbr_cleanup (tc);
 
-  /* Full-pipe detection evaluates one sample per round. Faster samples later
-   * in the same round must not move its bandwidth baseline. */
+  /* A later valid ACK can show growth after a slow round-start ACK. */
+  tcp_test_set_time (thread_index, 20);
+  tcp_test_bbr_init (tc, thread_index, 1000, 0.1);
+  scoreboard_init (&tc->sack_sb);
+  tc->cwnd = 100000;
+  tc->app_limited = 0;
+  tcp_bt_track_tx (tc, 10000);
+  tc->snd_nxt += 10000;
+  tcp_test_set_time (thread_index, 20.010);
+  tcp_bt_track_tx (tc, 5000);
+  tc->snd_nxt += 5000;
+  tcp_test_set_time (thread_index, 20.100);
+  clib_memset (&ac, 0, sizeof (ac));
+  tcp_ack_handle_feedback (tc, tc->snd_una + 10000, &ac);
+  tc->snd_una += 10000;
+  tc->cc_algo->rcv_ack (tc, &ac);
+
+  tcp_test_set_time (thread_index, 20.105);
+  tcp_bt_track_tx (tc, 1000);
+  tc->snd_nxt += 1000;
+  tcp_test_set_time (thread_index, 20.106);
+  tcp_bt_track_tx (tc, 20000);
+  tc->snd_nxt += 20000;
+  tcp_test_set_time (thread_index, 20.110);
+  clib_memset (&ac, 0, sizeof (ac));
+  tcp_ack_handle_feedback (tc, tc->snd_una + 5000, &ac);
+  tc->snd_una += 5000;
+  tc->cc_algo->rcv_ack (tc, &ac);
+
+  tcp_test_set_time (thread_index, 20.210);
+  clib_memset (&ac, 0, sizeof (ac));
+  tcp_ack_handle_feedback (tc, tc->snd_una + 1000, &ac);
+  tc->snd_una += 1000;
+  tc->cc_algo->rcv_ack (tc, &ac);
+  state = format (0, "%U%c", tc->cc_algo->format, tc, 0);
+  TCP_TEST (ac.interval_time >= 0.1 && strstr ((char *) state, "full_bw_count 1") != 0,
+	    "bbr counts a slow round-start ACK: %s", state);
+  vec_free (state);
+
+  tcp_test_set_time (thread_index, 20.220);
+  clib_memset (&ac, 0, sizeof (ac));
+  tcp_ack_handle_feedback (tc, tc->snd_una + 20000, &ac);
+  tc->snd_una += 20000;
+  tc->cc_algo->rcv_ack (tc, &ac);
+  state = format (0, "%U%c", tc->cc_algo->format, tc, 0);
+  TCP_TEST (ac.delivered == 26000 && ac.interval_time >= 0.1 &&
+	      !(ac.flags & TCP_BTS_IS_APP_LIMITED) && strstr ((char *) state, "state 0/") != 0 &&
+	      strstr ((char *) state, "full_bw_count 0") != 0,
+	    "bbr accepts later byte-tracker growth: %s", state);
+  vec_free (state);
+  tcp_test_bbr_cleanup (tc);
+
+  /* Three round-start ACKs without growth still end STARTUP. */
   tcp_test_bbr_init (tc, thread_index, 1000, 0.1);
   for (i = 0; i < 4; i++)
     {
       clib_memset (&ac, 0, sizeof (ac));
-      ac.acked_and_sacked = 1000;
-      ac.interval_time = ac.rtt_time = 0.001;
+      ac.acked_and_sacked = ac.delivered = 10000;
+      ac.interval_time = ac.rtt_time = 0.1;
       ac.prior_delivered = tc->delivered;
-      tc->delivered += 1000;
-      ac.delivered = tc->delivered - ac.prior_delivered;
-      tc->cc_algo->rcv_ack (tc, &ac);
-
-      clib_memset (&ac, 0, sizeof (ac));
-      ac.acked_and_sacked = 1500;
-      ac.interval_time = 0.001 / (1u << i);
-      ac.rtt_time = 0.001;
-      ac.prior_delivered = tc->delivered - 500;
-      tc->delivered += 1500;
-      ac.delivered = tc->delivered - ac.prior_delivered;
+      tc->delivered += ac.delivered;
       tc->cc_algo->rcv_ack (tc, &ac);
     }
   state = format (0, "%U%c", tc->cc_algo->format, tc, 0);
   TCP_TEST (strstr ((char *) state, "state 0/") == 0 &&
 	      strstr ((char *) state, "full_bw_count 3") != 0,
-	    "bbr startup ignores intra-round bandwidth growth: %s", state);
+	    "bbr exits startup after three plateau rounds: %s", state);
   vec_free (state);
   tcp_test_bbr_cleanup (tc);
 
@@ -6278,6 +6319,9 @@ tcp_test_delivery (vlib_main_t * vm, unformat_input_t * input)
 
   TCP_TEST (bt->last_ooo == TCP_BTS_INVALID_INDEX,
 	    "last out-of-order sample should be invalid after init");
+  TCP_TEST (tc->app_limited == 1, "tracker should start app limited");
+  /* Sample bursts from a sender that is not app limited. */
+  tc->app_limited = 0;
 
   /*
    * Track simple bursts without rxt
@@ -8034,6 +8078,7 @@ tcp_test_bt_rxt_merge_flags (void)
   tcp_bt_sample_t *bts;
 
   tcp_bt_init (tc);
+  tc->app_limited = 0;
   tcp_test_set_time (tc->c_thread_index, 1);
   tcp_bt_track_tx (tc, 100);
   tc->snd_nxt = 100;
@@ -8385,6 +8430,7 @@ tcp_test_bt (vlib_main_t * vm, unformat_input_t * input)
   memset (tc, 0, sizeof (*tc));
   tcp_bt_init (tc);
   bt = tc->bt;
+  tc->app_limited = 0;
 
   tcp_test_set_time (thread_index, 11);
   tcp_bt_track_tx (tc, 50);
@@ -8577,10 +8623,63 @@ tcp_test_bt (vlib_main_t * vm, unformat_input_t * input)
   TCP_TEST (tc->app_limited == tc->delivered + tcp_flight_size (tc),
 	    "retransmitted loss permits app-limited marking");
 
+  /* Sub-MSS cwnd headroom cannot carry another segment. */
+  tc->app_limited = 0;
+  tc->sack_sb.lost_bytes = tc->snd_rxt_bytes = 0;
+  tc->snd_nxt = tc->snd_una + tc->cwnd - tc->snd_mss / 2;
+  tcp_bt_check_app_limited (tc, 0);
+  TCP_TEST (!tc->app_limited, "sub-mss cwnd headroom should not be app limited");
+
+  tc->snd_nxt = tc->snd_una + tc->cwnd - tc->snd_mss;
+  tcp_bt_check_app_limited (tc, 0);
+  TCP_TEST (tc->app_limited == tc->delivered + tc->cwnd - tc->snd_mss,
+	    "one mss of cwnd headroom permits app-limited marking");
+
+  /* A write larger than one MSS, sent behind a 300-byte flight, empties the
+   * fifo. */
+  tc->app_limited = 0;
+  tc->snd_wnd = tc->cwnd;
+  tc->snd_nxt = tc->snd_una + 500;
+  tcp_cc_check_limited (tc, 500);
+  TCP_TEST (tc->app_limited == tc->delivered + 500, "burst that empties the fifo is app limited");
+
+  tc->app_limited = 0;
+  tcp_cc_check_limited (tc, 500 + tc->snd_mss);
+  TCP_TEST (!tc->app_limited, "burst that leaves a segment unsent is not app limited");
+
+  /* Sub-MSS headroom, not the application, stopped this burst even though
+   * less than a segment remains queued. */
+  tc->cwnd_limited_seq = tc->snd_una;
+  tc->snd_nxt = tc->snd_una + tc->cwnd - tc->snd_mss / 2;
+  tcp_cc_check_limited (tc, tc->cwnd);
+  TCP_TEST (!tc->app_limited && tc->cwnd_limited_seq == tc->snd_nxt,
+	    "burst stopped by cwnd is cwnd limited, not app limited");
+
   fifo_segment_free_fifo (fs, s->tx_fifo);
   session_free (s);
   vec_free (a->new_segment_indices);
   fifo_segment_delete (fsm, fs);
+  tcp_bt_cleanup (tc);
+
+  /* The send-path marker survives a full-cwnd restart until new delivery. */
+  memset (tc, 0, sizeof (*tc));
+  memset (ac, 0, sizeof (*ac));
+  tcp_bt_init (tc);
+  tc->cwnd = 1000;
+  tc->snd_mss = 100;
+  tc->delivered = 300;
+  tcp_bt_check_app_limited (tc, 0);
+  TCP_TEST (tc->app_limited == tc->delivered, "send-path check sets app-limited marker");
+  tcp_bt_check_app_limited (tc, tc->cwnd);
+  TCP_TEST (tc->app_limited == tc->delivered, "full-cwnd write retains app-limited marker");
+  tcp_test_set_time (thread_index, 50);
+  tcp_bt_track_tx (tc, tc->cwnd);
+  tc->snd_nxt = tc->cwnd;
+  bts = pool_elt_at_index (tc->bt->samples, tc->bt->head);
+  TCP_TEST (bts->flags & TCP_BTS_IS_APP_LIMITED, "restart sample retains app-limited flag");
+  tcp_test_set_time (thread_index, 51);
+  tcp_test_ack_handle_feedback (tc, tc->cwnd, ac);
+  TCP_TEST (tc->delivered == 1300 && !tc->app_limited, "new delivery clears app-limited marker");
   tcp_bt_cleanup (tc);
 
   /* Delivery sampling continues after FIN and excludes the FIN sequence. */
