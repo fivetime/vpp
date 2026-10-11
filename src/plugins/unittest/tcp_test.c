@@ -2266,6 +2266,7 @@ tcp_test_bbr (vlib_main_t *vm, unformat_input_t *input)
   u64 expected_rate;
   int switch_rv;
   u32 i;
+  u16 multiplier;
   u8 *state, switch_rejected, no_sack_rejected, bbr_selected;
 
   while (unformat_check_input (input) != UNFORMAT_END_OF_INPUT)
@@ -2287,8 +2288,11 @@ tcp_test_bbr (vlib_main_t *vm, unformat_input_t *input)
   tcp_test_bbr_cleanup (tc);
 
   /* Refresh the cached quantum when the effective MSS changes without a
-   * pacing-rate change. */
+   * pacing-rate change. Start from a 4 segment initial window. */
+  multiplier = tcp_cfg.initial_cwnd_multiplier;
+  tcp_cfg.initial_cwnd_multiplier = 4;
   tcp_test_bbr_init (tc, thread_index, 1000, 10.0);
+  tcp_cfg.initial_cwnd_multiplier = multiplier;
   tc->snd_mss = 2000;
   ac.acked_and_sacked = 2000;
   tc->cc_algo->rcv_ack (tc, &ac);
@@ -2981,6 +2985,63 @@ tcp_test_cubic_idle (vlib_main_t *vm)
   return 0;
 }
 
+/* The Reno-friendly estimate starts from cwnd_epoch (RFC 9438 Sec. 4.3 and 4.8) */
+static int
+tcp_test_cubic_reno_friendly (void)
+{
+  const clib_thread_index_t thread_index = 0;
+  const u32 snd_mss = 1000;
+  tcp_connection_t _tc, *tc = &_tc;
+  tcp_ack_ctx_t ac = { .bytes_acked = snd_mss, .acked_and_sacked = snd_mss };
+  u32 before, i, rtt, n_acks;
+
+  /* A cut from 39 segments leaves 27.3. Starting from that unrounded window, the
+   * estimate reaches 28 segments within 1.4 RTTs and 28 ACKs grow cwnd. */
+  tcp_test_set_time (thread_index, 1);
+  tcp_test_cubic_init_epoch (tc, thread_index, snd_mss, 39);
+  tc->mrtt_us = 0.01;
+  tc->srtt = 0.01 / TCP_TICK;
+  before = tc->cwnd;
+  tcp_test_set_time (thread_index, 1.014);
+  for (i = 0; i < 28; i++)
+    {
+      tc->snd_una += snd_mss;
+      tc->snd_nxt = tc->snd_una + tc->cwnd;
+      tc->cwnd_limited_seq = tc->snd_una;
+      tc->cc_algo->rcv_ack (tc, &ac);
+    }
+  TCP_TEST ((tc->cwnd > before), "cubic Reno-friendly estimate keeps the unrounded cut window");
+
+  /* After an RTO, the estimate starts from the window at which congestion
+   * avoidance resumes, so cwnd grows within a few RTTs. */
+  tcp_test_set_time (thread_index, 1);
+  tcp_test_cubic_init_epoch (tc, thread_index, snd_mss, 40);
+  tc->mrtt_us = 0.01;
+  tc->srtt = 0.01 / TCP_TICK;
+  tc->cc_algo->congestion (tc);
+  tc->cc_algo->loss (tc);
+
+  /* Skip the slow start back to ssthresh */
+  tc->cwnd = tc->ssthresh;
+  before = tc->cwnd;
+  for (rtt = 1; rtt <= 10; rtt++)
+    {
+      tcp_test_set_time (thread_index, 1 + rtt * 0.010);
+      n_acks = tc->cwnd / snd_mss;
+      for (i = 0; i < n_acks; i++)
+	{
+	  tc->snd_una += snd_mss;
+	  tc->snd_nxt = tc->snd_una + tc->cwnd;
+	  tc->cwnd_limited_seq = tc->snd_una;
+	  tc->cc_algo->rcv_ack (tc, &ac);
+	}
+    }
+  TCP_TEST ((tc->cwnd > before), "cubic grows the Reno-friendly window after an RTO");
+  tcp_test_set_time (thread_index, 1);
+
+  return 0;
+}
+
 static int
 tcp_test_cubic (vlib_main_t *vm, unformat_input_t *input)
 {
@@ -2999,6 +3060,9 @@ tcp_test_cubic (vlib_main_t *vm, unformat_input_t *input)
     return rv;
 
   if ((rv = tcp_test_cubic_app_limited ()))
+    return rv;
+
+  if ((rv = tcp_test_cubic_reno_friendly ()))
     return rv;
 
   if ((rv = tcp_test_cubic_undo (vm)))
@@ -3395,7 +3459,12 @@ tcp_test_persist_e2e (vlib_main_t *vm, unformat_input_t *input)
     }
 
 cleanup:
-  sessions_cleaned = tcp_e2e_force_session_cleanup (vm);
+  sessions_cleaned = tcp_e2e_cleanup_sessions (vm);
+  if (!sessions_cleaned)
+    {
+      rv = 1;
+      goto done;
+    }
 
   if (listen_handle != SESSION_INVALID_HANDLE)
     {
@@ -3454,8 +3523,12 @@ cleanup:
 	  (void) vnet_delete_loopback_interface (sw_if_index[j]);
     }
   else
-    clib_warning ("graph frames did not quiesce; preserving test loopbacks");
+    {
+      clib_warning ("graph frames did not quiesce; preserving test loopbacks");
+      rv = 1;
+    }
 
+done:
   vec_free (data);
   vec_free (appns_id);
 
@@ -4222,7 +4295,12 @@ tcp_test_rto_reduce_once_e2e (vlib_main_t *vm, unformat_input_t *input)
   }
 
 cleanup:
-  sessions_cleaned = tcp_e2e_force_session_cleanup (vm);
+  sessions_cleaned = tcp_e2e_cleanup_sessions (vm);
+  if (!sessions_cleaned)
+    {
+      rv = 1;
+      goto done;
+    }
 
   if (listen_handle != SESSION_INVALID_HANDLE)
     {
@@ -4281,8 +4359,12 @@ cleanup:
 	  (void) vnet_delete_loopback_interface (sw_if_index[j]);
     }
   else
-    clib_warning ("graph frames did not quiesce; preserving test loopbacks");
+    {
+      clib_warning ("graph frames did not quiesce; preserving test loopbacks");
+      rv = 1;
+    }
 
+done:
   vec_free (data);
   vec_free (appns_id);
 
@@ -4296,9 +4378,53 @@ tcp_test_rto (vlib_main_t *vm, unformat_input_t *input)
 }
 
 /* Two RSTs for one half-open connection can be processed by the same graph
- * dispatch. A failed connect must enqueue one refusal and one half-open
+ * dispatch. A failed connect must deliver one refusal and one half-open
  * cleanup, regardless of how many copies of the RST arrive in that dispatch.
  */
+typedef struct
+{
+  u32 buffer_indices[2];
+  volatile u32 n_connected;
+  volatile u32 n_refused;
+  volatile u32 n_cleanup;
+  volatile u8 done;
+  volatile u8 in_flight;
+} tcp_test_rst_burst_ctx_t;
+
+static tcp_test_rst_burst_ctx_t tcp_test_rst_burst_ctx;
+
+static int
+tcp_test_rst_connected_callback (u32 app_index, u32 api_context, session_t *s, session_error_t err)
+{
+  tcp_test_rst_burst_ctx.n_connected++;
+  if (err == SESSION_E_REFUSED)
+    tcp_test_rst_burst_ctx.n_refused++;
+  return placeholder_session_connected_callback (app_index, api_context, s, err);
+}
+
+static void
+tcp_test_rst_cleanup_callback (session_t *s)
+{
+  tcp_test_rst_burst_ctx.n_cleanup++;
+}
+
+static void
+tcp_test_rst_burst_rpc (void *arg)
+{
+  tcp_test_rst_burst_ctx_t *a = arg;
+  vlib_main_t *vm = vlib_get_main ();
+  vlib_frame_t *frame = vlib_get_frame_to_node (vm, tcp4_syn_sent_node.index);
+  vlib_node_runtime_t *node = vlib_node_get_runtime (vm, tcp4_syn_sent_node.index);
+  u32 *to = vlib_frame_vector_args (frame);
+
+  to[0] = a->buffer_indices[0];
+  to[1] = a->buffer_indices[1];
+  frame->n_vectors = 2;
+  tcp4_syn_sent_node.function (vm, node, frame);
+  vlib_frame_free (vm, frame);
+  a->done = 1;
+}
+
 static int
 tcp_test_rst_burst (vlib_main_t *vm, unformat_input_t *input)
 {
@@ -4314,13 +4440,12 @@ tcp_test_rst_burst (vlib_main_t *vm, unformat_input_t *input)
     .client_only = 1,
   };
   tcp_e2e_ctx_t _ctx, *ctx = &_ctx;
+  tcp_test_rst_burst_ctx_t *a = &tcp_test_rst_burst_ctx;
   tcp_connection_t *tc;
-  app_worker_t *app_wrk;
-  session_event_t *events;
+  application_t *app;
   u32 buffer_indices[2] = { VLIB_BUFFER_INVALID_INDEX, VLIB_BUFFER_INVALID_INDEX };
   clib_thread_index_t thread_index;
-  uword n_events, n_refused = 0, n_cleanup = 0, i;
-  u32 n_buffers;
+  u32 n_buffers, tries, i;
   u8 buffers_enqueued = 0;
   int rv = 0;
 
@@ -4330,6 +4455,11 @@ tcp_test_rst_burst (vlib_main_t *vm, unformat_input_t *input)
       return -1;
     }
 
+  if (!TCP_TEST_I ((!a->in_flight), "rst_burst: previous test completed"))
+    return 1;
+  clib_memset (a, 0, sizeof (*a));
+  a->in_flight = 1;
+
   if (!TCP_TEST_I ((tcp_e2e_setup (vm, ctx, &params) == 0), "rst_burst: half-open setup"))
     {
       rv = 1;
@@ -4338,8 +4468,17 @@ tcp_test_rst_burst (vlib_main_t *vm, unformat_input_t *input)
 
   tc = ctx->client_tc;
   thread_index = tc->c_thread_index;
-  app_wrk = application_get_default_worker (application_get (ctx->client_index));
-  events = app_wrk->wrk_evts[thread_index];
+  app = application_get (ctx->client_index);
+  app->cb_fns.session_connected_callback = tcp_test_rst_connected_callback;
+  app->cb_fns.half_open_cleanup_callback = tcp_test_rst_cleanup_callback;
+
+  /* Block the real handshake before releasing the worker barrier to inject
+   * the RSTs. Cleanup notifications may arrive on the control thread. */
+  session_add_del_route_via_lookup_in_table (ctx->client_vrf, ctx->server_vrf, &ctx->intf_addr[1],
+					     32, 0 /* is_add */);
+  session_add_del_route_via_lookup_in_table (ctx->server_vrf, ctx->client_vrf, &ctx->intf_addr[0],
+					     32, 0 /* is_add */);
+  ctx->routes_added = 0;
 
   if (!TCP_TEST_I ((tc->state == TCP_STATE_SYN_SENT), "rst_burst: connection starts in SYN_SENT"))
     {
@@ -4379,35 +4518,24 @@ tcp_test_rst_burst (vlib_main_t *vm, unformat_input_t *input)
       tcp->flags = TCP_FLAG_ACK | TCP_FLAG_RST;
     }
 
-  {
-    vlib_frame_t *frame = vlib_get_frame_to_node (vm, tcp4_syn_sent_node.index);
-    vlib_node_runtime_t *node = vlib_node_get_runtime (vm, tcp4_syn_sent_node.index);
-    u32 *to = vlib_frame_vector_args (frame);
-    to[0] = buffer_indices[0];
-    to[1] = buffer_indices[1];
-    frame->n_vectors = 2;
-    buffers_enqueued = 1;
-    tcp4_syn_sent_node.function (vm, node, frame);
-    vlib_frame_free (vm, frame);
-  }
+  clib_memcpy (a->buffer_indices, buffer_indices, sizeof (buffer_indices));
+  buffers_enqueued = 1;
+  session_send_rpc_evt_to_thread (thread_index, tcp_test_rst_burst_rpc, a);
+  for (tries = 0; (!a->done || !a->n_connected || !a->n_cleanup) && tries < 1000; tries++)
+    tcp_e2e_pump (vm, 1e-3);
+  if (!TCP_TEST_I ((a->done && a->n_connected && a->n_cleanup),
+		   "rst_burst: RST dispatch and notifications completed"))
+    /* Keep the RPC arguments, apps and loopbacks alive until cleanup finishes. */
+    return 1;
 
-  events = app_wrk->wrk_evts[thread_index];
-  n_events = clib_fifo_elts (events);
-  for (i = 0; i < n_events; i++)
-    {
-      session_event_t *event = events + clib_fifo_elt_index (events, i);
-      if (event->event_type == SESSION_CTRL_EVT_CONNECTED &&
-	  (session_error_t) (event->as_u64[1] & 0xffffffff) == SESSION_E_REFUSED)
-	n_refused++;
-      else if (event->event_type == SESSION_CTRL_EVT_HALF_CLEANUP)
-	n_cleanup++;
-    }
-
-  if (!TCP_TEST_I ((n_refused == 1), "rst_burst: one refused notification (got %lu)", n_refused))
+  if (!TCP_TEST_I ((a->n_refused == 1), "rst_burst: one refused notification (got %u)",
+		   a->n_refused))
     rv = 1;
-  if (!TCP_TEST_I ((n_cleanup == 1), "rst_burst: one cleanup notification (got %lu)", n_cleanup))
+  if (!TCP_TEST_I ((a->n_cleanup == 1), "rst_burst: one cleanup notification (got %u)",
+		   a->n_cleanup))
     rv = 1;
-  if (!TCP_TEST_I ((n_events == 2), "rst_burst: one event pair for two RSTs (got %lu)", n_events))
+  if (!TCP_TEST_I ((a->n_connected == 1), "rst_burst: one connect notification (got %u)",
+		   a->n_connected))
     rv = 1;
 
 cleanup:
@@ -4421,7 +4549,10 @@ cleanup:
 						 &ctx->intf_addr[0], 32, 0 /* is_add */);
       ctx->routes_added = 0;
     }
-  tcp_e2e_teardown (vm, ctx);
+  if (!tcp_e2e_teardown (vm, ctx))
+    rv = 1;
+  else
+    a->in_flight = 0;
   return rv;
 }
 
@@ -4562,7 +4693,8 @@ tcp_test_fin_rst_burst (vlib_main_t *vm, unformat_input_t *input)
 cleanup:
   if (!buffers_enqueued && buffer_indices[0] != VLIB_BUFFER_INVALID_INDEX)
     vlib_buffer_free (vm, buffer_indices, 2);
-  tcp_e2e_teardown (vm, ctx);
+  if (!tcp_e2e_teardown (vm, ctx))
+    rv = 1;
   return rv;
 }
 
@@ -4766,7 +4898,8 @@ tcp_test_timewait_syn_burst (vlib_main_t *vm, unformat_input_t *input)
 cleanup:
   if (!buffers_consumed && buffer_indices[0] != VLIB_BUFFER_INVALID_INDEX)
     vlib_buffer_free (vm, buffer_indices, 2);
-  tcp_e2e_teardown (vm, ctx);
+  if (!tcp_e2e_teardown (vm, ctx))
+    rv = 1;
   return rv;
 }
 
@@ -4914,7 +5047,8 @@ tcp_test_tamper_lost_fin (vlib_main_t *vm)
 
 cleanup:
   tcp_tamper_reset ();
-  tcp_e2e_teardown (vm, ctx);
+  if (!tcp_e2e_teardown (vm, ctx))
+    rv = 1;
   tcp_cfg.enable_rack = rack_enabled_before;
   return rv;
 }
@@ -5041,7 +5175,8 @@ tcp_test_tamper_lost_final_ack (vlib_main_t *vm)
 
 cleanup:
   tcp_tamper_reset ();
-  tcp_e2e_teardown (vm, ctx);
+  if (!tcp_e2e_teardown (vm, ctx))
+    rv = 1;
   return rv;
 }
 
@@ -5166,7 +5301,8 @@ tcp_test_tamper_peer_fin_first (vlib_main_t *vm)
 
 cleanup:
   tcp_tamper_reset ();
-  tcp_e2e_teardown (vm, ctx);
+  if (!tcp_e2e_teardown (vm, ctx))
+    rv = 1;
   return rv;
 }
 
@@ -5267,7 +5403,8 @@ tcp_test_tamper_chained_rxt (vlib_main_t *vm)
 cleanup:
   tcp_tamper_reset ();
   vec_free (data);
-  tcp_e2e_teardown (vm, ctx);
+  if (!tcp_e2e_teardown (vm, ctx))
+    rv = 1;
   return rv;
 }
 
@@ -5417,7 +5554,8 @@ tcp_test_tamper_queued_fin (vlib_main_t *vm)
 cleanup:
   tcp_tamper_reset ();
   vec_free (data);
-  tcp_e2e_teardown (vm, ctx);
+  if (!tcp_e2e_teardown (vm, ctx))
+    rv = 1;
   return rv;
 }
 
@@ -5582,7 +5720,8 @@ tcp_test_tamper_queued_data_loss_mode (vlib_main_t *vm, u8 bt_mode)
 cleanup:
   tcp_tamper_reset ();
   vec_free (data);
-  tcp_e2e_teardown (vm, ctx);
+  if (!tcp_e2e_teardown (vm, ctx))
+    rv = 1;
   return rv;
 }
 
@@ -5718,7 +5857,8 @@ tcp_test_tamper_recovery_point (vlib_main_t *vm)
 cleanup:
   tcp_tamper_reset ();
   vec_free (data);
-  tcp_e2e_teardown (vm, ctx);
+  if (!tcp_e2e_teardown (vm, ctx))
+    rv = 1;
   return rv;
 }
 
@@ -5729,6 +5869,33 @@ cleanup:
  * SACK evidence above the hole. Verify that the ACK exits timeout recovery
  * before its recovery point and immediately enters a fresh fast-recovery
  * episode for the residual loss. */
+typedef struct
+{
+  tcp_connection_t *tc;
+  tcp_tamper_rule_t *ack_rule;
+  sack_block_t dsack;
+  u32 ack_matches_before;
+  volatile u8 done;
+  volatile u8 in_flight;
+} tcp_test_dsack_ack_rpc_args_t;
+
+static tcp_test_dsack_ack_rpc_args_t tcp_test_dsack_ack_rpc_args;
+
+static void
+tcp_test_dsack_ack_rpc (void *arg)
+{
+  tcp_test_dsack_ack_rpc_args_t *a = arg;
+
+  vec_insert_elts (a->tc->snd_sacks, &a->dsack, 1, 0);
+  a->tc->snd_sack_pos = 0;
+  a->ack_matches_before = a->ack_rule->n_matched;
+  /* Keep ACKs suppressed until the D-SACK is ready on the receiver's owner. */
+  a->ack_rule->n_drop = 0;
+  tcp_program_ack (a->tc);
+  a->done = 1;
+  a->in_flight = 0;
+}
+
 static int
 tcp_test_tamper_dsack_early_undo (vlib_main_t *vm)
 {
@@ -5745,20 +5912,23 @@ tcp_test_tamper_dsack_early_undo (vlib_main_t *vm)
     .tx_fifo_size = 128 << 10,
   };
   tcp_e2e_ctx_t _ctx, *ctx = &_ctx;
+  tcp_test_dsack_ack_rpc_args_t *a = &tcp_test_dsack_ack_rpc_args;
   tcp_connection_t *client_tc, *server_tc;
   tcp_tamper_rule_t *ack_rule, *loss_rule, *release_rule;
   tcp_ack_ctx_t seed_ac = { 0 };
-  sack_block_t seed_sack, dsack;
+  sack_block_t seed_sack;
   session_t *client_s, *server_s;
   const u32 n_segments = 8;
   u32 tries, max_iters, mss, spurious_seq, loss_seq;
-  u32 total_bytes, drained = 0, fr_before, tr_before, ack_matches_before;
+  u32 total_bytes, drained = 0, fr_before, tr_before;
   u32 fresh_snd_una = 0, fresh_snd_nxt = 0, fresh_snd_congestion = 0;
   u32 fresh_cwnd = 0, fresh_prev_cwnd = 0, fresh_lost = 0;
   u8 *data = 0;
   u8 saw_reentry = 0;
   int error, rv = 0, i;
 
+  if (!TCP_TEST_I ((!a->in_flight), "dsack_early: ACK rpc slot available"))
+    return 1;
   tcp_tamper_reset ();
 
   if (!TCP_TEST_I ((tcp_e2e_setup (vm, ctx, &params) == 0), "dsack_early: e2e setup"))
@@ -5876,14 +6046,19 @@ tcp_test_tamper_dsack_early_undo (vlib_main_t *vm)
       rv = 1;
       goto cleanup;
     }
-  dsack.start = spurious_seq;
-  dsack.end = spurious_seq + mss;
-  vec_insert_elts (server_tc->snd_sacks, &dsack, 1, 0);
-  server_tc->snd_sack_pos = 0;
   client_tc->snd_rxt_ts = 0;
-  ack_matches_before = ack_rule->n_matched;
-  ack_rule->n_drop = 0;
-  tcp_program_ack (server_tc);
+  clib_memset (a, 0, sizeof (*a));
+  a->tc = server_tc;
+  a->ack_rule = ack_rule;
+  a->dsack.start = spurious_seq;
+  a->dsack.end = spurious_seq + mss;
+  a->in_flight = 1;
+  session_send_rpc_evt_to_thread (server_tc->c_thread_index, tcp_test_dsack_ack_rpc, a);
+  for (tries = 0; !a->done && tries < 1000; tries++)
+    tcp_e2e_pump (vm, 1e-3);
+  if (!TCP_TEST_I ((a->done), "dsack_early: D-SACK ACK programmed on receiver thread"))
+    /* A pending RPC still owns the connection and tamper rule. */
+    return 1;
 
   for (tries = 0; tries < 50 && client_tc->snd_una == spurious_seq; tries++)
     tcp_e2e_pump (vm, 1e-3);
@@ -5891,7 +6066,7 @@ tcp_test_tamper_dsack_early_undo (vlib_main_t *vm)
 		   "dsack_early: synthetic D-SACK ACK reached sender "
 		   "(ack matches %u->%u, server sacks %u, tr %u, fr %u, flags 0x%x, "
 		   "dsack flags 0x%x, rxt ranges %u)",
-		   ack_matches_before, ack_rule->n_matched, vec_len (server_tc->snd_sacks),
+		   a->ack_matches_before, ack_rule->n_matched, vec_len (server_tc->snd_sacks),
 		   client_tc->tr_occurences - tr_before, client_tc->fr_occurences - fr_before,
 		   client_tc->flags, client_tc->sack_sb.flags,
 		   tcp_test_dsack_rxt_count (client_tc)))
@@ -5970,7 +6145,8 @@ tcp_test_tamper_dsack_early_undo (vlib_main_t *vm)
 cleanup:
   tcp_tamper_reset ();
   vec_free (data);
-  tcp_e2e_teardown (vm, ctx);
+  if (!tcp_e2e_teardown (vm, ctx))
+    rv = 1;
   return rv;
 }
 
@@ -6090,7 +6266,8 @@ tcp_test_tamper_stranded_head (vlib_main_t *vm)
 cleanup:
   tcp_tamper_reset ();
   vec_free (data);
-  tcp_e2e_teardown (vm, ctx);
+  if (!tcp_e2e_teardown (vm, ctx))
+    rv = 1;
   return rv;
 }
 
@@ -6216,7 +6393,8 @@ tcp_test_tamper_rto (vlib_main_t *vm)
 cleanup:
   tcp_tamper_reset ();
   vec_free (data);
-  tcp_e2e_teardown (vm, ctx);
+  if (!tcp_e2e_teardown (vm, ctx))
+    rv = 1;
   return rv;
 }
 
@@ -10065,6 +10243,152 @@ tcp_test_rack (vlib_main_t *vm, unformat_input_t *input)
   return 0;
 }
 
+/* In SYN_RCVD the rx fifo exists, so the SYN-ACK advertises its size, up to
+ * the unscaled maximum, instead of the smallest fifo size. */
+static int
+tcp_test_synack_wnd (vlib_main_t *vm, u32 fifo_size, u32 expected_wnd)
+{
+  tcp_e2e_params_t params = {
+    .name = "synack_wnd",
+    .client_addr = 0x1c1c1c01,
+    .server_addr = 0x1d1d1d01,
+    .client_vrf = 0,
+    .server_vrf = 2,
+    .server_port = 2263,
+    .client_port = 0,
+    .secret = 2262,
+    .rx_fifo_size = fifo_size,
+    .tx_fifo_size = 64 << 10,
+  };
+  tcp_e2e_ctx_t _ctx = {}, *ctx = &_ctx;
+  int rv = 0;
+
+  if (!TCP_TEST_I ((tcp_e2e_setup (vm, ctx, &params) == 0), "synack_wnd: e2e setup"))
+    {
+      rv = 1;
+      goto cleanup;
+    }
+
+  /* Until the server sends anything else, the client's window is the SYN-ACK's */
+  if (!TCP_TEST_I ((ctx->client_tc->snd_wnd == expected_wnd),
+		   "syn-ack advertises rx fifo size %u (wnd %u, expected %u)", fifo_size,
+		   ctx->client_tc->snd_wnd, expected_wnd))
+    rv = 1;
+
+cleanup:
+  if (!tcp_e2e_teardown (vm, ctx))
+    rv = 1;
+  return rv;
+}
+
+/* RFC 6928 initial window, min (10 * MSS, max (2 * MSS, 14600)), unless the
+ * multiplier is configured */
+static int
+tcp_test_initial_cwnd (void)
+{
+  u16 multiplier = tcp_cfg.initial_cwnd_multiplier;
+  tcp_connection_t _tc = {}, *tc = &_tc;
+  u32 iw[5];
+
+  tcp_cfg.initial_cwnd_multiplier = 0;
+  tc->snd_mss = 536;
+  iw[0] = tcp_initial_cwnd (tc);
+  tc->snd_mss = 1448;
+  iw[1] = tcp_initial_cwnd (tc);
+  tc->snd_mss = 1500;
+  iw[2] = tcp_initial_cwnd (tc);
+  tc->snd_mss = 8948;
+  iw[3] = tcp_initial_cwnd (tc);
+  tcp_cfg.initial_cwnd_multiplier = 4;
+  iw[4] = tcp_initial_cwnd (tc);
+  tcp_cfg.initial_cwnd_multiplier = multiplier;
+
+  TCP_TEST ((iw[0] == 10 * 536), "initial window is 10 segments for mss 536");
+  TCP_TEST ((iw[1] == 10 * 1448), "initial window is 10 segments for mss 1448");
+  TCP_TEST ((iw[2] == 14600), "initial window is 14600 bytes for mss 1500");
+  TCP_TEST ((iw[3] == 2 * 8948), "initial window is 2 segments for mss 8948");
+  TCP_TEST ((iw[4] == 4 * 8948), "configured multiplier overrides the initial window");
+
+  return 0;
+}
+
+/* CUBIC paces at 2x in early slow start and 1x from ssthresh / 2.
+ * NewReno uses the default window rate without a gain. */
+static int
+tcp_test_cc_pacing (void)
+{
+  const tcp_cc_algorithm_type_e cc_types[] = { TCP_CC_CUBIC, TCP_CC_NEWRENO };
+  const struct
+  {
+    u32 ssthresh;
+    u64 cubic_rate;
+    const char *phase;
+  } cases[] = {
+    { 0x7FFFFFFFU, 20000000, "initial slow start" },
+    { 200002, 20000000, "below ssthresh / 2" },
+    { 200000, 10000000, "at ssthresh / 2" },
+    { 199998, 10000000, "above ssthresh / 2" },
+    { 100000, 10000000, "at ssthresh" },
+    { 99998, 10000000, "above ssthresh" },
+  };
+  tcp_connection_t _tc = {}, *tc = &_tc;
+  u64 rate, expected_rate;
+  u32 i, j;
+
+  tc->srtt = 0.01 / TCP_TICK;
+  tc->mrtt_us = 0.01;
+  tc->cwnd = 100000;
+
+  for (i = 0; i < ARRAY_LEN (cc_types); i++)
+    {
+      tc->cc_algo = tcp_cc_algo_get (cc_types[i]);
+      for (j = 0; j < ARRAY_LEN (cases); j++)
+	{
+	  tc->ssthresh = cases[j].ssthresh;
+	  expected_rate = cc_types[i] == TCP_CC_CUBIC ? cases[j].cubic_rate : 10000000;
+	  rate = tcp_cc_get_pacing_rate (tc);
+	  TCP_TEST ((rate == expected_rate), "%s pacing in %s: %llu bytes/s (expected %llu)",
+		    tc->cc_algo->name, cases[j].phase, rate, expected_rate);
+	}
+    }
+
+  return 0;
+}
+
+static int
+tcp_test_startup (vlib_main_t *vm, unformat_input_t *input)
+{
+  const struct
+  {
+    u32 fifo_size;
+    u32 expected_wnd;
+  } cases[] = {
+    { 4 << 10, 4 << 10 },
+    { 32 << 10, 32 << 10 },
+    { 64 << 10, TCP_WND_MAX },
+  };
+  u32 i;
+  int rv;
+
+  while (unformat_check_input (input) != UNFORMAT_END_OF_INPUT)
+    {
+      vlib_cli_output (vm, "parse error: '%U'", format_unformat_error, input);
+      return -1;
+    }
+
+  for (i = 0; i < ARRAY_LEN (cases); i++)
+    if ((rv = tcp_test_synack_wnd (vm, cases[i].fifo_size, cases[i].expected_wnd)))
+      return rv;
+
+  if ((rv = tcp_test_initial_cwnd ()))
+    return rv;
+
+  if ((rv = tcp_test_cc_pacing ()))
+    return rv;
+
+  return 0;
+}
+
 static clib_error_t *
 tcp_test (vlib_main_t *vm, unformat_input_t *input, vlib_cli_command_t *cmd_arg)
 {
@@ -10133,6 +10457,10 @@ tcp_test (vlib_main_t *vm, unformat_input_t *input, vlib_cli_command_t *cmd_arg)
 	{
 	  res = tcp_test_tamper (vm, input);
 	}
+      else if (unformat (input, "startup"))
+	{
+	  res = tcp_test_startup (vm, input);
+	}
       else if (unformat (input, "all"))
 	{
 	  if ((res = tcp_test_sack (vm, input)))
@@ -10160,6 +10488,8 @@ tcp_test (vlib_main_t *vm, unformat_input_t *input, vlib_cli_command_t *cmd_arg)
 	  if ((res = tcp_test_rack (vm, input)))
 	    goto done;
 	  if ((res = tcp_test_tamper (vm, input)))
+	    goto done;
+	  if ((res = tcp_test_startup (vm, input)))
 	    goto done;
 	}
       else

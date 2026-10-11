@@ -24,6 +24,8 @@
 #define IIAVF_AQ_POLL_INTERVAL	  0.2
 #define IIAVF_AQ_BUF_SIZE	  4096
 
+#define IAVF_FCS_LEN 4
+
 typedef struct iavf_adminq_dma_mem iavf_adminq_dma_mem_t;
 
 typedef struct
@@ -199,9 +201,11 @@ typedef struct
   iavf_rx_tail_t tails[IAVF_RX_VECTOR_SZ];
 } iavf_rt_data_t;
 
-#define foreach_iavf_tx_node_counter                                          \
-  _ (SEG_SZ_EXCEEDED, seg_sz_exceeded, ERROR, "segment size exceeded")        \
-  _ (NO_FREE_SLOTS, no_free_slots, ERROR, "no free tx slots")
+#define foreach_iavf_tx_node_counter                                                               \
+  _ (SEG_SZ_EXCEEDED, seg_sz_exceeded, ERROR, "segment size exceeded")                             \
+  _ (NO_FREE_SLOTS, no_free_slots, ERROR, "no free tx slots")                                      \
+  _ (PH_BUF_ALLOC, ph_buf_alloc, ERROR, "ph buf alloc")                                            \
+  _ (GSO_PACKET_DROP, gso_packet_drop, ERROR, "gso packet drop")
 
 typedef enum
 {

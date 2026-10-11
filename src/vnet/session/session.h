@@ -552,11 +552,11 @@ __clib_export int session_enqueue_notify (session_t *s);
 __clib_export int session_dequeue_notify (session_t *s);
 int session_enqueue_notify_cl (session_t *s);
 /* Deprecated, use session_program_* functions */
-int session_send_io_evt_to_thread (svm_fifo_t *f, session_evt_type_t evt_type);
+__clib_export int session_send_io_evt_to_thread (svm_fifo_t *f, session_evt_type_t evt_type);
 /* Deprecated, use session_program_* functions */
-int session_send_io_evt_to_thread_custom (void *data,
-					  clib_thread_index_t thread_index,
-					  session_evt_type_t evt_type);
+__clib_export int session_send_io_evt_to_thread_custom (void *data,
+							clib_thread_index_t thread_index,
+							session_evt_type_t evt_type);
 __clib_export int session_program_tx_io_evt (session_handle_tu_t sh, session_evt_type_t evt_type);
 __clib_export int session_program_rx_io_evt (session_handle_tu_t sh);
 __clib_export int session_program_transport_io_evt (session_handle_tu_t sh,
@@ -590,8 +590,7 @@ transport_cleanup_cb (void *cb_fn, transport_connection_t *tc)
   ((void (*) (transport_connection_t *)) cb_fn) (tc);
 }
 
-int session_stream_connect_notify (transport_connection_t * tc,
-				   session_error_t err);
+__clib_export int session_stream_connect_notify (transport_connection_t *tc, session_error_t err);
 __clib_export int session_dgram_connect_notify (transport_connection_t *tc, session_handle_tu_t osh,
 						session_t **new_session);
 __clib_export void session_migrate_accept (session_t *s);
