@@ -4,47 +4,47 @@ Hash: SHA512
 Architectures: amd64 arm64
 Codename: bookworm
 Components: main
-Date: Sun, 18 Oct 2026 08:43:11 +0000
+Date: Sun, 18 Oct 2026 09:10:19 +0000
 Description: VPP community packages (bookworm)
 Label: VPP
 Origin: VPP community packages
 Suite: bookworm
 MD5Sum:
- 9833bacf5a0d8c74d0b9c3ee2ee04bec              206 Release
+ f8ee8acb14c5a17faa8fe65108256548              206 Release
  85879c346e02d5ac44a869215dedfd47             6361 main/binary-amd64/Packages
- f6f87a7048c600bfa41cb7e88d45f1f2             1844 main/binary-amd64/Packages.gz
+ a71e2267fdea2562b9ac77cf194af9f3             1844 main/binary-amd64/Packages.gz
  6a29442428890555b106d7a25a83f922              112 main/binary-amd64/Release
  cf23eab151324f8fbca086fcd49b9337             6359 main/binary-arm64/Packages
- 6bd776ae3ff5ee3d01ed64c039760b04             1848 main/binary-arm64/Packages.gz
+ 805e03dc55b94d9079e9bd8444577047             1848 main/binary-arm64/Packages.gz
  cc4370c8abee2a027a8e4dc9b97fefbf              112 main/binary-arm64/Release
 SHA1:
- af5285ac095a0256d8a10ae480fa1785ed305560              206 Release
+ 8d58f45b57acd8f31795ba2b8cace6d12de77066              206 Release
  9e32a7b138fce01e6ada8ef42f06e23ad6ddb6b9             6361 main/binary-amd64/Packages
- eafd8fb52595422adffb745aaeaaf4430a223a61             1844 main/binary-amd64/Packages.gz
+ f19acd45eef9cd82cdcf9e4137759a64d4dab5b4             1844 main/binary-amd64/Packages.gz
  89782e1d0916008be0f398c7f0b95e174945ff67              112 main/binary-amd64/Release
  5bd9a9d384fc58e342706c5911dabe9bc3914cc7             6359 main/binary-arm64/Packages
- fde5cfb7fd2406b4d44adf1c4fe8552a05f31d7a             1848 main/binary-arm64/Packages.gz
+ be7662932d8536de20929cb0e12c74c4b6d5217e             1848 main/binary-arm64/Packages.gz
  817ad2de95f3117033bb282011757ba8522f25e4              112 main/binary-arm64/Release
 SHA256:
- 900b52cbfcfefa4a3f72c7a7b2ccd05fb97d52de40982723b8f75506a25d046e              206 Release
+ 745dd7d23b29eb58e8910ea003234ff5343e83e2c0f1964f94338cfc623e821b              206 Release
  b15fc4925106d17335f7f2886bcc1278b97279316ba846496ef6a2721371ed4c             6361 main/binary-amd64/Packages
- 0e6eac77ebe9987f2646f16d2b2c3837762d498abb8e693f2540abb68b56b77f             1844 main/binary-amd64/Packages.gz
+ ac07b5d15ae10ec26dde239359282c3cfec03d1e5d7703fd50c0bb2abfcefffa             1844 main/binary-amd64/Packages.gz
  eee749589ce3dc44d947d28f36b23f9979e745507608d54c0e606a23178e8cb6              112 main/binary-amd64/Release
  e30d001771751149808a583a9ecb99883af1e8616ce90805d7353f82bc3b6c30             6359 main/binary-arm64/Packages
- f37f0caea9bb97e43156d8196fcdc9e9dd977b76a58684f70a861a7e37500e8a             1848 main/binary-arm64/Packages.gz
+ dbc1fac4cd76662b5a49e7d97df20807dbe02aa0069175384259b40dc708fff2             1848 main/binary-arm64/Packages.gz
  ebb15cdd3ca99079d98af3766c9b1e55444dd9d759009e453ae0801921997a27              112 main/binary-arm64/Release
 SHA512:
- 8d6b35f6aa7340927ffd79860cda4d9f360108a4187b2bc3c1e18d5f6032202c1daa8829d1d506bcb9e55e6ca2573c409c685370b2a61706e0820843f6dfcbd0              206 Release
+ 9735bd6b5ec3b5d14f74e809e738baac0c78010dd15c4ab3fc204823238fb592c35e36390558595a7d25a8c229fba0c6acb2dc302f34162639c35705eb1c18a7              206 Release
  a1072d2cd06bf7cf17d8c92486a2d88d485813a876fd7f3aab3a51bbdcb982668b3abde78041471ca9cfb039e8de8fab87a2fd6d27aadbd1420970862bf10a1a             6361 main/binary-amd64/Packages
- f0ccb9a2be7a1c2be45301521dcdc42cf67ed9734a72e8114f242e839baeec1fd3021ca607f06a8fe8c8bf36800a220e8b93deae7710e3db441a767eaec33072             1844 main/binary-amd64/Packages.gz
+ 97ecae97817a4130f05d45bd9657ec1b8ccd04f1445cf5d66c0fa136b0d8295d95140f45cd20cd53307975caaeb6d897e5a5a7fa84ae8e48fa0851759caec92f             1844 main/binary-amd64/Packages.gz
  e8e9b9171c0e47bdb0709981b6232c3017145e8f46c076fc422bf3e87a2bfc5e06d2e5ab91cf53624855ef9b3e92d75beafea446987a40808abe12d884bade8d              112 main/binary-amd64/Release
  b58ac089582990244e1b52c8ae7c9d90bb0c6bbae8e0977d723dc2a9071c890d72f1070dd1ded18ad149f44e800bf6fb18b3147b24eb0b6038b311a2107fea2d             6359 main/binary-arm64/Packages
- 5e5daff153db18021b0c570a28e459df787be64c8faada93066c549e575ae1caea50090984ab3f39cb877425ff34536d223038ba31b32947d4665381f335802f             1848 main/binary-arm64/Packages.gz
+ a44cfd5c442437dd323d9050b56e3e526f17919ca263f614d88cfa46bde2901bfe99f23bab0be2ebaead7d19d431f746447064ebc7bcb1904164155148f4ed74             1848 main/binary-arm64/Packages.gz
  463b9d39b62f02cd25eef5bf493077f818b4b22d9897b2794c48cc5ede6122b9caed128c0892609e2cec5723198a0f67dcd039c4c371244181a454ce6162b67f              112 main/binary-arm64/Release
 -----BEGIN PGP SIGNATURE-----
 
-iHUEARYKAB0WIQT419mlHyVlGRVZ1bkXjZzugotznwUCatSGnwAKCRAXjZzugotz
-n8RwAQD6Xt0FM8REfM4qxRvuYCYghihj6OpbfTYbo4jmbRyr2AEA+GC7oBdZ+HxU
-nqy3WOqOni9uQlgvcBLMn7gaGCd+SAI=
-=ZNAP
+iHUEARYKAB0WIQT419mlHyVlGRVZ1bkXjZzugotznwUCatSM+wAKCRAXjZzugotz
+n4QlAQDYkvkKDWX1Cbfw/XzS8UustHCPplNPFYkAdsf+8Bq3uwEA7HafAYjnlsMm
+tmNQeJPSIEujm+p0pScan692MqVC0Qs=
+=LHk9
 -----END PGP SIGNATURE-----
