@@ -1912,6 +1912,121 @@ sfifo_test_fifo_shrink (vlib_main_t * vm, unformat_input_t * input)
 }
 
 static int
+sfifo_test_fifo_reservation (vlib_main_t *vm, unformat_input_t *input)
+{
+  fifo_segment_main_t _fsm = { 0 }, *fsm = &_fsm;
+  const u32 first_len = 3000, second_len = 6000;
+  svm_fifo_seg_t segs[8];
+  svm_fifo_seg_t legacy[8];
+  u8 *expected = 0, *actual = 0;
+  fifo_segment_t *fs;
+  svm_fifo_t *f;
+  u32 copied, i, n_chunks, head, tail;
+  int n_segs, rv;
+
+  (void) input;
+
+  fs = fifo_segment_prepare (fsm, "fifo-reservation", 0);
+  SFIFO_TEST (fs != 0, "fifo segment allocated");
+
+  /* Start with one 4K chunk and let provisioning grow the chunk list. */
+  f = fifo_prepare (fs, 4096);
+  SFIFO_TEST (f != 0, "fifo allocated");
+  svm_fifo_set_size (f, 16 << 10);
+
+  /* Empty ranges must not allocate chunks or publish data. */
+  n_chunks = svm_fifo_n_chunks (f);
+  head = f->shr->head;
+  tail = f->shr->tail;
+  rv = svm_fifo_provision_chunks_at_offset (f, 64, segs, ARRAY_LEN (segs), 0);
+  SFIFO_TEST (rv == 0, "empty offset reservation returns no segments");
+  rv = svm_fifo_provision_chunks_at_offset (f, 16 << 10, segs, ARRAY_LEN (segs), 0);
+  SFIFO_TEST (rv == 0, "empty reservation at capacity is accepted");
+  rv = svm_fifo_provision_chunks_at_offset (f, (16 << 10) + 1, segs, ARRAY_LEN (segs), 0);
+  SFIFO_TEST (rv == SVM_FIFO_EFULL, "empty reservation beyond capacity is rejected");
+  rv = svm_fifo_provision_chunks_at_offset (f, ~0u, segs, ARRAY_LEN (segs), 2);
+  SFIFO_TEST (rv == SVM_FIFO_EFULL, "overflowing reservation range is rejected");
+  rv = svm_fifo_provision_chunks_at_offset (f, 1, segs, ARRAY_LEN (segs), ~0u);
+  SFIFO_TEST (rv == SVM_FIFO_EFULL, "overflowing reservation length is rejected");
+  SFIFO_TEST (svm_fifo_n_chunks (f) == n_chunks, "empty and invalid ranges do not grow chunks");
+  SFIFO_TEST (f->shr->head == head && f->shr->tail == tail,
+	      "empty and invalid ranges preserve fifo indices");
+
+  rv = svm_fifo_provision_chunks (f, legacy, ARRAY_LEN (legacy), first_len);
+  n_segs = svm_fifo_provision_chunks_at_offset (f, 0, segs, ARRAY_LEN (segs), first_len);
+  SFIFO_TEST (rv == n_segs, "offset zero preserves historical segment count");
+  for (i = 0; i < n_segs; i++)
+    SFIFO_TEST (segs[i].data == legacy[i].data && segs[i].len == legacy[i].len,
+		"offset zero preserves historical segment %u", i);
+
+  vec_validate (expected, first_len + second_len - 1);
+  vec_validate (actual, first_len + second_len - 1);
+  for (i = 0; i < vec_len (expected); i++)
+    expected[i] = (i * 17 + 3) & 0xff;
+
+  /* Provision capacity without constructing a prefix vector. */
+  rv = svm_fifo_provision_chunks_at_offset (f, first_len, 0, 0, second_len);
+  SFIFO_TEST (rv == 0, "capacity-only reservation succeeds without output segments");
+  SFIFO_TEST (svm_fifo_n_chunks (f) > n_chunks, "capacity-only reservation grows chunks");
+  n_segs = svm_fifo_provision_chunks_at_offset (f, 0, segs, 1, first_len + second_len);
+  SFIFO_TEST (n_segs == 1 && segs[0].len < first_len + second_len,
+	      "limited output vector maps only the available segment slot");
+  n_segs = svm_fifo_provision_chunks_at_offset (f, first_len, segs, 1, second_len);
+  SFIFO_TEST (n_segs == 1 && segs[0].len < second_len,
+	      "limited offset vector stops before the next chunk");
+  n_segs = svm_fifo_provision_chunks_at_offset (f, 4096, segs, 1, 1);
+  SFIFO_TEST (n_segs == 1 && segs[0].len == 1, "reservation starts exactly at a chunk boundary");
+  segs[0].data = expected;
+  segs[0].len = 123;
+  rv = svm_fifo_provision_chunks_at_offset (f, first_len, segs, 0, second_len);
+  SFIFO_TEST (rv == 0 && segs[0].data == expected && segs[0].len == 123,
+	      "zero segment capacity leaves output untouched");
+
+  /* Provision and complete the second asynchronous operation first. */
+  n_segs = svm_fifo_provision_chunks_at_offset (f, first_len, segs, ARRAY_LEN (segs), second_len);
+  SFIFO_TEST (n_segs > 0, "second reservation provisioned in %d segments", n_segs);
+  copied = 0;
+  for (i = 0; i < n_segs; i++)
+    {
+      clib_memcpy_fast (segs[i].data, expected + first_len + copied, segs[i].len);
+      copied += segs[i].len;
+    }
+  SFIFO_TEST (copied == second_len, "second reservation mapped %u bytes", copied);
+  SFIFO_TEST (svm_fifo_max_dequeue_cons (f) == 0, "uncommitted reservation is not visible");
+
+  n_segs = svm_fifo_provision_chunks_at_offset (f, 0, segs, ARRAY_LEN (segs), first_len);
+  SFIFO_TEST (n_segs > 0, "first reservation provisioned in %d segments", n_segs);
+  copied = 0;
+  for (i = 0; i < n_segs; i++)
+    {
+      clib_memcpy_fast (segs[i].data, expected + copied, segs[i].len);
+      copied += segs[i].len;
+    }
+  SFIFO_TEST (copied == first_len, "first reservation mapped %u bytes", copied);
+
+  /* The producer publishes completed reservations in stream order. */
+  svm_fifo_enqueue_nocopy (f, first_len);
+  SFIFO_TEST (svm_fifo_max_dequeue_cons (f) == first_len, "only first reservation is visible");
+  svm_fifo_enqueue_nocopy (f, second_len);
+  SFIFO_TEST (svm_fifo_max_dequeue_cons (f) == first_len + second_len,
+	      "both reservations are visible");
+
+  rv = svm_fifo_dequeue (f, first_len + second_len, actual);
+  SFIFO_TEST (rv == first_len + second_len, "dequeued %d reserved bytes", rv);
+  SFIFO_TEST (!memcmp (actual, expected, first_len + second_len),
+	      "reserved data preserved across chunk boundaries");
+
+  rv = svm_fifo_provision_chunks_at_offset (f, 16 << 10, segs, ARRAY_LEN (segs), 1);
+  SFIFO_TEST (rv == SVM_FIFO_EFULL, "reservation beyond fifo size rejected");
+
+  ft_fifo_free (fs, f);
+  ft_fifo_segment_free (fsm, fs);
+  vec_free (expected);
+  vec_free (actual);
+  return 0;
+}
+
+static int
 sfifo_test_fifo_indirect (vlib_main_t * vm, unformat_input_t * input)
 {
   int __clib_unused verbose = 0, fifo_size = 4096, deq_chunk;
@@ -2091,6 +2206,93 @@ sfifo_test_fifo_make_rcv_wnd_zero (vlib_main_t * vm, unformat_input_t * input)
 
 
 static fifo_segment_main_t segment_main;
+
+/*
+ * Enqueue segments with offset
+ */
+static int
+sfifo_test_fifo_ooo_segs (vlib_main_t *vm, unformat_input_t *input)
+{
+  fifo_segment_main_t _fsm = { 0 }, *fsm = &_fsm;
+  u32 fifo_size = 16 << 10, index;
+  u8 *test_data = 0, *data_buf = 0;
+  svm_fifo_seg_t segs[4];
+  ooo_segment_t *newest;
+  int verbose = 0, rv;
+  fifo_segment_t *fs;
+  svm_fifo_t *f;
+
+  while (unformat_check_input (input) != UNFORMAT_END_OF_INPUT)
+    {
+      if (unformat (input, "verbose"))
+	verbose = 1;
+      else
+	{
+	  vlib_cli_output (vm, "parse error: '%U'", format_unformat_error, input);
+	  return -1;
+	}
+    }
+
+  fs = fifo_segment_prepare (fsm, "fifo-ooo-segs", 0);
+  f = fifo_prepare (fs, 4096);
+  svm_fifo_init_ooo_lookup (f, 0 /* enq ooo */);
+  svm_fifo_set_size (f, fifo_size);
+  validate_test_and_buf_vecs (&test_data, &data_buf, fifo_size);
+
+  /* Back to back segments, including an empty one, are added as one
+   * out-of-order segment, also across the chunks the enqueue allocates */
+  segs[0] = (svm_fifo_seg_t) { test_data + 1000, 3000 };
+  segs[1] = (svm_fifo_seg_t) { test_data + 4000, 0 };
+  segs[2] = (svm_fifo_seg_t) { test_data + 4000, 2500 };
+  segs[3] = (svm_fifo_seg_t) { test_data + 6500, 3000 };
+  rv = svm_fifo_enqueue_segments_with_offset (f, 1000, segs, 4, 0 /* allow partial */);
+  SFIFO_TEST (rv == 8500, "enqueued %d expected %u", rv, 8500);
+  newest = svm_fifo_newest_ooo_segment (f);
+  SFIFO_TEST (svm_fifo_n_ooo_segments (f) == 1 && newest &&
+		ooo_segment_offset_prod (f, newest) == 1000 &&
+		ooo_segment_length (f, newest) == 8500,
+	      "segments added as one out-of-order segment");
+  SFIFO_TEST (svm_fifo_n_chunks (f) > 1, "segments span %u chunks", svm_fifo_n_chunks (f));
+  SFIFO_TEST (svm_fifo_max_dequeue (f) == 0, "no data in order");
+  if (verbose)
+    vlib_cli_output (vm, "fifo after segments at 1000: %U", format_svm_fifo, f, 1);
+
+  /* Segments that only repeat queued data change no segment */
+  svm_fifo_newest_ooo_segment_reset (f);
+  segs[0] = (svm_fifo_seg_t) { test_data + 2000, 500 };
+  segs[1] = (svm_fifo_seg_t) { test_data + 2500, 3000 };
+  rv = svm_fifo_enqueue_segments_with_offset (f, 2000, segs, 2, 0 /* allow partial */);
+  SFIFO_TEST (rv == 3500 && !svm_fifo_newest_ooo_segment (f) && svm_fifo_n_ooo_segments (f) == 1,
+	      "repeated data changes no segment");
+
+  /* Segments that do not fit are not enqueued, unless partial enqueues are
+   * allowed, in which case the prefix that fits is */
+  segs[0] = (svm_fifo_seg_t) { test_data + 9000, 4000 };
+  segs[1] = (svm_fifo_seg_t) { test_data + 13000, 4000 };
+  rv = svm_fifo_enqueue_segments_with_offset (f, 9000, segs, 2, 0 /* allow partial */);
+  SFIFO_TEST (rv == SVM_FIFO_EFULL && svm_fifo_n_ooo_segments (f) == 1,
+	      "segments that do not fit are not enqueued");
+  rv = svm_fifo_enqueue_segments_with_offset (f, 9000, segs, 2, 1 /* allow partial */);
+  newest = svm_fifo_newest_ooo_segment (f);
+  SFIFO_TEST (rv == fifo_size - 9000 && newest && ooo_segment_offset_prod (f, newest) == 1000 &&
+		ooo_segment_length (f, newest) == fifo_size - 1000,
+	      "partial enqueue fills the fifo");
+  rv = svm_fifo_enqueue_segments_with_offset (f, fifo_size, segs, 1, 1 /* allow partial */);
+  SFIFO_TEST (rv == SVM_FIFO_EFULL, "no partial enqueue past the fifo end");
+
+  /* Filling the hole in order collects all of the data */
+  rv = svm_fifo_enqueue (f, 1000, test_data);
+  SFIFO_TEST (rv == fifo_size, "enqueued %d expected %u", rv, fifo_size);
+  rv = svm_fifo_dequeue (f, fifo_size, data_buf);
+  SFIFO_TEST (rv == fifo_size && !compare_data (data_buf, test_data, 0, fifo_size, &index),
+	      "data preserved");
+
+  vec_free (test_data);
+  vec_free (data_buf);
+  ft_fifo_free (fs, f);
+  ft_fifo_segment_free (fsm, fs);
+  return 0;
+}
 
 static int
 sfifo_test_fifo_segment_hello_world (int verbose)
@@ -2840,10 +3042,14 @@ svm_fifo_test (vlib_main_t * vm, unformat_input_t * input,
 	res = sfifo_test_fifo_grow (vm, input);
       else if (unformat (input, "shrink"))
 	res = sfifo_test_fifo_shrink (vm, input);
+      else if (unformat (input, "reservation"))
+	res = sfifo_test_fifo_reservation (vm, input);
       else if (unformat (input, "indirect"))
 	res = sfifo_test_fifo_indirect (vm, input);
       else if (unformat (input, "zero"))
 	res = sfifo_test_fifo_make_rcv_wnd_zero (vm, input);
+      else if (unformat (input, "ooo-segs"))
+	res = sfifo_test_fifo_ooo_segs (vm, input);
       else if (unformat (input, "segment"))
 	res = sfifo_test_fifo_segment (vm, input);
       else if (unformat (input, "all"))
@@ -2905,10 +3111,16 @@ svm_fifo_test (vlib_main_t * vm, unformat_input_t * input,
 	  if ((res = sfifo_test_fifo_shrink (vm, input)))
 	    goto done;
 
+	  if ((res = sfifo_test_fifo_reservation (vm, input)))
+	    goto done;
+
 	  if ((res = sfifo_test_fifo_indirect (vm, input)))
 	    goto done;
 
 	  if ((res = sfifo_test_fifo_make_rcv_wnd_zero (vm, input)))
+	    goto done;
+
+	  if ((res = sfifo_test_fifo_ooo_segs (vm, input)))
 	    goto done;
 
 	  str = "all";

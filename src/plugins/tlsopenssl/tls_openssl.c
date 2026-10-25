@@ -444,6 +444,17 @@ openssl_confirm_app_close (tls_ctx_t *ctx)
   session_transport_closed_notify (&ctx->connection);
 }
 
+/* One record usually fits the chunks the fifo already has */
+static __clib_noinline int
+openssl_provision_record (svm_fifo_t *tx_fifo, svm_fifo_t *app_fifo, u32 *len)
+{
+  *len = clib_min (*len, svm_fifo_max_read_chunk (app_fifo));
+  *len = clib_min (*len, SSL3_RT_MAX_PLAIN_LENGTH);
+
+  return svm_fifo_provision_chunks (tx_fifo, 0, 0,
+				    *len + SSL3_RT_HEADER_LENGTH + SSL3_RT_MAX_ENCRYPTED_OVERHEAD);
+}
+
 static int
 openssl_ctx_write_tls (tls_ctx_t *ctx, session_t *app_session,
 		       transport_send_params_t *sp)
@@ -472,7 +483,8 @@ openssl_ctx_write_tls (tls_ctx_t *ctx, session_t *app_session,
    * If under memory pressure, tls's fifo segment might not be able to
    * allocate the chunks needed. This also avoids errors from the underlying
    * custom bio to the ssl infra which at times can get stuck. */
-  if (svm_fifo_provision_chunks (ts->tx_fifo, 0, 0, deq_max + TLSO_CTRL_BYTES))
+  if (PREDICT_FALSE (svm_fifo_provision_chunks (ts->tx_fifo, 0, 0, deq_max + TLSO_CTRL_BYTES)) &&
+      openssl_provision_record (ts->tx_fifo, f, &deq_max))
     goto check_tls_fifo;
 
   wrote = openssl_write_from_fifo_into_ssl (f, ctx, sp, deq_max);
@@ -1837,9 +1849,10 @@ openssl_tls_ctx_attribute (tls_ctx_t *ctx, u8 is_get,
 	if (requested & TLS_CERT_F_LEAF)
 	  {
 #if OPENSSL_VERSION_NUMBER >= 0x30000000L
-	    X509 *peer_cert = SSL_get1_peer_certificate (oc->ssl);
+	    X509 *peer_cert = SSL_get0_peer_certificate (oc->ssl);
 #else
-	    X509 *peer_cert = SSL_get_peer_certificate (oc->ssl);
+	    SSL_SESSION *session = SSL_get_session (oc->ssl);
+	    X509 *peer_cert = session ? SSL_SESSION_get0_peer (session) : NULL;
 #endif
 	    if (peer_cert)
 	      {
@@ -1847,8 +1860,7 @@ openssl_tls_ctx_attribute (tls_ctx_t *ctx, u8 is_get,
 		attr->tls_peer_cert.flags |= TLS_CERT_F_LEAF;
 	      }
 	  }
-
-	if (requested & TLS_CERT_F_CHAIN)
+	else if (requested & TLS_CERT_F_CHAIN)
 	  {
 	    STACK_OF (X509) *chain = SSL_get_peer_cert_chain (oc->ssl);
 	    if (chain && sk_X509_num (chain) > 0)

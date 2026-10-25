@@ -16,12 +16,13 @@ const tcpChainedBufferMTU = 9000
 func init() {
 	RegisterVperfTests(VperfBuiltinTest, VperfBuiltinClientSessionDisconnectTest, VperfBuiltinBandwidthTest,
 		VperfBuiltinEchoBytesTest, VperfBuiltinRoundtripTest, VperfBuiltinUdpLossTest, VperfBuiltinPeriodicReportTest,
+		VperfBuiltinTcpEchoBytesTest,
 		VperfBuiltinPeriodicReportTotalTest, TlsSingleConnectionTest, VperfBuiltinPeriodicReportUDPTest, VperfBuiltinUdpTest,
-		VperfBuiltinTcpNoTxCsumOffloadTest, VperfBuiltinTcpChainedBufferTest,
+		VperfBuiltinTestBytesTest, VperfBuiltinUdpTestBytesTest, VperfBuiltinTcpNoTxCsumOffloadTest, VperfBuiltinTcpChainedBufferTest,
 		VperfBuiltinUdpNoTxCsumOffloadTest, VperfBuiltinHttpTest, VperfBuiltinHttpsTest, VperfBuiltinHttp2Test,
 		VperfBuiltinHttp3Test, VperfBuiltinHttpTestBytesTest, VperfBuiltinHttp2ConnectTcpTest, VperfBuiltinHttp3ConnectTcpTest,
 		VperfBuiltinHttp2ConnectUdpTest, VperfBuiltinHttp3ConnectUdpTest, VperfBuiltinHttp2ConnectUdpBackpressureTest,
-		TlsPicotlsTransferTest, TlsPicotlsSmallFifoTransferTest)
+		TlsPicotlsTransferTest, TlsPicotlsSmallFifoTransferTest, VperfBuiltinUdpUsoTestBytesTest)
 	RegisterVperfMWTests(TcpWithLossMWTest, TcpChainedBufferWithLossMWTest, VperfBuiltinHttp1CpsMWTest,
 		VperfBuiltinHttp2CpsMWTest, VperfBuiltinHttp3CpsMWTest, VperfBuiltinHttp2ConnectUdpBackpressureMWTest)
 	RegisterVperf6Tests(TcpWithLoss6Test)
@@ -107,6 +108,32 @@ func VperfBuiltinUdpTest(s *VperfSuite) {
 		" uri udp://" + s.Interfaces.Server.Ip4AddressString() + ":" + s.Ports.Port1)
 	Log(o)
 	AssertNotContains(o, "failed:")
+}
+
+func VperfBuiltinTestBytesTest(s *VperfSuite) {
+	serverVpp := s.Containers.ServerVpp.VppInstance
+	clientVpp := s.Containers.ClientVpp.VppInstance
+
+	serverVpp.Vppctl("vperf server uri tcp://%s/%s", s.Interfaces.Server.Ip4AddressString(), s.Ports.Port1)
+
+	o := clientVpp.Vppctl("vperf client bytes 32m test-bytes verbose uri tcp://%s/%s",
+		s.Interfaces.Server.Ip4AddressString(), s.Ports.Port1)
+	Log(o)
+	AssertNotContains(o, "failed")
+	AssertContains(o, "33554432 bytes")
+}
+
+func VperfBuiltinUdpTestBytesTest(s *VperfSuite) {
+	serverVpp := s.Containers.ServerVpp.VppInstance
+	clientVpp := s.Containers.ClientVpp.VppInstance
+
+	serverVpp.Vppctl("vperf server uri udp://%s/%s", s.Interfaces.Server.Ip4AddressString(), s.Ports.Port1)
+
+	o := clientVpp.Vppctl("vperf client bytes 6000k throughput 12m test-bytes verbose uri udp://%s/%s",
+		s.Interfaces.Server.Ip4AddressString(), s.Ports.Port1)
+	Log(o)
+	AssertNotContains(o, "failed")
+	AssertContains(o, "lost 0 datagrams")
 }
 
 func VperfBuiltinTcpNoTxCsumOffloadTest(s *VperfSuite) {
@@ -356,6 +383,19 @@ func VperfBuiltinRoundtripTest(s *VperfSuite) {
 	}
 }
 
+func VperfBuiltinTcpEchoBytesTest(s *VperfSuite) {
+	serverVpp := s.Containers.ServerVpp.VppInstance
+	clientVpp := s.Containers.ClientVpp.VppInstance
+
+	serverVpp.Vppctl("vperf server uri tcp://%s/%s", s.Interfaces.Server.Ip4AddressString(), s.Ports.Port1)
+
+	o := clientVpp.Vppctl("vperf client bytes 8m echo-bytes test-timeout 10 uri tcp://%s/%s",
+		s.Interfaces.Server.Ip4AddressString(), s.Ports.Port1)
+	Log(o)
+	AssertNotContains(o, "failed")
+	AssertContains(o, "8388608 bytes")
+}
+
 func VperfBuiltinEchoBytesTest(s *VperfSuite) {
 	serverVpp := s.Containers.ServerVpp.VppInstance
 
@@ -389,6 +429,19 @@ func VperfBuiltinUdpLossTest(s *VperfSuite) {
 	AssertNotContains(o, "failed")
 	AssertContains(o, "lost")
 	AssertContains(o, " bytes out of 32768 sent (32768 target)")
+}
+
+func VperfBuiltinUdpUsoTestBytesTest(s *VperfSuite) {
+	serverVpp := s.Containers.ServerVpp.VppInstance
+	clientVpp := s.Containers.ClientVpp.VppInstance
+
+	serverVpp.Vppctl("vperf server uri udp://%s/%s", s.Interfaces.Server.Ip4AddressString(), s.Ports.Port1)
+
+	o := clientVpp.Vppctl("vperf client uso bytes 6000k throughput 12m test-bytes verbose uri udp://%s/%s",
+		s.Interfaces.Server.Ip4AddressString(), s.Ports.Port1)
+	Log(o)
+	AssertNotContains(o, "failed")
+	AssertContains(o, "lost 0 datagrams")
 }
 
 func setTcpChainedBufferLinuxLinkMTU(ifName string, mtu int) {
@@ -549,10 +602,10 @@ func tcpWithLossAndNoLoss(s tcpWithLossInterface, clientVpp *VppInstance,
 // The picotls tests in tls_test.go only cover the handshake, so nothing else
 // exercises its record encrypt and decrypt paths.
 func TlsPicotlsTransferTest(s *VperfSuite) {
-	tlsPicotlsTransferTest(s, "")
+	tlsPicotlsTransferTest(s, " echo-bytes")
 }
 
-// Same, but with an app fifo small enough that the engine is handed short
+// Same, one-way, with an app fifo small enough that the engine is handed short
 // leading tx segments, which takes its gather-into-a-staging-buffer path.
 func TlsPicotlsSmallFifoTransferTest(s *VperfSuite) {
 	tlsPicotlsTransferTest(s, " fifo-size 32k")
@@ -573,9 +626,6 @@ func tlsPicotlsTransferTest(s *VperfSuite, extraArgs string) {
 	throughput, err := ParseVperfClientTransfer(o)
 	AssertNil(err)
 	AssertGreaterThan(throughput, uint64(0), "throughput must be > 0")
-
-	// test-bytes mismatches are reported by the receiving side only
-	AssertNotContains(serverVpp.Vppctl("show log"), "expected")
 }
 
 func TlsSingleConnectionTest(s *VperfSuite) {

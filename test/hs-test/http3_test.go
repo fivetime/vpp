@@ -17,12 +17,12 @@ import (
 )
 
 func init() {
-	RegisterH3Tests(Http3GetTest, Http3DownloadTest, Http3PostTest, Http3UploadTest, Http3ClientGetRepeatTest,
+	RegisterH3Tests(Http3GetTest, Http3AltSvcCompoundListenerTest, Http3DownloadTest, Http3PostTest, Http3UploadTest, Http3ClientGetRepeatTest,
 		Http3ClientGetMultiplexingTest, Http3PeerResetStream, Http3ClientRequestIncompleteTest,
 		Http3MissingPseudoHeaderTest, Http3MissingSchemePseudoHeaderTest, Http3MissingPathPseudoHeaderTest,
 		Http3MissingAuthorityPseudoHeaderTest, Http3ConnectWithSchemePathPseudoHeadersTest,
 		Http3PseudoHeaderAfterRegularTest, Http3ReservedFrameTest, Http3DataFrameOnCtrlStreamTest,
-		Http3GoawayOnReqStreamTest, Http3SecondSettingsFrameTest,
+		Http3GoawayOnReqStreamTest, Http3GoawayInvalidLengthTest, Http3SecondSettingsFrameTest,
 		Http3ReservedSettingsTest, Http3MissingSettingsTest, Http3SecondCtrlStreamTest,
 		Http3SecondQpackDecoderStreamTest, Http3SecondQpackEncoderStreamTest, Http3CtrlStreamClosedTest,
 		Http3QpackDecompressionFailedTest, Http3ClientOpenPushStreamTest, Http3DataBeforeHeadersTest,
@@ -111,6 +111,35 @@ func Http3GetTest(s *Http3Suite) {
 	Log(vpp.Vppctl("http cli server listener del uri https://" + serverAddress))
 	o = vpp.Vppctl("show session verbose")
 	AssertNotContains(o, "LISTEN")
+}
+
+func Http3AltSvcCompoundListenerTest(s *Http3Suite) {
+	vpp := s.Containers.Vpp.VppInstance
+	uri := "https://" + net.JoinHostPort(s.VppAddr(), s.Ports.Port1)
+	o := vpp.Vppctl("http cli server http3-enabled listener add uri " + uri)
+	Log(o)
+	AssertEmpty(strings.TrimSpace(o))
+
+	Log(vpp.Vppctl("show session verbose 2"))
+
+	// The compound listener advertises its own port without an explicit Alt-Svc port.
+	for _, protoMajor := range []int{1, 2} {
+		client := NewHttpClient(defaultHttpTimeout, protoMajor == 2)
+		defer client.CloseIdleConnections()
+		resp, err := client.Get(uri + "/show/version")
+		AssertNil(err, fmt.Sprint(err))
+		defer resp.Body.Close()
+		Log(DumpHttpResp(resp, false))
+
+		AssertHttpStatus(resp, http.StatusOK)
+		AssertEqual(protoMajor, resp.ProtoMajor)
+		AssertHttpHeaderWithValue(resp, "Alt-Svc", fmt.Sprintf(`h3=":%s"`, s.Ports.Port1))
+	}
+
+	// Verify that HTTP/3 is reachable on the advertised UDP port.
+	args := fmt.Sprintf("-k --max-time 10 --noproxy '*' --http3-only %s/show/version", uri)
+	_, log := RunCurlContainer(s.Containers.Curl, args)
+	AssertContains(log, "HTTP/3 200")
 }
 
 func Http3DownloadTest(s *Http3Suite) {
@@ -486,7 +515,8 @@ func Http3HalfClosedBeforeAllDataTest(s *Http3Suite) {
 	AssertNil(err)
 	// content-length is 5, but DATA frame has 4 bytes and then FIN
 	_, err = stream.Write([]byte{
-		0x01, 0x0B, 0x00, 0x00, 0xD4, 0xD7, 0xC1, 0x50,
+		0x01, 0x13, 0x00, 0x00, 0xD4, 0xD7, 0x51, 0x07,
+		0x2F, 0x75, 0x70, 0x6C, 0x6F, 0x61, 0x64, 0x50,
 		0x01, 0x61, 0x54, 0x01, 0x35, 0x00, 0x04, 0x78,
 		0x78, 0x78, 0x78,
 	})
@@ -564,6 +594,16 @@ func Http3DataFrameOnCtrlStreamTest(s *Http3Suite) {
 
 func Http3GoawayOnReqStreamTest(s *Http3Suite) {
 	http3SendReqExpectConnError(s, []byte{0x07, 0x02, 0x7B, 0xBD}, http3.ErrCodeFrameUnexpected)
+}
+
+func Http3GoawayInvalidLengthTest(s *Http3Suite) {
+	http3SendCtrlExpectConnError(
+		s,
+		[]byte{
+			0x04, 0x00, 0x07, 0x09,
+			0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		},
+		http3.ErrCodeFrameError)
 }
 
 func Http3SecondSettingsFrameTest(s *Http3Suite) {

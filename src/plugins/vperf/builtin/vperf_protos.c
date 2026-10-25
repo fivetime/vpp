@@ -56,6 +56,27 @@ vp_proto_connected (session_t *s, vp_test_cfg_t *cfg, vp_test_worker_t *wrk, u32
   return 1;
 }
 
+always_inline void
+vp_proto_server_rx_self_tap (vp_test_session_t *es, session_t *s)
+{
+  /* Program self-tap to retry */
+  if (svm_fifo_set_event (s->rx_fifo))
+    {
+      /* Session node unsets the rx fifo event before notifying the app */
+      if (session_program_transport_io_evt (s->handle, SESSION_IO_EVT_BUILTIN_RX))
+	vp_proto_err ("failed to enqueue self-tap");
+
+#if CLIB_DEBUG > 0
+      if (es->rx_retries == 500000)
+	{
+	  vp_proto_err ("session stuck: %U", format_session, s, 2);
+	}
+      if (es->rx_retries < 500001)
+	es->rx_retries++;
+#endif
+    }
+}
+
 always_inline int
 vp_proto_server_stream_rx_inline (vp_test_session_t *es, session_t *s, u8 *rx_buf, u8 test_bytes)
 {
@@ -82,21 +103,7 @@ vp_proto_server_stream_rx_inline (vp_test_session_t *es, session_t *s, u8 *rx_bu
   if (PREDICT_FALSE (max_transfer == 0))
     {
     rx_event:
-      /* Program self-tap to retry */
-      if (svm_fifo_set_event (rx_fifo))
-	{
-	  if (session_enqueue_notify (s))
-	    vp_proto_err ("failed to enqueue self-tap");
-
-#if CLIB_DEBUG > 0
-	  if (es->rx_retries == 500000)
-	    {
-	      vp_proto_err ("session stuck: %U", format_session, s, 2);
-	    }
-	  if (es->rx_retries < 500001)
-	    es->rx_retries++;
-#endif
-	}
+      svm_fifo_add_want_deq_ntf (tx_fifo, SVM_FIFO_WANT_DEQ_NOTIF);
 
       return 0;
     }
@@ -127,31 +134,38 @@ vp_proto_server_stream_rx_inline (vp_test_session_t *es, session_t *s, u8 *rx_bu
   return 0;
 }
 
-static int
-vp_proto_server_stream_rx (vp_test_session_t *es, session_t *s, u8 *rx_buf)
-{
-  return vp_proto_server_stream_rx_inline (es, s, rx_buf, 0);
-}
-
-static int
-vp_proto_server_stream_rx_test_bytes (vp_test_session_t *es, session_t *s, u8 *rx_buf)
-{
-  return vp_proto_server_stream_rx_inline (es, s, rx_buf, 1);
-}
-
-static void
-vp_proto_server_stream_rx_no_echo (vp_test_session_t *es, session_t *s)
+always_inline void
+vp_proto_server_stream_rx_no_echo_inline (vp_test_session_t *es, session_t *s, u8 *rx_buf, u8 copy)
 {
   svm_fifo_t *rx_fifo = s->rx_fifo;
-  u32 n_read = svm_fifo_max_dequeue_cons (rx_fifo);
+  int rv;
 
-  es->bytes_received += n_read;
-  int rv = svm_fifo_dequeue_drop (rx_fifo, n_read);
-  if (rv > 0 && svm_fifo_needs_deq_ntf (rx_fifo, rv))
+  if (copy)
+    rv = svm_fifo_dequeue (rx_fifo, vec_len (rx_buf), rx_buf);
+  else
+    {
+      /* If no-echo, just drop the data and be done with it. */
+      rv = svm_fifo_dequeue_drop (rx_fifo, svm_fifo_max_dequeue_cons (rx_fifo));
+    }
+  if (rv <= 0)
+    return;
+
+  es->bytes_received += rv;
+  if (svm_fifo_needs_deq_ntf (rx_fifo, rv))
     {
       svm_fifo_clear_deq_ntf (rx_fifo);
       session_program_transport_io_evt (s->handle, SESSION_IO_EVT_RX);
     }
+}
+
+static int
+vp_proto_server_stream_rx (vp_test_session_t *es, session_t *s, u8 *rx_buf,
+			   vp_server_rx_flag_t flags)
+{
+  if (flags & VP_SERVER_RX_F_ECHO)
+    return vp_proto_server_stream_rx_inline (es, s, rx_buf, flags & VP_SERVER_RX_F_CHECK);
+  vp_proto_server_stream_rx_no_echo_inline (es, s, rx_buf, flags & VP_SERVER_RX_F_COPY);
+  return 0;
 }
 
 always_inline u8
@@ -161,6 +175,7 @@ vp_proto_client_stream_rx_inline (vp_test_session_t *es, session_t *s, u8 *rx_bu
   int n_read, i;
   svm_fifo_t *rx_fifo;
   u8 *rx_buf_start;
+  u8 rv = 0;
 
   rx_fifo = es->rx_fifo;
   rx_buf_start = rx_buf;
@@ -179,7 +194,8 @@ vp_proto_client_stream_rx_inline (vp_test_session_t *es, session_t *s, u8 *rx_bu
 	    {
 	      vp_proto_err ("read %d error at byte %lld, 0x%x not 0x%x", n_read,
 			    test_buf_offset + i, rx_buf_start[i], ((test_buf_offset + i) & 0xff));
-	      return 1;
+	      rv = 1;
+	      break;
 	    }
 	}
     }
@@ -206,7 +222,7 @@ vp_proto_client_stream_rx_inline (vp_test_session_t *es, session_t *s, u8 *rx_bu
   es->bytes_to_receive -= n_read;
   es->bytes_received += n_read;
 
-  return 0;
+  return rv;
 }
 
 static u8
@@ -218,7 +234,7 @@ vp_proto_client_stream_rx (vp_test_session_t *es, session_t *s, u8 *rx_buf)
 static u8
 vp_proto_client_stream_rx_test_bytes (vp_test_session_t *es, session_t *s, u8 *rx_buf)
 {
-  return vp_proto_client_stream_rx_inline (es, s, rx_buf, 0);
+  return vp_proto_client_stream_rx_inline (es, s, rx_buf, 1);
 }
 
 static u32
@@ -287,8 +303,6 @@ vp_proto_tcp_connect (vnet_connect_args_t *a, vp_test_cfg_t *cfg)
 static vp_test_proto_vft_t vp_test_tcp = {
   .listen = vp_proto_tcp_listen,
   .server_rx = vp_proto_server_stream_rx,
-  .server_rx_test_bytes = vp_proto_server_stream_rx_test_bytes,
-  .server_rx_no_echo = vp_proto_server_stream_rx_no_echo,
   .connect = vp_proto_tcp_connect,
   .connected = vp_proto_connected,
   .client_rx = vp_proto_client_stream_rx,
@@ -381,39 +395,13 @@ rx_stale:
   return 0;
 
 rx_event:
-  /* Program self-tap to retry */
-  if (svm_fifo_set_event (rx_fifo))
-    {
-      if (session_enqueue_notify (s))
-	vp_proto_err ("failed to enqueue self-tap");
-
-#if CLIB_DEBUG > 0
-      if (es->rx_retries == 500000)
-	{
-	  vp_proto_err ("session stuck: %U", format_session, s, 2);
-	}
-      if (es->rx_retries < 500001)
-	es->rx_retries++;
-#endif
-    }
+  vp_proto_server_rx_self_tap (es, s);
 
   return 0;
 }
 
-static int
-vp_proto_udp_server_rx (vp_test_session_t *es, session_t *s, u8 *rx_buf)
-{
-  return vp_proto_server_dgram_rx (es, s, rx_buf, 0);
-}
-
-static int
-vp_proto_udp_server_rx_test_bytes (vp_test_session_t *es, session_t *s, u8 *rx_buf)
-{
-  return vp_proto_server_dgram_rx (es, s, rx_buf, 1);
-}
-
-static void
-vp_proto_udp_server_rx_no_echo (vp_test_session_t *es, session_t *s)
+always_inline void
+vp_proto_udp_server_rx_no_echo_inline (vp_test_session_t *es, session_t *s, u8 *rx_buf, u8 copy)
 {
   svm_fifo_t *rx_fifo = s->rx_fifo;
   session_dgram_pre_hdr_t ph;
@@ -428,6 +416,9 @@ vp_proto_udp_server_rx_no_echo (vp_test_session_t *es, session_t *s)
       dgram_size = sizeof (session_dgram_hdr_t) + ph.data_length;
       if (left_deq < dgram_size)
 	break;
+      if (copy)
+	svm_fifo_peek (rx_fifo, sizeof (session_dgram_hdr_t),
+		       clib_min (ph.data_length, vec_len (rx_buf)), rx_buf);
       es->dgrams_received++;
       bytes_received += ph.data_length;
       left_deq -= svm_fifo_dequeue_drop (rx_fifo, sizeof (session_dgram_hdr_t) + ph.data_length);
@@ -441,6 +432,15 @@ vp_proto_udp_server_rx_no_echo (vp_test_session_t *es, session_t *s)
     }
 }
 
+static int
+vp_proto_udp_server_rx (vp_test_session_t *es, session_t *s, u8 *rx_buf, vp_server_rx_flag_t flags)
+{
+  if (flags & VP_SERVER_RX_F_ECHO)
+    return vp_proto_server_dgram_rx (es, s, rx_buf, flags & VP_SERVER_RX_F_CHECK);
+  vp_proto_udp_server_rx_no_echo_inline (es, s, rx_buf, flags & VP_SERVER_RX_F_COPY);
+  return 0;
+}
+
 always_inline u8
 vp_proto_client_dgram_rx_inline (vp_test_session_t *es, session_t *s, u8 *rx_buf, u8 test_bytes)
 {
@@ -448,6 +448,7 @@ vp_proto_client_dgram_rx_inline (vp_test_session_t *es, session_t *s, u8 *rx_buf
   int n_read, i;
   svm_fifo_t *rx_fifo;
   u8 *rx_buf_start;
+  u8 rv = 0;
 
   rx_fifo = es->rx_fifo;
 
@@ -476,7 +477,8 @@ vp_proto_client_dgram_rx_inline (vp_test_session_t *es, session_t *s, u8 *rx_buf
 	    {
 	      vp_proto_err ("read %d error at byte %lld, 0x%x not 0x%x", n_read,
 			    test_buf_offset + i, rx_buf_start[i], ((test_buf_offset + i) & 0xff));
-	      return 1;
+	      rv = 1;
+	      break;
 	    }
 	}
     }
@@ -498,7 +500,7 @@ vp_proto_client_dgram_rx_inline (vp_test_session_t *es, session_t *s, u8 *rx_buf
   es->bytes_to_receive -= n_read;
   es->bytes_received += n_read;
 
-  return 0;
+  return rv;
 }
 
 static u8
@@ -695,8 +697,6 @@ vp_proto_udp_connect (vnet_connect_args_t *a, vp_test_cfg_t *cfg)
 static vp_test_proto_vft_t vp_test_udp = {
   .listen = vp_proto_udp_listen,
   .server_rx = vp_proto_udp_server_rx,
-  .server_rx_test_bytes = vp_proto_udp_server_rx_test_bytes,
-  .server_rx_no_echo = vp_proto_udp_server_rx_no_echo,
   .connect = vp_proto_udp_connect,
   .connected = vp_proto_connected,
   .client_rx = vp_proto_client_dgram_rx,
@@ -795,7 +795,7 @@ vp_proto_client_udp_uso_tx_test_bytes (vp_test_session_t *es, u8 *test_data, u32
 				  { test_data + test_buf_offset, n_transfer } };
 
   rv = svm_fifo_enqueue_segments (f, data_segs, 2, 0 /* allow partial */);
-  n_sent = vp_protos_check_tx_rv (rv);
+  n_sent = vp_protos_check_tx_rv (rv) ? n_transfer : 0;
   if (svm_fifo_set_event (es->tx_fifo))
     session_program_tx_io_evt (es->tx_fifo->vpp_sh, SESSION_IO_EVT_TX);
 
@@ -807,8 +807,6 @@ vp_proto_client_udp_uso_tx_test_bytes (vp_test_session_t *es, u8 *test_data, u32
 static vp_test_proto_vft_t vp_test_udp_uso = {
   .listen = vp_proto_udp_listen,
   .server_rx = vp_proto_udp_server_rx,
-  .server_rx_test_bytes = vp_proto_udp_server_rx_test_bytes,
-  .server_rx_no_echo = vp_proto_udp_server_rx_no_echo,
   .connect = vp_proto_udp_connect,
   .connected = vp_proto_connected,
   .client_rx = vp_proto_client_dgram_rx,
@@ -868,22 +866,7 @@ vp_proto_tls_server_rx_inline (vp_test_session_t *es, session_t *s, u8 *rx_buf, 
   if (PREDICT_FALSE (max_transfer == 0))
     {
     rx_event:
-      /* Program self-tap to retry */
-      if (svm_fifo_set_event (rx_fifo))
-	{
-	  /* NOTE: session_enqueue_notify() do not work with tls */
-	  if (session_program_transport_io_evt (s->handle, SESSION_IO_EVT_BUILTIN_RX))
-	    vp_proto_err ("failed to enqueue self-tap");
-
-#if CLIB_DEBUG > 0
-	  if (es->rx_retries == 500000)
-	    {
-	      vp_proto_err ("session stuck: %U", format_session, s, 2);
-	    }
-	  if (es->rx_retries < 500001)
-	    es->rx_retries++;
-#endif
-	}
+      vp_proto_server_rx_self_tap (es, s);
 
       return 0;
     }
@@ -915,22 +898,17 @@ vp_proto_tls_server_rx_inline (vp_test_session_t *es, session_t *s, u8 *rx_buf, 
 }
 
 static int
-vp_proto_tls_server_rx (vp_test_session_t *es, session_t *s, u8 *rx_buf)
+vp_proto_tls_server_rx (vp_test_session_t *es, session_t *s, u8 *rx_buf, vp_server_rx_flag_t flags)
 {
-  return vp_proto_tls_server_rx_inline (es, s, rx_buf, 0);
-}
-
-static int
-vp_proto_tls_server_rx_test_bytes (vp_test_session_t *es, session_t *s, u8 *rx_buf)
-{
-  return vp_proto_tls_server_rx_inline (es, s, rx_buf, 1);
+  if (flags & VP_SERVER_RX_F_ECHO)
+    return vp_proto_tls_server_rx_inline (es, s, rx_buf, flags & VP_SERVER_RX_F_CHECK);
+  vp_proto_server_stream_rx_no_echo_inline (es, s, rx_buf, flags & VP_SERVER_RX_F_COPY);
+  return 0;
 }
 
 static vp_test_proto_vft_t vp_test_tls = {
   .listen = vp_proto_tls_listen,
   .server_rx = vp_proto_tls_server_rx,
-  .server_rx_test_bytes = vp_proto_tls_server_rx_test_bytes,
-  .server_rx_no_echo = vp_proto_server_stream_rx_no_echo,
   .connect = vp_proto_tls_connect,
   .connected = vp_proto_connected,
   .client_rx = vp_proto_client_stream_rx,
@@ -978,22 +956,7 @@ vp_proto_quic_server_rx_inline (vp_test_session_t *es, session_t *s, u8 *rx_buf,
   if (PREDICT_FALSE (max_transfer == 0))
     {
     rx_event:
-      /* Program self-tap to retry */
-      if (svm_fifo_set_event (rx_fifo))
-	{
-	  /* NOTE: session_enqueue_notify() do not work with quic */
-	  if (session_program_transport_io_evt (s->handle, SESSION_IO_EVT_BUILTIN_RX))
-	    vp_proto_err ("failed to enqueue self-tap");
-
-#if CLIB_DEBUG > 0
-	  if (es->rx_retries == 500000)
-	    {
-	      vp_proto_err ("session stuck: %U", format_session, s, 2);
-	    }
-	  if (es->rx_retries < 500001)
-	    es->rx_retries++;
-#endif
-	}
+      vp_proto_server_rx_self_tap (es, s);
 
       return 0;
     }
@@ -1025,15 +988,12 @@ vp_proto_quic_server_rx_inline (vp_test_session_t *es, session_t *s, u8 *rx_buf,
 }
 
 static int
-vp_proto_quic_server_rx (vp_test_session_t *es, session_t *s, u8 *rx_buf)
+vp_proto_quic_server_rx (vp_test_session_t *es, session_t *s, u8 *rx_buf, vp_server_rx_flag_t flags)
 {
-  return vp_proto_quic_server_rx_inline (es, s, rx_buf, 0);
-}
-
-static int
-vp_proto_quic_server_rx_test_bytes (vp_test_session_t *es, session_t *s, u8 *rx_buf)
-{
-  return vp_proto_quic_server_rx_inline (es, s, rx_buf, 1);
+  if (flags & VP_SERVER_RX_F_ECHO)
+    return vp_proto_quic_server_rx_inline (es, s, rx_buf, flags & VP_SERVER_RX_F_CHECK);
+  vp_proto_server_stream_rx_no_echo_inline (es, s, rx_buf, flags & VP_SERVER_RX_F_COPY);
+  return 0;
 }
 
 static int
@@ -1091,8 +1051,6 @@ vp_proto_quic_connected (session_t *s, vp_test_cfg_t *cfg, vp_test_worker_t *wrk
 static vp_test_proto_vft_t vp_test_quic = {
   .listen = vp_proto_quic_listen,
   .server_rx = vp_proto_quic_server_rx,
-  .server_rx_test_bytes = vp_proto_quic_server_rx_test_bytes,
-  .server_rx_no_echo = vp_proto_server_stream_rx_no_echo,
   .connect = vp_proto_quic_connect,
   .connected = vp_proto_quic_connected,
   .client_rx = vp_proto_client_stream_rx,
@@ -1276,22 +1234,7 @@ vp_proto_http_server_rx_inline (vp_test_session_t *es, session_t *s, u8 *rx_buf,
   if (PREDICT_FALSE (max_transfer == 0))
     {
     rx_event:
-      /* Program self-tap to retry */
-      if (svm_fifo_set_event (rx_fifo))
-	{
-	  /* NOTE: session_enqueue_notify() do not work with http */
-	  if (session_program_transport_io_evt (s->handle, SESSION_IO_EVT_BUILTIN_RX))
-	    vp_proto_err ("failed to enqueue self-tap");
-
-#if CLIB_DEBUG > 0
-	  if (es->rx_retries == 500000)
-	    {
-	      vp_proto_err ("session stuck: %U", format_session, s, 2);
-	    }
-	  if (es->rx_retries < 500001)
-	    es->rx_retries++;
-#endif
-	}
+      vp_proto_server_rx_self_tap (es, s);
 
       return 0;
     }
@@ -1322,15 +1265,12 @@ vp_proto_http_server_rx_inline (vp_test_session_t *es, session_t *s, u8 *rx_buf,
 }
 
 static int
-vp_proto_http_server_rx (vp_test_session_t *es, session_t *s, u8 *rx_buf)
+vp_proto_http_server_rx (vp_test_session_t *es, session_t *s, u8 *rx_buf, vp_server_rx_flag_t flags)
 {
-  return vp_proto_http_server_rx_inline (es, s, rx_buf, 0);
-}
-
-static int
-vp_proto_http_server_rx_test_bytes (vp_test_session_t *es, session_t *s, u8 *rx_buf)
-{
-  return vp_proto_http_server_rx_inline (es, s, rx_buf, 1);
+  if (flags & VP_SERVER_RX_F_ECHO)
+    return vp_proto_http_server_rx_inline (es, s, rx_buf, flags & VP_SERVER_RX_F_CHECK);
+  vp_proto_server_stream_rx_no_echo_inline (es, s, rx_buf, flags & VP_SERVER_RX_F_COPY);
+  return 0;
 }
 
 static u8
@@ -1405,8 +1345,6 @@ vp_proto_http_client_tx_test_bytes (vp_test_session_t *es, u8 *test_data, u32 ma
 static vp_test_proto_vft_t vp_test_http = {
   .listen = vp_proto_http_listen,
   .server_rx = vp_proto_http_server_rx,
-  .server_rx_test_bytes = vp_proto_http_server_rx_test_bytes,
-  .server_rx_no_echo = vp_proto_server_stream_rx_no_echo,
   .connect = vp_proto_http_connect,
   .connected = vp_proto_http_connected,
   .client_rx = vp_proto_http_client_rx,
@@ -1581,16 +1519,9 @@ vp_proto_http_connect_read_resp (vp_test_session_t *es, session_t *s, u8 *rx_buf
   return 0;
 }
 
-static void
-vp_proto_http_connect_tcp_accept_no_echo (vp_test_session_t *es, session_t *s)
-{
-  es->opaque = 1;
-  vp_proto_http_read_connect_tcp_req (s);
-  vp_proto_http_proxy_send_resp (s, 0);
-}
-
 static int
-vp_proto_http_connect_tcp_accept_echo (vp_test_session_t *es, session_t *s, u8 *rx_buf)
+vp_proto_http_connect_tcp_accept (vp_test_session_t *es, session_t *s, u8 *rx_buf,
+				  vp_server_rx_flag_t flags)
 {
   es->opaque = 1;
   vp_proto_http_read_connect_tcp_req (s);
@@ -1600,37 +1531,22 @@ vp_proto_http_connect_tcp_accept_echo (vp_test_session_t *es, session_t *s, u8 *
 
 vp_test_proto_vft_t vp_proto_http_connect_tcp_vft[2] = {
   {
-    .server_rx = vp_proto_http_connect_tcp_accept_echo,
-    .server_rx_test_bytes = vp_proto_http_connect_tcp_accept_echo,
-    .server_rx_no_echo = vp_proto_http_connect_tcp_accept_no_echo,
+    .server_rx = vp_proto_http_connect_tcp_accept,
     .client_rx = vp_proto_http_connect_read_resp,
     .client_rx_test_bytes = vp_proto_http_connect_read_resp,
   },
   {
     .server_rx = vp_proto_http_server_rx,
-    .server_rx_test_bytes = vp_proto_http_server_rx_test_bytes,
-    .server_rx_no_echo = vp_proto_server_stream_rx_no_echo,
     .client_rx = vp_proto_client_stream_rx,
     .client_rx_test_bytes = vp_proto_client_stream_rx_test_bytes,
   },
 };
 
 static int
-vp_proto_http_connect_tcp_server_rx (vp_test_session_t *es, session_t *s, u8 *rx_buf)
+vp_proto_http_connect_tcp_server_rx (vp_test_session_t *es, session_t *s, u8 *rx_buf,
+				     vp_server_rx_flag_t flags)
 {
-  return vp_proto_http_connect_tcp_vft[es->opaque].server_rx (es, s, rx_buf);
-}
-
-static int
-vp_proto_http_connect_tcp_server_rx_test_bytes (vp_test_session_t *es, session_t *s, u8 *rx_buf)
-{
-  return vp_proto_http_connect_tcp_vft[es->opaque].server_rx_test_bytes (es, s, rx_buf);
-}
-
-static void
-vp_proto_http_connect_tcp_server_rx_no_echo (vp_test_session_t *es, session_t *s)
-{
-  vp_proto_http_connect_tcp_vft[es->opaque].server_rx_no_echo (es, s);
+  return vp_proto_http_connect_tcp_vft[es->opaque].server_rx (es, s, rx_buf, flags);
 }
 
 static u8
@@ -1736,8 +1652,6 @@ static vp_test_proto_vft_t vp_test_http_connect_tcp = {
   .test_init = vp_proto_http_masque_init_test,
   .listen = vp_proto_http_masque_listen,
   .server_rx = vp_proto_http_connect_tcp_server_rx,
-  .server_rx_test_bytes = vp_proto_http_connect_tcp_server_rx_test_bytes,
-  .server_rx_no_echo = vp_proto_http_connect_tcp_server_rx_no_echo,
   .connect = vp_proto_http_masque_connect,
   .connected = vp_proto_http_connect_tcp_connected,
   .client_rx = vp_proto_http_connect_tcp_client_rx,
@@ -1764,16 +1678,9 @@ vp_proto_http_read_connect_udp_req (session_t *s)
   svm_fifo_dequeue_drop (s->rx_fifo, msg.data.len);
 }
 
-static void
-vp_proto_http_connect_udp_accept_no_echo (vp_test_session_t *es, session_t *s)
-{
-  es->opaque = 1;
-  vp_proto_http_read_connect_udp_req (s);
-  vp_proto_http_proxy_send_resp (s, 1);
-}
-
 static int
-vp_proto_http_connect_udp_accept_echo (vp_test_session_t *es, session_t *s, u8 *rx_buf)
+vp_proto_http_connect_udp_accept (vp_test_session_t *es, session_t *s, u8 *rx_buf,
+				  vp_server_rx_flag_t flags)
 {
   es->opaque = 1;
   vp_proto_http_read_connect_udp_req (s);
@@ -1811,22 +1718,7 @@ vp_proto_http_server_dgram_rx (vp_test_session_t *es, session_t *s, u8 *rx_buf, 
       /* No space in tx fifo */
       if (PREDICT_FALSE (max_enqueue < dgram_size))
 	{
-	  /* Program self-tap to retry */
-	  if (svm_fifo_set_event (rx_fifo))
-	    {
-	      /* NOTE: session_enqueue_notify() do not work with http */
-	      if (session_program_transport_io_evt (s->handle, SESSION_IO_EVT_BUILTIN_RX))
-		vp_proto_err ("failed to enqueue self-tap");
-
-#if CLIB_DEBUG > 0
-	      if (es->rx_retries == 500000)
-		{
-		  vp_proto_err ("session stuck: %U", format_session, s, 2);
-		}
-	      if (es->rx_retries < 500001)
-		es->rx_retries++;
-#endif
-	    }
+	  vp_proto_server_rx_self_tap (es, s);
 
 	  return 0;
 	}
@@ -1868,15 +1760,13 @@ vp_proto_http_server_dgram_rx (vp_test_session_t *es, session_t *s, u8 *rx_buf, 
 }
 
 static int
-vp_proto_http_server_rx_dgram (vp_test_session_t *es, session_t *s, u8 *rx_buf)
+vp_proto_http_server_rx_dgram (vp_test_session_t *es, session_t *s, u8 *rx_buf,
+			       vp_server_rx_flag_t flags)
 {
-  return vp_proto_http_server_dgram_rx (es, s, rx_buf, 0);
-}
-
-static int
-vp_proto_http_server_rx_test_bytes_dgram (vp_test_session_t *es, session_t *s, u8 *rx_buf)
-{
-  return vp_proto_http_server_dgram_rx (es, s, rx_buf, 1);
+  if (flags & VP_SERVER_RX_F_ECHO)
+    return vp_proto_http_server_dgram_rx (es, s, rx_buf, flags & VP_SERVER_RX_F_CHECK);
+  vp_proto_udp_server_rx_no_echo_inline (es, s, rx_buf, flags & VP_SERVER_RX_F_COPY);
+  return 0;
 }
 
 always_inline u8
@@ -1939,37 +1829,22 @@ vp_proto_http_client_dgram_rx_test_bytes (vp_test_session_t *es, session_t *s, u
 
 vp_test_proto_vft_t vp_proto_http_connect_udp_vft[2] = {
   {
-    .server_rx = vp_proto_http_connect_udp_accept_echo,
-    .server_rx_test_bytes = vp_proto_http_connect_udp_accept_echo,
-    .server_rx_no_echo = vp_proto_http_connect_udp_accept_no_echo,
+    .server_rx = vp_proto_http_connect_udp_accept,
     .client_rx = vp_proto_http_connect_read_resp,
     .client_rx_test_bytes = vp_proto_http_connect_read_resp,
   },
   {
     .server_rx = vp_proto_http_server_rx_dgram,
-    .server_rx_test_bytes = vp_proto_http_server_rx_test_bytes_dgram,
-    .server_rx_no_echo = vp_proto_udp_server_rx_no_echo,
     .client_rx = vp_proto_http_client_dgram_rx,
     .client_rx_test_bytes = vp_proto_http_client_dgram_rx_test_bytes,
   },
 };
 
 static int
-vp_proto_http_connect_udp_server_rx (vp_test_session_t *es, session_t *s, u8 *rx_buf)
+vp_proto_http_connect_udp_server_rx (vp_test_session_t *es, session_t *s, u8 *rx_buf,
+				     vp_server_rx_flag_t flags)
 {
-  return vp_proto_http_connect_udp_vft[es->opaque].server_rx (es, s, rx_buf);
-}
-
-static int
-vp_proto_http_connect_udp_server_rx_test_bytes (vp_test_session_t *es, session_t *s, u8 *rx_buf)
-{
-  return vp_proto_http_connect_udp_vft[es->opaque].server_rx_test_bytes (es, s, rx_buf);
-}
-
-static void
-vp_proto_http_connect_udp_server_rx_no_echo (vp_test_session_t *es, session_t *s)
-{
-  vp_proto_http_connect_udp_vft[es->opaque].server_rx_no_echo (es, s);
+  return vp_proto_http_connect_udp_vft[es->opaque].server_rx (es, s, rx_buf, flags);
 }
 
 static u8
@@ -2075,8 +1950,6 @@ static vp_test_proto_vft_t vp_test_http_connect_udp = {
   .test_init = vp_proto_http_masque_init_test,
   .listen = vp_proto_http_masque_listen,
   .server_rx = vp_proto_http_connect_udp_server_rx,
-  .server_rx_test_bytes = vp_proto_http_connect_udp_server_rx_test_bytes,
-  .server_rx_no_echo = vp_proto_http_connect_udp_server_rx_no_echo,
   .connect = vp_proto_http_masque_connect,
   .connected = vp_proto_http_connect_udp_connected,
   .client_rx = vp_proto_http_connect_udp_client_rx,
