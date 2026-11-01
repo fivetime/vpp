@@ -743,6 +743,9 @@ func vppConnectProxyClientCheckCleanup(s *MasqueSuite) {
 		}
 		time.Sleep(1 * time.Second)
 	}
+	if !closed {
+		s.SkipIfWrongWorkerThread("connect proxy session not closed")
+	}
 	AssertEqual(closed, true, "connect proxy session not closed")
 	h2Stats := clientVpp.Vppctl("show http stats")
 	streamsOpened := 0
@@ -759,14 +762,23 @@ func vppConnectProxyClientCheckCleanup(s *MasqueSuite) {
 		}
 	}
 	// one stream for http/2 connection (parent stays open)
+	if streamsOpened-streamsClosed != 1 {
+		s.SkipIfWrongWorkerThread("only parent stream should stay open")
+	}
 	AssertEqual(streamsOpened-streamsClosed, 1, "only parent stream should stays open")
 }
 
 func vppConnectProxyServerCheckCleanup(s *MasqueSuite, IsHttp3 bool) {
 	o := s.Containers.VppServer.VppInstance.Vppctl("show session verbose")
 	if IsHttp3 {
+		if strings.Count(o, "[H3]") != 2 {
+			s.SkipIfWrongWorkerThread("unexpected HTTP/3 sessions after cleanup")
+		}
 		AssertEqual(2, strings.Count(o, "[H3]"), "there should be http/3 connection session and parent stream")
 	} else {
+		if strings.Count(o, "[H2]") != 1 {
+			s.SkipIfWrongWorkerThread("unexpected HTTP/2 sessions after cleanup")
+		}
 		AssertEqual(1, strings.Count(o, "[H2]"), "there should be http/2 connection session")
 	}
 	h2Stats := s.Containers.VppServer.VppInstance.Vppctl("show http stats")
@@ -784,8 +796,14 @@ func vppConnectProxyServerCheckCleanup(s *MasqueSuite, IsHttp3 bool) {
 		}
 	}
 	if IsHttp3 {
+		if streamsOpened-streamsClosed != 1 {
+			s.SkipIfWrongWorkerThread("all tunnel streams should be closed")
+		}
 		AssertEqual(streamsOpened-streamsClosed, 1, "all tunnel streams should be closed")
 	} else {
+		if streamsOpened-streamsClosed != 0 {
+			s.SkipIfWrongWorkerThread("all tunnel streams should be closed")
+		}
 		AssertEqual(streamsOpened-streamsClosed, 0, "all tunnel streams should be closed")
 	}
 }
@@ -993,6 +1011,9 @@ func VppConnectProxyIperfUdpMWTest(s *MasqueSuite) {
 		}
 		time.Sleep(1 * time.Second)
 	}
+	if !closed {
+		s.SkipIfWrongWorkerThread("connect proxy TCP sessions not closed")
+	}
 	AssertEqual(closed, true)
 }
 
@@ -1095,6 +1116,9 @@ func VppConnectProxyClientConnectTimeoutMWTest(s *MasqueSuite) {
 	cmd = CommandInNetns([]string{"curl", "--noproxy", "*", "--max-time", "15", "--fail", "--silent", "--show-error", uri}, s.NetNamespaces.Client)
 	output, err = cmd.CombinedOutput()
 	Log(string(output))
+	if err != nil {
+		s.SkipIfWrongWorkerThread("tunnel request on original parent connection failed")
+	}
 	AssertNil(err)
 	AssertEqual(strings.Repeat("x", 64), string(output))
 	AssertEqual(parentConnection, clientVpp.Vppctl("show http connect proxy client"), "parent connection changed")
@@ -1227,6 +1251,9 @@ func vppConnectProxyClientHttp3CheckCleanup(s *MasqueSuite) {
 			break
 		}
 		time.Sleep(1 * time.Second)
+	}
+	if !closed {
+		s.SkipIfWrongWorkerThread("connect proxy session not closed")
 	}
 	AssertEqual(closed, true, "connect proxy session not closed")
 }

@@ -1825,7 +1825,18 @@ class TemplateResponder(IkePeer):
 
     def test_responder(self):
         self.send_sa_init_req()
+        rspi = int.from_bytes(self.sa.rspi, "big")
+        commands = ("show ikev2 sa details", f"show ikev2 sa rspi {rspi:x}")
+        for command in commands:
+            status = self.vapi.cli(command)
+            self.assertIn("profile: none\n", status)
+            self.assertIn("state: SA_INIT\n", status)
+        self.assertIn(f"rspi {rspi:x}", self.vapi.cli("show ikev2 sa"))
         self.send_sa_auth()
+        for command in commands:
+            status = self.vapi.cli(command)
+            self.assertIn(f"profile: {self.p.profile_name}\n", status)
+            self.assertIn("state: AUTHENTICATED\n", status)
         self.verify_ipsec_sas()
         self.verify_ike_sas()
         self.verify_ike_sas_v2()
@@ -2400,6 +2411,8 @@ class TestInitiatorRekey(TestInitiatorPsk):
         self.pg_start()
         self.vapi.ikev2_initiate_rekey_child_sa(ispi=ispi)
         capture = self.pg0.get_capture(1)
+        self.assertEqual(capture[0][UDP].sport, self.sa.dport)
+        self.assertEqual(capture[0][UDP].dport, self.sa.sport)
         ih = self.get_ike_header(capture[0])
         self.assertEqual(ih.exch_type, 36)  # CHILD_SA
         self.assertNotIn("Response", ih.flags)
@@ -2433,6 +2446,17 @@ class TestInitiatorRekey(TestInitiatorPsk):
         self.verify_ike_sas()
         self.verify_ike_sas_v2()
         self.verify_ipsec_sas(is_rekey=True)
+
+
+class TestInitiatorNATPortRekey(TestInitiatorRekey):
+    """Local Child rekey uses the authenticated peer's NAT mapping."""
+
+    def config_tc(self):
+        TestInitiatorNATT.config_tc(self)
+
+    def send_auth_response(self):
+        self.sa.sport = 62000
+        super().send_auth_response()
 
 
 class TestInitiatorDelSAFromResponder(TemplateInitiator, Ikev2Params):

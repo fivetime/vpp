@@ -198,6 +198,19 @@ tcp_rcv_rst (tcp_worker_ctx_t * wrk, tcp_connection_t * tc)
     }
 }
 
+/* Report data below rcv_nxt received again. Returns 1 if a report is pending. */
+static __clib_noinline u8
+tcp_dsack_report_old (tcp_connection_t *tc, vlib_buffer_t *b)
+{
+  u32 seq = vnet_buffer (b)->tcp.seq_number;
+
+  if (!seq_lt (seq, tc->rcv_nxt))
+    return 0;
+
+  tcp_dsack_report (tc, seq, seq_min (vnet_buffer (b)->tcp.seq_end, tc->rcv_nxt));
+  return tcp_dsack_is_pending (tc);
+}
+
 /**
  * Validate incoming segment as per RFC793 p. 69 and RFC1323 p. 19
  *
@@ -237,7 +250,11 @@ tcp_segment_validate (tcp_worker_ctx_t * wrk, tcp_connection_t * tc0,
        * SEG.TSval */
       else if (!tcp_rst (th0))
 	{
-	  tcp_program_ack (tc0);
+	  /* An original delayed past its retransmission fails paws */
+	  if (tcp_dsack_report_old (tc0, b0))
+	    tcp_program_dupack (tc0);
+	  else
+	    tcp_program_ack (tc0);
 	  TCP_EVT (TCP_EVT_DUPACK_SENT, tc0, vnet_buffer (b0)->tcp);
 	  goto error;
 	}
@@ -298,6 +315,7 @@ tcp_segment_validate (tcp_worker_ctx_t * wrk, tcp_connection_t * tc0,
       /* If not RST, send dup ack */
       if (!tcp_rst (th0))
 	{
+	  tcp_dsack_report_old (tc0, b0);
 	  tcp_program_dupack (tc0);
 	  TCP_EVT (TCP_EVT_DUPACK_SENT, tc0, vnet_buffer (b0)->tcp);
 	}
@@ -1015,15 +1033,14 @@ tcp_rcv_fin (tcp_worker_ctx_t * wrk, tcp_connection_t * tc, vlib_buffer_t * b,
 
 /** Enqueue data for delivery to application */
 static int
-tcp_session_enqueue_data (tcp_connection_t * tc, vlib_buffer_t * b,
-			  u16 data_len)
+tcp_session_enqueue_data (tcp_connection_t *tc, vlib_buffer_t *b, u16 data_len)
 {
   int written, error = TCP_ERROR_ENQUEUED;
+  svm_fifo_enq_args_t args = {};
 
   ASSERT (seq_geq (vnet_buffer (b)->tcp.seq_number, tc->rcv_nxt));
   ASSERT (data_len);
-  written = session_enqueue_stream_connection (&tc->connection, b, 0,
-					       1 /* queue event */ , 1);
+  written = session_enqueue_stream_connection (&tc->connection, b, 1 /* queue event */, &args);
 
   TCP_EVT (TCP_EVT_INPUT, tc, 0, data_len, written);
 
@@ -1059,8 +1076,12 @@ tcp_session_enqueue_data (tcp_connection_t * tc, vlib_buffer_t * b,
   /* Update SACK list if need be */
   if (tcp_opts_sack_permitted (&tc->rcv_opts) && vec_len (tc->snd_sacks))
     {
-      /* Remove SACK blocks that have been delivered */
-      tcp_update_sack_list (tc, tc->rcv_nxt, tc->rcv_nxt);
+      /* written includes collected ooo bytes, so the segment started at rcv_nxt - written.
+       * Remove the blocks it delivered and report what it repeated of them */
+      u32 seq = tc->rcv_nxt - written;
+      tcp_update_sack_list (tc, tc->rcv_nxt, tc->rcv_nxt, seq, seq + data_len);
+      if (tcp_dsack_is_pending (tc))
+	tcp_program_dupack (tc);
     }
 
   return error;
@@ -1068,23 +1089,19 @@ tcp_session_enqueue_data (tcp_connection_t * tc, vlib_buffer_t * b,
 
 /** Enqueue out-of-order data */
 static int
-tcp_session_enqueue_ooo (tcp_connection_t * tc, vlib_buffer_t * b,
-			 u16 data_len)
+tcp_session_enqueue_ooo (tcp_connection_t *tc, vlib_buffer_t *b, u16 data_len)
 {
-  session_t *s0;
-  int rv, offset;
+  svm_fifo_enq_args_t args = { .offset = vnet_buffer (b)->tcp.seq_number - tc->rcv_nxt };
+  int rv;
 
   ASSERT (seq_gt (vnet_buffer (b)->tcp.seq_number, tc->rcv_nxt));
   ASSERT (data_len);
 
   /* Enqueue out-of-order data with relative offset */
-  rv = session_enqueue_stream_connection (&tc->connection, b,
-					  vnet_buffer (b)->tcp.seq_number -
-					  tc->rcv_nxt, 0 /* queue event */ ,
-					  0);
+  rv = session_enqueue_stream_connection (&tc->connection, b, 0 /* queue event */, &args);
 
   /* Nothing written */
-  if (rv)
+  if (rv < 0)
     {
       TCP_EVT (TCP_EVT_INPUT, tc, 1, data_len, 0);
       return TCP_ERROR_FIFO_FULL;
@@ -1096,22 +1113,19 @@ tcp_session_enqueue_ooo (tcp_connection_t * tc, vlib_buffer_t * b,
   /* Update SACK list if in use */
   if (tcp_opts_sack_permitted (&tc->rcv_opts))
     {
-      ooo_segment_t *newest;
-      u32 start, end;
+      u32 start, seq = vnet_buffer (b)->tcp.seq_number;
 
-      s0 = session_get (tc->c_s_index, tc->c_thread_index);
-
-      /* Get the newest segment from the fifo */
-      newest = svm_fifo_newest_ooo_segment (s0->rx_fifo);
-      if (newest)
+      if (args.dup_len < data_len)
 	{
-	  offset = ooo_segment_offset_prod (s0->rx_fifo, newest);
-	  ASSERT (offset <= vnet_buffer (b)->tcp.seq_number - tc->rcv_nxt);
-	  start = tc->rcv_nxt + offset;
-	  end = start + ooo_segment_length (s0->rx_fifo, newest);
-	  tcp_update_sack_list (tc, start, end);
-	  svm_fifo_newest_ooo_segment_reset (s0->rx_fifo);
+	  ASSERT (args.seg_offset <= seq - tc->rcv_nxt);
+	  start = tc->rcv_nxt + args.seg_offset;
+	  tcp_update_sack_list (tc, start, start + args.seg_len, seq, seq + data_len);
 	  TCP_EVT (TCP_EVT_CC_SACKS, tc);
+	}
+      else
+	{
+	  /* All of the data was queued already */
+	  tcp_dsack_report (tc, seq, seq + data_len);
 	}
     }
 
@@ -1190,11 +1204,16 @@ tcp_segment_rcv (tcp_worker_ctx_t * wrk, tcp_connection_t * tc,
 	   * retransmissions since we may not have any data to send */
 	  if (seq_leq (vnet_buffer (b)->tcp.seq_end, tc->rcv_nxt))
 	    {
+	      tcp_dsack_report_old (tc, b);
 	      tcp_program_dupack (tc);
 	      tc->errors.below_data_wnd++;
 	      error = TCP_ERROR_SEGMENT_OLD;
 	      goto done;
 	    }
+
+	  /* Report the duplicate prefix right away */
+	  if (tcp_dsack_report_old (tc, b))
+	    tcp_program_dupack (tc);
 
 	  /* Chop off the bytes in the past and see if what is left
 	   * can be enqueued in order */

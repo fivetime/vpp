@@ -476,6 +476,9 @@ typedef struct
 
   /* If this is set, don't run polling nodes on main */
   int no_main;
+
+  /* If this is set, SFDP runtime state has been initialized. */
+  int init_done;
 } sfdp_main_t;
 
 typedef struct
@@ -736,6 +739,18 @@ sfdp_notify_deleted_sessions (sfdp_main_t *sfdpm, u32 *deleted_sessions,
 			      u32 len)
 {
   SFDP_CALLBACKS_CALL (notify_deleted_sessions, deleted_sessions, len);
+}
+
+static_always_inline void
+sfdp_notify_new_tenant (u32 tenant_index)
+{
+  SFDP_CALLBACKS_CALL (notify_new_tenant, tenant_index);
+}
+
+static_always_inline void
+sfdp_notify_deleted_tenant (u32 tenant_index)
+{
+  SFDP_CALLBACKS_CALL (notify_deleted_tenant, tenant_index);
 }
 
 static_always_inline u32

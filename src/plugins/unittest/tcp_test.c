@@ -326,6 +326,8 @@ tcp_test_sack_rxt_head (tcp_test_sack_backend_t backend)
   tc->rcv_opts.flags = TCP_OPTS_FLAG_SACK_PERMITTED | TCP_OPTS_FLAG_SACK;
   tcp_test_sack_backend_init (tc, backend);
 
+  /* The rto marks loss before it sizes the head copy */
+  tcp_sack_rxt_mark_lost (tc);
   if (!TCP_TEST_I (tcp_sack_rxt_head_bytes (tc, 100) == 100,
 		   "%s: without sacks the head copy is a full mss", name))
     goto done;
@@ -361,6 +363,8 @@ tcp_test_sack_rxt_head (tcp_test_sack_backend_t backend)
   tc->rcv_opts.n_sack_blocks = 2;
   tcp_test_rack_rcv_ack (tc, 1200, &ac);
   tcp_test_rack_rcv_ack (tc, 1500, &ac);
+  /* The rto handles reneging before it sizes the head copy */
+  tcp_sack_handle_reneging (tc);
   if (!TCP_TEST_I (tcp_sack_rxt_head_bytes (tc, 200) == 200,
 		   "%s: a sacked head left by reneging does not limit the copy", name))
     goto done;
@@ -387,6 +391,263 @@ tcp_test_sack_rxt_head (tcp_test_sack_backend_t backend)
 
 done:
   tcp_test_sack_backend_cleanup (tc, backend);
+  return rv;
+}
+
+static void
+tcp_test_sack_tail_init (tcp_connection_t *tc, u32 flags)
+{
+  clib_memset (tc, 0, sizeof (*tc));
+  tc->snd_una = 1000;
+  tc->snd_nxt = 2000;
+  tc->snd_mss = 100;
+  tc->flags = flags;
+  tc->rcv_opts.flags = TCP_OPTS_FLAG_SACK_PERMITTED;
+  scoreboard_init (&tc->sack_sb);
+}
+
+/* Ack with one sack block, or none if the block is empty */
+static void
+tcp_test_sack_tail_ack (tcp_connection_t *tc, u32 ack, u32 start, u32 end, tcp_ack_ctx_t *ac)
+{
+  sack_block_t block = { start, end };
+
+  vec_reset_length (tc->rcv_opts.sacks);
+  tc->rcv_opts.flags &= ~TCP_OPTS_FLAG_SACK;
+  tc->rcv_opts.n_sack_blocks = 0;
+  if (start != end)
+    {
+      vec_add1 (tc->rcv_opts.sacks, block);
+      tc->rcv_opts.flags |= TCP_OPTS_FLAG_SACK;
+      tc->rcv_opts.n_sack_blocks = 1;
+    }
+  tcp_test_rcv_sacks (tc, ack, ac);
+  tc->snd_una = seq_max (tc->snd_una, ack);
+}
+
+/* Out of recovery, an ack that covers all sacked data drops the tail hole
+ * left with nothing sacked above it. The hole stays if the ack sacks new
+ * data, if sacked data remains, if it is lost, or in recovery. */
+static int
+tcp_test_sack_empty_tail (void)
+{
+  tcp_connection_t _tc, *tc = &_tc;
+  sack_scoreboard_t *sb = &tc->sack_sb;
+  sack_scoreboard_hole_t *first, *last;
+  u8 can_rescue = 0, snd_limited = 0;
+  tcp_ack_ctx_t ac = {};
+  int rv = 1;
+
+  tcp_test_sack_tail_init (tc, 0);
+  tcp_test_sack_tail_ack (tc, 1000, 1100, 1300, &ac);
+
+  /* An ack at the frontier that sacks new data keeps the tail for the block */
+  tc->snd_nxt = 2200;
+  tcp_test_sack_tail_ack (tc, 1300, 1500, 1600, &ac);
+  first = scoreboard_first_hole (sb);
+  last = scoreboard_last_hole (sb);
+  if (!TCP_TEST_I (pool_elts (sb->holes) == 2 && first->start == 1300 && first->end == 1500 &&
+		     last->start == 1600 && last->end == 2200 && sb->sacked_bytes == 100,
+		   "empty tail: an ack at the frontier that sacks new data keeps the holes "
+		   "(holes %u, sacked %u)",
+		   pool_elts (sb->holes), sb->sacked_bytes))
+    goto done;
+
+  /* An ack below the frontier keeps the holes */
+  tcp_test_sack_tail_ack (tc, 1400, 0, 0, &ac);
+  first = scoreboard_first_hole (sb);
+  if (!TCP_TEST_I (pool_elts (sb->holes) == 2 && first->start == 1400 && sb->sacked_bytes == 100,
+		   "empty tail: an ack below the frontier keeps the holes (holes %u, sacked %u)",
+		   pool_elts (sb->holes), sb->sacked_bytes))
+    goto done;
+
+  /* An ack at the frontier drops the tail */
+  tcp_test_sack_tail_ack (tc, 1600, 0, 0, &ac);
+  if (!TCP_TEST_I (
+	pool_elts (sb->holes) == 0 && sb->head == TCP_INVALID_SACK_HOLE_INDEX && !sb->sacked_bytes,
+	"empty tail: an ack at the frontier drops the tail (holes %u)", pool_elts (sb->holes)))
+    goto done;
+
+  /* In recovery the tail stays, so rule 4 can still rescue it */
+  tcp_test_sack_backend_cleanup (tc, TCP_TEST_SACK_BACKEND_SCOREBOARD);
+  tcp_test_sack_tail_init (tc, TCP_CONN_FAST_RECOVERY | TCP_CONN_RECOVERY);
+  tc->snd_congestion = tc->snd_nxt;
+  tcp_test_sack_tail_ack (tc, 1000, 1100, 1300, &ac);
+  tcp_sack_init_rxt (tc, tc->snd_una);
+  tcp_test_sack_tail_ack (tc, 1300, 0, 0, &ac);
+  first = scoreboard_first_hole (sb);
+  if (!TCP_TEST_I (pool_elts (sb->holes) == 1 && first->start == 1300 && first->end == 2000,
+		   "empty tail: recovery keeps the tail (holes %u)", pool_elts (sb->holes)))
+    goto done;
+  if (!TCP_TEST_I (
+	!scoreboard_next_rxt_hole (sb, 0, 0 /* have_unsent */, &can_rescue, &snd_limited) &&
+	  can_rescue,
+	"empty tail: recovery can still rescue the tail"))
+    goto done;
+
+  /* A lost hole keeps its loss state out of recovery */
+  tcp_test_sack_backend_cleanup (tc, TCP_TEST_SACK_BACKEND_SCOREBOARD);
+  tcp_test_sack_tail_init (tc, TCP_CONN_RECOVERY);
+  tcp_sack_rxt_mark_lost (tc);
+  tc->flags = 0;
+  tcp_test_sack_tail_ack (tc, 1500, 0, 0, &ac);
+  first = scoreboard_first_hole (sb);
+  if (!TCP_TEST_I (pool_elts (sb->holes) == 1 && first->start == 1500 && first->is_lost &&
+		     sb->lost_bytes == 500,
+		   "empty tail: a lost hole is kept (holes %u, lost %u)", pool_elts (sb->holes),
+		   sb->lost_bytes))
+    goto done;
+
+  rv = 0;
+
+done:
+  tcp_test_sack_backend_cleanup (tc, TCP_TEST_SACK_BACKEND_SCOREBOARD);
+  return rv;
+}
+
+/* An rto with nothing sacked marks everything outstanding lost. Data sent
+ * during recovery is not lost and must not inherit the mark, or recovery
+ * exit sees loss above the recovery point and enters recovery again. */
+static int
+tcp_test_sack_rto_new_data (vlib_main_t *vm, int verbose)
+{
+  tcp_connection_t _tc, *tc = &_tc;
+  sack_scoreboard_t *sb = &tc->sack_sb;
+  sack_scoreboard_hole_t *hole;
+  tcp_ack_ctx_t ac = {};
+  sack_block_t block;
+  int rv = 0;
+
+  clib_memset (tc, 0, sizeof (*tc));
+  tc->snd_una = 1000;
+  tc->snd_nxt = 2000;
+  tc->snd_mss = 100;
+  tc->rcv_opts.flags = TCP_OPTS_FLAG_SACK_PERMITTED;
+  tc->cc_algo = tcp_cc_algo_get (TCP_CC_NEWRENO);
+  tc->cwnd = tc->ssthresh = 10 * tc->snd_mss;
+  tc->mrtt_us = 0.1;
+  scoreboard_init (sb);
+
+  /* rto retransmits the head of [1000, 2000] */
+  tc->flags = TCP_CONN_RECOVERY;
+  tc->snd_congestion = tc->snd_nxt;
+  tcp_sack_rxt_mark_lost (tc);
+  tcp_sack_init_rxt (tc, tc->snd_una + tc->snd_mss);
+  rv |= !TCP_TEST_I (sb->lost_bytes == 1000, "rto new data: rto marks [1000, 2000] lost (lost %u)",
+		     sb->lost_bytes);
+
+  /* New data [2000, 2200] is sent. The ack for the head carries no sacks */
+  tc->snd_nxt = 2200;
+  tcp_test_rcv_sacks (tc, 1100, &ac);
+  tc->snd_una = 1100;
+  hole = scoreboard_last_hole (sb);
+  if (verbose)
+    vlib_cli_output (vm, "\nrto new data, ack 1100 no sacks:\n%U", format_tcp_scoreboard, sb, tc);
+  rv |= !TCP_TEST_I (sb->lost_bytes == 900,
+		     "rto new data: data sent after the rto is not lost (lost %u, last hole "
+		     "[%u, %u] is_lost %u)",
+		     sb->lost_bytes, hole->start, hole->end, hole->is_lost);
+
+  /* More new data [2200, 2400]. The peer sacks [2000, 2100] */
+  tc->snd_nxt = 2400;
+  tc->rcv_opts.flags |= TCP_OPTS_FLAG_SACK;
+  block = (sack_block_t) { 2000, 2100 };
+  vec_add1 (tc->rcv_opts.sacks, block);
+  tc->rcv_opts.n_sack_blocks = 1;
+  tcp_test_rcv_sacks (tc, 1100, &ac);
+  hole = scoreboard_last_hole (sb);
+  if (verbose)
+    vlib_cli_output (vm, "\nrto new data, sack [2000, 2100]:\n%U", format_tcp_scoreboard, sb, tc);
+  rv |= !TCP_TEST_I (sb->lost_bytes == 900 && !hole->is_lost,
+		     "rto new data: hole above the sacked block is not lost (lost %u, last hole "
+		     "[%u, %u] is_lost %u)",
+		     sb->lost_bytes, hole->start, hole->end, hole->is_lost);
+
+  /* [1100, 2000] is retransmitted and the peer acks up to the sacked block */
+  sb->high_rxt = 2000;
+  vec_reset_length (tc->rcv_opts.sacks);
+  tc->rcv_opts.flags &= ~TCP_OPTS_FLAG_SACK;
+  tc->rcv_opts.n_sack_blocks = 0;
+  tcp_test_rcv_sacks (tc, 2100, &ac);
+  tc->snd_una = 2100;
+  if (verbose)
+    vlib_cli_output (vm, "\nrto new data, ack 2100:\n%U", format_tcp_scoreboard, sb, tc);
+  rv |= !TCP_TEST_I (sb->lost_bytes == 0,
+		     "rto new data: nothing lost at the recovery point (lost %u)", sb->lost_bytes);
+
+  tcp_loss_exit_recovery (tc, &ac);
+  rv |=
+    !TCP_TEST_I (!tcp_loss_should_reenter_recovery (tc, &ac, 1),
+		 "rto new data: recovery exit does not enter recovery again (lost %u, holes %u)",
+		 sb->lost_bytes, pool_elts (sb->holes));
+
+  /* A second rto with nothing sacked also marks the data sent after the first */
+  tc->snd_una = 1000;
+  tc->snd_nxt = 2000;
+  tc->flags = TCP_CONN_RECOVERY;
+  tc->snd_congestion = tc->snd_nxt;
+  tcp_sack_rxt_mark_lost (tc);
+  tcp_sack_init_rxt (tc, tc->snd_una + tc->snd_mss);
+  tc->snd_nxt = 2200;
+  tcp_test_rcv_sacks (tc, 1100, &ac);
+  tc->snd_una = 1100;
+  tc->snd_nxt = 2300;
+  tc->snd_congestion = tc->snd_nxt;
+  tcp_sack_rxt_mark_lost (tc);
+  hole = scoreboard_first_hole (sb);
+  if (verbose)
+    vlib_cli_output (vm, "\nrto new data, second rto:\n%U", format_tcp_scoreboard, sb, tc);
+  rv |= !TCP_TEST_I (pool_elts (sb->holes) == 1 && hole->start == 1100 && hole->end == 2300 &&
+		       hole->is_lost && sb->lost_bytes == 1200,
+		     "rto new data: second rto marks [1100, 2300] lost (holes %u, lost %u)",
+		     pool_elts (sb->holes), sb->lost_bytes);
+
+  /* After an rto, data sent and sacked above the lost hole. A spurious exit
+   * clears the loss marks, which leaves the two holes as one */
+  scoreboard_clear (sb);
+  tc->snd_una = 1000;
+  tc->snd_nxt = 2000;
+  tc->flags = TCP_CONN_RECOVERY;
+  tc->snd_congestion = tc->snd_nxt;
+  tc->prev_cwnd = tc->cwnd;
+  tc->prev_ssthresh = tc->ssthresh;
+  tcp_sack_rxt_mark_lost (tc);
+  tcp_sack_init_rxt (tc, tc->snd_una + tc->snd_mss);
+  tc->snd_nxt = 2200;
+  tcp_test_sack_tail_ack (tc, 1100, 0, 0, &ac);
+  tc->snd_nxt = 2500;
+  tcp_test_sack_tail_ack (tc, 1100, 2300, 2400, &ac);
+  rv |= !TCP_TEST_I (pool_elts (sb->holes) == 3,
+		     "rto new data: lost hole, hole after it and tail (holes %u)",
+		     pool_elts (sb->holes));
+  ac.ack_flags = TCP_ACK_F_EIFEL_SPURIOUS;
+  tcp_loss_exit_recovery (tc, &ac);
+  hole = scoreboard_first_hole (sb);
+  rv |= !TCP_TEST_I (
+    pool_elts (sb->holes) == 2 && hole->start == 1100 && hole->end == 2300 && !hole->is_lost,
+    "rto new data: spurious exit merges the holes (holes %u)", pool_elts (sb->holes));
+
+  /* A second rto copies the head across the hole for data sent after the
+   * first one, up to the first sacked byte */
+  scoreboard_clear (sb);
+  tc->snd_una = 1000;
+  tc->snd_nxt = 2000;
+  tc->flags = TCP_CONN_RECOVERY;
+  tc->snd_congestion = tc->snd_nxt;
+  tcp_sack_rxt_mark_lost (tc);
+  tcp_sack_init_rxt (tc, tc->snd_una + tc->snd_mss);
+  tc->snd_nxt = 2300;
+  tcp_test_sack_tail_ack (tc, 1950, 0, 0, &ac);
+  tc->snd_nxt = 2600;
+  tcp_test_sack_tail_ack (tc, 1950, 2400, 2500, &ac);
+  tcp_sack_rxt_mark_lost (tc);
+  rv |= !TCP_TEST_I (tcp_sack_rxt_head_bytes (tc, tc->snd_mss) == tc->snd_mss,
+		     "rto new data: head copy spans the hole after the lost one (bytes %u)",
+		     tcp_sack_rxt_head_bytes (tc, tc->snd_mss));
+
+  scoreboard_clear (sb);
+  pool_free (sb->holes);
+  vec_free (tc->rcv_opts.sacks);
   return rv;
 }
 
@@ -538,6 +799,12 @@ tcp_test_sack_rx (vlib_main_t * vm, unformat_input_t * input)
 
   if (tcp_test_sack_rxt_head (TCP_TEST_SACK_BACKEND_SCOREBOARD) ||
       tcp_test_sack_rxt_head (TCP_TEST_SACK_BACKEND_BT))
+    return 1;
+
+  if (tcp_test_sack_empty_tail ())
+    return 1;
+
+  if (tcp_test_sack_rto_new_data (vm, verbose))
     return 1;
 
   clib_memset (tc, 0, sizeof (*tc));
@@ -792,11 +1059,12 @@ tcp_test_sack_rx (vlib_main_t * vm, unformat_input_t * input)
 
   TCP_TEST (vec_len (tc->rcv_opts.sacks) == 0, "cumulative ack does not add a sack block");
   TCP_TEST ((sb->sacked_bytes == 0), "sacked bytes %d", sb->sacked_bytes);
-  TCP_TEST ((pool_elts (sb->holes) == 1), "scoreboard has %d elements", pool_elts (sb->holes));
+  /* Out of recovery, the tail hole left with nothing sacked is dropped */
+  TCP_TEST ((pool_elts (sb->holes) == 0), "scoreboard has %d elements", pool_elts (sb->holes));
   TCP_TEST ((ac.last_bytes_delivered == 100), "last bytes delivered %d", ac.last_bytes_delivered);
   TCP_TEST ((sb->lost_bytes == 0), "lost bytes %u", sb->lost_bytes);
-  TCP_TEST ((sb->head != TCP_INVALID_SACK_HOLE_INDEX), "head %u", sb->head);
-  TCP_TEST ((sb->tail != TCP_INVALID_SACK_HOLE_INDEX), "tail %u", sb->tail);
+  TCP_TEST ((sb->head == TCP_INVALID_SACK_HOLE_INDEX), "head %u", sb->head);
+  TCP_TEST ((sb->tail == TCP_INVALID_SACK_HOLE_INDEX), "tail %u", sb->tail);
   TCP_TEST ((!tcp_scoreboard_is_reneging (sb)), "is not reneging");
 
   /*
@@ -891,15 +1159,14 @@ tcp_test_sack_rx (vlib_main_t * vm, unformat_input_t * input)
     vlib_cli_output (vm, "\nsb ack [0, 800]:\n%U", format_tcp_scoreboard, sb,
 		     tc);
 
-  TCP_TEST ((pool_elts (sb->holes) == 1),
-	    "scoreboard has %d elements", pool_elts (sb->holes));
+  TCP_TEST ((pool_elts (sb->holes) == 0), "scoreboard has %d elements", pool_elts (sb->holes));
   TCP_TEST ((!tcp_scoreboard_is_reneging (sb)), "is not reneging");
   TCP_TEST ((sb->sacked_bytes == 0), "sacked bytes %d", sb->sacked_bytes);
   TCP_TEST ((ac.last_sacked_bytes == 0), "last sacked bytes %d", ac.last_sacked_bytes);
   TCP_TEST ((ac.last_bytes_delivered == 400), "last bytes delivered %d", ac.last_bytes_delivered);
   TCP_TEST ((sb->lost_bytes == 0), "lost bytes %u", sb->lost_bytes);
-  TCP_TEST ((sb->head != TCP_INVALID_SACK_HOLE_INDEX), "head %u", sb->head);
-  TCP_TEST ((sb->tail != TCP_INVALID_SACK_HOLE_INDEX), "tail %u", sb->tail);
+  TCP_TEST ((sb->head == TCP_INVALID_SACK_HOLE_INDEX), "head %u", sb->head);
+  TCP_TEST ((sb->tail == TCP_INVALID_SACK_HOLE_INDEX), "tail %u", sb->tail);
 
   /*
    * One hole close to head, patch head, split in two and start acking
@@ -1488,7 +1755,7 @@ tcp_test_sack_tx (vlib_main_t * vm, unformat_input_t * input)
    */
   for (i = 1; i < 10; i += 2)
     {
-      tcp_update_sack_list (tc, i * 100, (i + 1) * 100);
+      tcp_update_sack_list (tc, i * 100, (i + 1) * 100, i * 100, (i + 1) * 100);
     }
 
   TCP_TEST ((vec_len (tc->snd_sacks) == 5), "sack blocks %d expected %d",
@@ -1502,7 +1769,7 @@ tcp_test_sack_tx (vlib_main_t * vm, unformat_input_t * input)
    */
   sacks = vec_dup (tc->snd_sacks);
 
-  tcp_update_sack_list (tc, 1100, 1200);
+  tcp_update_sack_list (tc, 1100, 1200, 1100, 1200);
   if (verbose)
     vlib_cli_output (vm, "add new segment [1100, 1200]\n%U",
 		     format_tcp_sacks, tc);
@@ -1521,7 +1788,7 @@ tcp_test_sack_tx (vlib_main_t * vm, unformat_input_t * input)
    * Overlap first 2 segment
    */
   tc->rcv_nxt = 300;
-  tcp_update_sack_list (tc, 300, 300);
+  tcp_update_sack_list (tc, 300, 300, 300, 300);
   if (verbose)
     vlib_cli_output (vm, "overlap first 2 segments:\n%U",
 		     format_tcp_sacks, tc);
@@ -1534,7 +1801,7 @@ tcp_test_sack_tx (vlib_main_t * vm, unformat_input_t * input)
   /*
    * Add a new segment
    */
-  tcp_update_sack_list (tc, 1100, 1200);
+  tcp_update_sack_list (tc, 1100, 1200, 1100, 1200);
   if (verbose)
     vlib_cli_output (vm, "add new segment [1100, 1200]\n%U",
 		     format_tcp_sacks, tc);
@@ -1547,7 +1814,7 @@ tcp_test_sack_tx (vlib_main_t * vm, unformat_input_t * input)
   /*
    * Join middle segments
    */
-  tcp_update_sack_list (tc, 800, 900);
+  tcp_update_sack_list (tc, 800, 900, 800, 900);
   if (verbose)
     vlib_cli_output (vm, "join middle segments [800, 900]\n%U",
 		     format_tcp_sacks, tc);
@@ -1562,7 +1829,7 @@ tcp_test_sack_tx (vlib_main_t * vm, unformat_input_t * input)
    * Advance rcv_nxt to overlap all
    */
   tc->rcv_nxt = 1200;
-  tcp_update_sack_list (tc, 1200, 1200);
+  tcp_update_sack_list (tc, 1200, 1200, 1200, 1200);
   if (verbose)
     vlib_cli_output (vm, "advance rcv_nxt to 1200\n%U", format_tcp_sacks, tc);
   TCP_TEST ((vec_len (tc->snd_sacks) == 0), "sack blocks %d expected %d",
@@ -1576,8 +1843,8 @@ tcp_test_sack_tx (vlib_main_t * vm, unformat_input_t * input)
   vec_reset_length (tc->snd_sacks);
   tc->rcv_nxt = 0;
 
-  tcp_update_sack_list (tc, 100, 200);
-  tcp_update_sack_list (tc, 300, 400);
+  tcp_update_sack_list (tc, 100, 200, 100, 200);
+  tcp_update_sack_list (tc, 300, 400, 300, 400);
 
   if (verbose)
     vlib_cli_output (vm, "add [100, 200] [300, 400]\n%U",
@@ -1589,7 +1856,7 @@ tcp_test_sack_tx (vlib_main_t * vm, unformat_input_t * input)
 	    300);
 
   tc->rcv_nxt = 100;
-  tcp_update_sack_list (tc, 100, 100);
+  tcp_update_sack_list (tc, 100, 100, 100, 100);
   if (verbose)
     vlib_cli_output (vm, "add [100, 200] rcv_nxt = 100\n%U",
 		     format_tcp_sacks, tc);
@@ -1598,6 +1865,82 @@ tcp_test_sack_tx (vlib_main_t * vm, unformat_input_t * input)
   TCP_TEST ((tc->snd_sacks[0].start == 300),
 	    "first sack block start %u expected %u", tc->snd_sacks[0].start,
 	    300);
+
+  /*
+   * D-SACK reports (RFC 2883)
+   */
+  {
+    sack_block_t blks[TCP_OPTS_MAX_SACK_BLOCKS];
+    u32 n;
+
+    vec_free (tc->snd_sacks);
+    vec_free (tc->snd_sacks_fl);
+    clib_memset (tc, 0, sizeof (*tc));
+    tc->rcv_opts.flags = TCP_OPTS_FLAG_SACK_PERMITTED;
+    tc->rcv_nxt = 1000;
+
+    tcp_dsack_report (tc, 800, 900);
+    n = tcp_dsack_make_sacks (tc, blks);
+    TCP_TEST ((n == 1 && blks[0].start == 800 && blks[0].end == 900 && !tcp_dsack_is_pending (tc)),
+	      "old duplicate is reported once, as the only block");
+
+    tcp_dsack_report (tc, 100, 200);
+    tcp_dsack_report (tc, 200, 300);
+    tcp_dsack_report (tc, 150, 250);
+    tcp_dsack_report (tc, 500, 600);
+    TCP_TEST ((vec_len (tc->snd_dsacks) == 2 && tc->snd_dsacks[0].start == 100 &&
+	       tc->snd_dsacks[0].end == 300 && tc->snd_dsacks[1].start == 500),
+	      "touching duplicates merge, others are reported separately");
+    n = tcp_dsack_make_sacks (tc, blks);
+    TCP_TEST ((n == 1 && blks[0].start == 100 && vec_len (tc->snd_dsacks) == 1),
+	      "oldest duplicate is reported first, one per ack");
+    vec_free (tc->snd_dsacks);
+    for (i = 0; i < TCP_MAX_DSACK_BLOCKS + 2; i++)
+      tcp_dsack_report (tc, 100 * i, 100 * i + 50);
+    TCP_TEST ((vec_len (tc->snd_dsacks) == TCP_MAX_DSACK_BLOCKS && tc->snd_dsacks[0].start == 200),
+	      "pending duplicates are capped, keeping the most recent");
+    vec_free (tc->snd_dsacks);
+
+    tcp_update_sack_list (tc, 1200, 1300, 1200, 1300);
+    tcp_update_sack_list (tc, 1500, 1800, 1500, 1800);
+    tcp_update_sack_list (tc, 2000, 2100, 2000, 2100);
+    tcp_dsack_report (tc, 1600, 1700);
+    n = tcp_dsack_make_sacks (tc, blks);
+    TCP_TEST ((n == 3 && blks[0].start == 1600 && blks[0].end == 1700 && blks[1].start == 1500 &&
+	       blks[1].end == 1800 && blks[2].start == 2000 && tc->snd_sack_pos == 1),
+	      "out-of-order duplicate is followed by the block that contains it");
+
+    tc->snd_sack_pos = 0;
+    tcp_dsack_report (tc, 800, 900);
+    n = tcp_dsack_make_sacks (tc, blks);
+    TCP_TEST ((n == 3 && blks[0].start == 800 && blks[1].start == 2000 && blks[2].start == 1500),
+	      "old duplicate is followed by the blocks in rotation");
+
+    tcp_update_sack_list (tc, 1500, 1850, 1750, 1850);
+    TCP_TEST ((vec_len (tc->snd_dsacks) == 1 && tc->snd_dsacks[0].start == 1750 &&
+	       tc->snd_dsacks[0].end == 1800),
+	      "out-of-order segment reports the part it repeated");
+    vec_free (tc->snd_dsacks);
+    tcp_update_sack_list (tc, 2000, 2200, 2100, 2200);
+    TCP_TEST ((!tcp_dsack_is_pending (tc)), "adjacent out-of-order segment reports nothing");
+    tc->rcv_nxt = 1300;
+    tcp_update_sack_list (tc, 1300, 1300, 1000, 1300);
+    TCP_TEST ((vec_len (tc->snd_dsacks) == 1 && tc->snd_dsacks[0].start == 1200 &&
+	       tc->snd_dsacks[0].end == 1300 && vec_len (tc->snd_sacks) == 2),
+	      "in-order segment reports the blocks it delivered again");
+    vec_free (tc->snd_dsacks);
+
+    tc->sack_sb.flags |= TCP_DSACK_UNDO_DISABLED;
+    tcp_dsack_report (tc, 800, 900);
+    TCP_TEST ((!tcp_dsack_is_pending (tc)), "no reports with dsack disabled");
+    tc->sack_sb.flags = 0;
+    tc->rcv_opts.flags = 0;
+    tcp_dsack_report (tc, 800, 900);
+    TCP_TEST ((!tcp_dsack_is_pending (tc)), "no reports without sack");
+    vec_free (tc->snd_sacks);
+    vec_free (tc->snd_sacks_fl);
+    vec_free (tc->snd_dsacks);
+  }
   return 0;
 }
 
@@ -6750,6 +7093,341 @@ cleanup:
   return rv;
 }
 
+/* Drop the server's acks for a flight, so a timeout resends the head. The
+ * server reports the copy with a D-SACK, which undoes the timeout. With
+ * partial, the first of two short segments is also lost, so the timeout copy
+ * spans both and only the second is a duplicate, which the server already
+ * holds out of order. */
+static int
+tcp_test_tamper_dsack_mode (vlib_main_t *vm, u8 partial)
+{
+  tcp_e2e_params_t params = {
+    .name = partial ? "dsack_partial" : "dsack_rto",
+    .client_addr = partial ? 0x22222201 : 0x20202001,
+    .server_addr = partial ? 0x23232301 : 0x21212101,
+    .client_vrf = 0,
+    .server_vrf = 2,
+    .server_port = partial ? 2269 : 2267,
+    .client_port = 0, /* ephemeral */
+    .secret = partial ? 2268 : 2266,
+  };
+  const u32 head_len = 100, island_len = 200;
+  tcp_e2e_ctx_t _ctx, *ctx = &_ctx;
+  tcp_connection_t *client_tc, *server_tc;
+  tcp_tamper_rule_t *ack_rule, *seg_rule;
+  session_t *client_s, *server_s;
+  u32 tries, max_iters, tr_before, cwnd_before, total_bytes, start, drained, unreported;
+  u8 *data = 0, arrived;
+  int error, rv = 0, i;
+
+  tcp_tamper_reset ();
+
+  if (!TCP_TEST_I ((tcp_e2e_setup (vm, ctx, &params) == 0), "dsack_rto: e2e setup"))
+    {
+      rv = 1;
+      goto cleanup;
+    }
+  client_tc = ctx->client_tc;
+  client_s = ctx->client_s;
+  server_s = session_get_if_valid (accepted_session_index, accepted_session_thread);
+  if (!TCP_TEST_I ((server_s != 0), "dsack_rto: server session resolvable"))
+    {
+      rv = 1;
+      goto cleanup;
+    }
+  server_tc = (tcp_connection_t *) session_get_transport (server_s);
+
+  client_tc->cfg_flags |= TCP_CFG_F_NO_TSO;
+  client_tc->cfg_flags &= ~TCP_CFG_F_TSO;
+  client_tc->connection.flags &= ~TRANSPORT_CONNECTION_F_IS_TX_PACED;
+  client_tc->rto = TCP_RTO_MIN;
+  total_bytes = partial ? head_len + island_len : 2 * client_tc->snd_mss;
+  start = client_tc->snd_una;
+  tr_before = client_tc->tr_occurences;
+
+  ack_rule = tcp_tamper_drop_pure_ack (server_tc, ~0);
+  tcp_tamper_enable (server_tc);
+  if (partial)
+    {
+      seg_rule = tcp_tamper_drop_seq (client_tc, start, 1);
+      seg_rule->data_only = 1;
+      tcp_tamper_enable (client_tc);
+      /* Adding a rule can move the rule vector */
+      ack_rule = &tcp_tamper_main.rules[0];
+    }
+
+  vec_validate (data, total_bytes - 1);
+  for (i = 0; i < (int) total_bytes; i++)
+    data[i] = i & 0xff;
+  /* In partial mode, keep the two writes in separate segments */
+  for (i = 0; i < (partial ? 2 : 1); i++)
+    {
+      u32 len = !partial ? total_bytes : i ? island_len : head_len;
+      error = svm_fifo_enqueue (client_s->tx_fifo, len, data + (i ? head_len : 0));
+      if (!TCP_TEST_I ((error == (int) len), "%s: client queued %u bytes", params.name, len))
+	{
+	  rv = 1;
+	  goto cleanup;
+	}
+      error = session_program_tx_io_evt (client_s->handle, SESSION_IO_EVT_TX);
+      if (!TCP_TEST_I ((error == 0), "%s: client tx event programmed", params.name))
+	{
+	  rv = 1;
+	  goto cleanup;
+	}
+      tcp_e2e_pump (vm, 1e-3);
+    }
+
+  /* Wait for the flight to arrive while its acks are dropped. In partial
+   * mode, the second segment is held out of order. */
+  for (tries = 0, arrived = 0; !arrived && tries < 200; tries++)
+    {
+      arrived = partial ? (server_tc->rcv_nxt == start && vec_len (server_tc->snd_sacks) == 1) :
+			  server_tc->rcv_nxt - start == total_bytes;
+      arrived = arrived && ack_rule->n_dropped;
+      if (!arrived)
+	tcp_e2e_pump (vm, 1e-3);
+    }
+  if (!TCP_TEST_I ((arrived && ack_rule->n_dropped && client_tc->snd_una == start &&
+		    client_tc->tr_occurences == tr_before),
+		   "%s: flight arrived, its acks were dropped (dropped %u)", params.name,
+		   ack_rule->n_dropped))
+    {
+      rv = 1;
+      goto cleanup;
+    }
+
+  /* Let the ack that reports the duplicate through. Drain the server only
+   * afterwards, as a window update would ack the flight first. */
+  cwnd_before = client_tc->cwnd;
+  ack_rule->n_drop = 0;
+  max_iters = tcp_e2e_rxt_wait_iters (client_tc, 10e-3);
+  for (tries = 0; (tcp_in_cong_recovery (client_tc) || client_tc->snd_una != client_tc->snd_nxt) &&
+		  tries < max_iters;
+       tries++)
+    tcp_e2e_pump (vm, 10e-3);
+  drained = session_test_drain_rx_fifo (server_s);
+
+  if (!TCP_TEST_I (
+	(client_tc->tr_occurences != tr_before && client_tc->snd_una == client_tc->snd_nxt),
+	"%s: a timeout resent the head and all data was acked (timeouts %u, "
+	"acked %u of %u)",
+	params.name, client_tc->tr_occurences - tr_before, client_tc->snd_una - start,
+	client_tc->snd_nxt - start))
+    {
+      rv = 1;
+      goto cleanup;
+    }
+  /* Only the copy of the second segment is a duplicate in partial mode */
+  unreported = client_tc->dsack_undo.lifetime_unreported;
+  if (!TCP_TEST_I ((unreported == (partial ? head_len : 0)),
+		   "%s: the server reported the duplicate with a D-SACK (unreported %u)",
+		   params.name, unreported))
+    {
+      rv = 1;
+      goto cleanup;
+    }
+  if (!partial && !TCP_TEST_I ((client_tc->cwnd >= cwnd_before),
+			       "%s: the D-SACK undid the timeout (cwnd %u before %u)", params.name,
+			       client_tc->cwnd, cwnd_before))
+    {
+      rv = 1;
+      goto cleanup;
+    }
+  if (partial && !TCP_TEST_I ((client_tc->cwnd < cwnd_before),
+			      "%s: the lost head keeps the timeout's reduction (cwnd %u before %u)",
+			      params.name, client_tc->cwnd, cwnd_before))
+    {
+      rv = 1;
+      goto cleanup;
+    }
+  if (!TCP_TEST_I ((drained == total_bytes), "%s: all data delivered (got %u of %u)", params.name,
+		   drained, total_bytes))
+    {
+      rv = 1;
+      goto cleanup;
+    }
+
+cleanup:
+  tcp_tamper_reset ();
+  vec_free (data);
+  if (!tcp_e2e_teardown (vm, ctx))
+    rv = 1;
+  return rv;
+}
+
+static int
+tcp_test_tamper_dsack_rto (vlib_main_t *vm)
+{
+  return tcp_test_tamper_dsack_mode (vm, 0 /* partial */);
+}
+
+static int
+tcp_test_tamper_dsack_partial (vlib_main_t *vm)
+{
+  return tcp_test_tamper_dsack_mode (vm, 1 /* partial */);
+}
+
+static int
+tcp_test_dsack_rx_inject (vlib_main_t *vm, tcp_connection_t *tc, u32 seq, u16 len, u8 chained)
+{
+  u32 bis[2], n_buffers = chained ? 2 : 1;
+  u32 n_alloc = vlib_buffer_alloc (vm, bis, n_buffers);
+  vlib_buffer_t *b;
+  tcp_header_t *th;
+  vlib_frame_t *frame;
+  u16 first_len = chained ? len / 2 : len;
+
+  if (n_alloc != n_buffers)
+    {
+      vlib_buffer_free (vm, bis, n_alloc);
+      return -1;
+    }
+  b = vlib_get_buffer (vm, bis[0]);
+  vlib_buffer_reset (b);
+  b->current_length = sizeof (*th) + first_len;
+  vnet_buffer (b)->tcp.hdr_offset = 0;
+  vnet_buffer (b)->tcp.data_offset = sizeof (*th);
+  vnet_buffer (b)->tcp.connection_index = tc->c_c_index;
+  vnet_buffer (b)->tcp.seq_number = seq;
+  vnet_buffer (b)->tcp.seq_end = seq + len;
+  vnet_buffer (b)->tcp.ack_number = tc->snd_nxt;
+  vnet_buffer (b)->tcp.data_len = len;
+  th = vlib_buffer_get_current (b);
+  clib_memset (th, 0, b->current_length);
+  th->src_port = tc->c_rmt_port;
+  th->dst_port = tc->c_lcl_port;
+  th->seq_number = clib_host_to_net_u32 (seq);
+  th->ack_number = clib_host_to_net_u32 (tc->snd_nxt);
+  th->window = clib_host_to_net_u16 (tc->snd_wnd >> tc->snd_wscale);
+  th->data_offset_and_reserved = 5 << 4;
+  th->flags = TCP_FLAG_ACK;
+  if (chained)
+    {
+      vlib_buffer_t *tail = vlib_get_buffer (vm, bis[1]);
+      vlib_buffer_reset (tail);
+      tail->current_length = len - first_len;
+      clib_memset (vlib_buffer_get_current (tail), 0, tail->current_length);
+      b->next_buffer = bis[1];
+      b->total_length_not_including_first_buffer = tail->current_length;
+      b->flags |= VLIB_BUFFER_NEXT_PRESENT | VLIB_BUFFER_TOTAL_LENGTH_VALID;
+    }
+  frame = vlib_get_frame_to_node (vm, tcp4_established_node.index);
+  ((u32 *) vlib_frame_vector_args (frame))[0] = bis[0];
+  frame->n_vectors = 1;
+  tcp4_established_node.function (vm, vlib_node_get_runtime (vm, tcp4_established_node.index),
+				  frame);
+  vlib_frame_free (vm, frame);
+  return 0;
+}
+
+static int
+tcp_test_dsack_rx_e2e (vlib_main_t *vm)
+{
+  tcp_e2e_params_t params = {
+    .name = "dsack_rx",
+    .client_addr = 0x24242401,
+    .server_addr = 0x25252501,
+    .client_vrf = 0,
+    .server_vrf = 2,
+    .server_port = 2271,
+    .secret = 2270,
+  };
+  const struct
+  {
+    const char *name;
+    u16 start, len, dup_start, dup_end;
+    u8 chained;
+  } cases[] = {
+    { "contained", 200, 400, 200, 600, 0 },
+    { "partial right", 700, 400, 700, 800, 0 },
+    { "partial left", 50, 200, 100, 250, 0 },
+    { "adjacent", 800, 400, 0, 0, 0 },
+    { "chained contained", 200, 400, 200, 600, 1 },
+    { "chained partial right", 700, 400, 700, 800, 1 },
+    /* Only the first buffer adds data */
+    { "chained partial left", 10, 400, 100, 410, 1 },
+    { "chained adjacent", 800, 400, 0, 0, 1 },
+  };
+  tcp_e2e_ctx_t ctx;
+  tcp_connection_t *tc;
+  u32 i, base, cap;
+  int rv = 0;
+
+  if (!TCP_TEST_I (!tcp_e2e_setup (vm, &ctx, &params), "dsack_rx: e2e setup"))
+    {
+      rv = 1;
+      goto cleanup;
+    }
+  tc = ctx.client_tc;
+  tc->rcv_opts.flags &= ~TCP_OPTS_FLAG_TSTAMP;
+  for (i = 0; i < ARRAY_LEN (cases); i++)
+    {
+      base = tc->rcv_nxt;
+      if (tcp_test_dsack_rx_inject (vm, tc, base + 100, 700, 0) ||
+	  tcp_test_dsack_rx_inject (vm, tc, base + cases[i].start, cases[i].len, cases[i].chained))
+	{
+	  rv = 1;
+	  goto cleanup;
+	}
+      if (!TCP_TEST_I (vec_len (tc->snd_dsacks) == (cases[i].dup_end != 0),
+		       "dsack_rx: %s reports only duplicate data", cases[i].name))
+	{
+	  rv = 1;
+	  goto cleanup;
+	}
+      if (cases[i].dup_end &&
+	  !TCP_TEST_I (tc->snd_dsacks[0].start == base + cases[i].dup_start &&
+			 tc->snd_dsacks[0].end == base + cases[i].dup_end,
+		       "dsack_rx: %s reports the original segment's overlap", cases[i].name))
+	{
+	  rv = 1;
+	  goto cleanup;
+	}
+      if (!TCP_TEST_I (vec_len (tc->snd_sacks) &&
+			 seq_leq (tc->snd_sacks[0].start, base + cases[i].start) &&
+			 seq_geq (tc->snd_sacks[0].end, base + cases[i].start + cases[i].len),
+		       "dsack_rx: %s first sack block covers the segment", cases[i].name))
+	{
+	  rv = 1;
+	  goto cleanup;
+	}
+      /* Fill the hole and drain before the next case. Keep the graph paused
+       * so the ACK burst cannot consume reports before they are checked. */
+      if (tcp_test_dsack_rx_inject (vm, tc, base, 1200, 0))
+	{
+	  rv = 1;
+	  goto cleanup;
+	}
+      session_test_drain_rx_fifo (ctx.client_s);
+      vec_free (tc->snd_dsacks);
+    }
+
+  /* A chain that overflows the fifo is not enqueued, so neither its
+   * duplicate prefix nor its tail is reported */
+  base = tc->rcv_nxt;
+  cap = svm_fifo_max_enqueue_prod (ctx.client_s->rx_fifo);
+  if (tcp_test_dsack_rx_inject (vm, tc, base + cap - 600, 400, 0) ||
+      tcp_test_dsack_rx_inject (vm, tc, base + cap - 600, 800, 1))
+    {
+      rv = 1;
+      goto cleanup;
+    }
+  if (!TCP_TEST_I (!tcp_dsack_is_pending (tc) && vec_len (tc->snd_sacks) == 1 &&
+		     tc->snd_sacks[0].start == base + cap - 600 &&
+		     tc->snd_sacks[0].end == base + cap - 200,
+		   "dsack_rx: chain that overflows the fifo reports only queued data"))
+    {
+      rv = 1;
+      goto cleanup;
+    }
+
+cleanup:
+  if (!tcp_e2e_teardown (vm, &ctx))
+    rv = 1;
+  return rv;
+}
+
 static int
 tcp_test_tamper (vlib_main_t *vm, unformat_input_t *input)
 {
@@ -6771,6 +7449,8 @@ tcp_test_tamper (vlib_main_t *vm, unformat_input_t *input)
     { "rto", tcp_test_tamper_rto },
     { "rto-head", tcp_test_tamper_rto_head },
     { "dupack-run", tcp_test_tamper_dupack_run },
+    { "dsack-rto", tcp_test_tamper_dsack_rto },
+    { "dsack-partial", tcp_test_tamper_dsack_partial },
   };
   int res = 0, i;
 
@@ -11389,6 +12069,8 @@ tcp_test (vlib_main_t *vm, unformat_input_t *input, vlib_cli_command_t *cmd_arg)
 	}
       else if (unformat (input, "dsack-undo"))
 	res = tcp_test_dsack_undo ();
+      else if (unformat (input, "dsack-rx"))
+	res = tcp_test_dsack_rx_e2e (vm);
       else if (unformat (input, "all"))
 	{
 	  if ((res = tcp_test_sack (vm, input)))
@@ -11420,6 +12102,8 @@ tcp_test (vlib_main_t *vm, unformat_input_t *input, vlib_cli_command_t *cmd_arg)
 	  if ((res = tcp_test_startup (vm, input)))
 	    goto done;
 	  if ((res = tcp_test_dsack_undo ()))
+	    goto done;
+	  if ((res = tcp_test_dsack_rx_e2e (vm)))
 	    goto done;
 	}
       else

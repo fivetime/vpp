@@ -39,7 +39,7 @@ typedef struct svm_fifo_chunk_
 typedef struct
 {
   u32 next;	/**< Next linked-list element pool index */
-  u32 prev;	/**< Previous linked-list element pool index */
+  u32 prev;	/**< Previous linked-list element pool index, last for head */
   u32 start;	/**< Start of segment, normalized*/
   u32 length;	/**< Length of segment */
 } ooo_segment_t;
@@ -108,7 +108,6 @@ typedef struct _svm_fifo
   svm_fifo_chunk_t *ooo_enq;	 /**< last chunk used for ooo enqueue */
   ooo_segment_t *ooo_segments;	 /**< Pool of ooo segments */
   u32 ooos_list_head;		 /**< Head of out-of-order linked-list */
-  u32 ooos_newest;		 /**< Last segment to have been updated */
 
   u8 flags;		  /**< fifo flags */
   i8 refcnt;		  /**< reference count  */

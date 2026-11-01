@@ -49,6 +49,23 @@ typedef struct svm_fifo_seg_
   u32 len;
 } svm_fifo_seg_t;
 
+/** Arguments of the enqueues that take them, like @ref svm_fifo_enqueue2,
+ * and what the enqueue found of the fifo's out-of-order data. Callers zero
+ * it, enqueues only set what they find. Offsets are from the tail before the
+ * enqueue */
+typedef struct svm_fifo_enq_args_
+{
+  /* In */
+  u32 offset;	    /**< Where the data goes, 0 for in-order data */
+  u8 allow_partial; /**< Segment enqueues, enqueue as much as fits */
+  /* Out, set by successful out-of-order enqueues, in-order ones only report
+   * duplicates */
+  u32 seg_offset; /**< Out-of-order enqueues, segment that holds the data */
+  u32 seg_len;	  /**< Length of that segment */
+  u32 dup_offset; /**< First data the fifo had out of order, 0 if none */
+  u32 dup_len;	  /**< Length of that data, 0 if all the data is new */
+} svm_fifo_enq_args_t;
+
 #if SVM_FIFO_TRACE
 #define svm_fifo_trace_add(_f, _s, _l, _t)		\
 {							\
@@ -156,6 +173,18 @@ always_inline int
 f_pos_geq (u32 a, u32 b)
 {
   return ((i32) (a - b) >= 0);
+}
+
+always_inline u32
+f_pos_min (u32 a, u32 b)
+{
+  return f_pos_lt (a, b) ? a : b;
+}
+
+always_inline u32
+f_pos_max (u32 a, u32 b)
+{
+  return f_pos_lt (a, b) ? b : a;
 }
 
 always_inline u8
@@ -377,22 +406,70 @@ void svm_fifo_enqueue_nocopy (svm_fifo_t * f, u32 len);
  */
 int svm_fifo_enqueue_segments (svm_fifo_t * f, const svm_fifo_seg_t segs[],
 			       u32 n_segs, u8 allow_partial);
+
+/*
+ * In-order (_io) and out-of-order (_ooo) halves of @ref svm_fifo_enqueue2 and
+ * @ref svm_fifo_enqueue_segments2, which callers use. They dispatch inline,
+ * so callers that know the mode pay for no dispatch, and pass the inputs in
+ * registers, so a only carries what the enqueue reports.
+ */
+int svm_fifo_enqueue_io (svm_fifo_t *f, u32 len, const u8 *src, svm_fifo_enq_args_t *a);
+int svm_fifo_enqueue_ooo (svm_fifo_t *f, u32 offset, u32 len, const u8 *src,
+			  svm_fifo_enq_args_t *a);
+int svm_fifo_enqueue_segments_io (svm_fifo_t *f, const svm_fifo_seg_t segs[], u32 n_segs,
+				  u8 allow_partial, svm_fifo_enq_args_t *a);
+int svm_fifo_enqueue_segments_ooo (svm_fifo_t *f, u32 offset, const svm_fifo_seg_t segs[],
+				   u32 n_segs, u8 allow_partial, svm_fifo_enq_args_t *a);
+
 /**
- * Enqueue array of @ref svm_fifo_seg_t with offset
+ * Enqueue data to fifo at a->offset from the tail
  *
- * Segments are copied back to back, starting at offset, and added to the
- * out-of-order list as one segment, like data enqueued with
- * @ref svm_fifo_enqueue_with_offset.
+ * In-order data, at offset 0, is enqueued like with @ref svm_fifo_enqueue,
+ * out-of-order data like with @ref svm_fifo_enqueue_with_offset. Reports
+ * what the enqueue found of the fifo's out-of-order data in a.
  *
  * @param f		fifo
- * @param offset	offset at which to copy the data
+ * @param len		length of data to copy
+ * @param src		buffer from where to copy the data
+ * @param a		args, see @ref svm_fifo_enq_args_t
+ * @return		in order, number of contiguous bytes that can be
+ *			consumed, out of order, len, as the data is enqueued
+ *			entirely or not at all. Error otherwise
+ */
+static inline int
+svm_fifo_enqueue2 (svm_fifo_t *f, u32 len, const u8 *src, svm_fifo_enq_args_t *a)
+{
+  if (a->offset)
+    return svm_fifo_enqueue_ooo (f, a->offset, len, src, a);
+  return svm_fifo_enqueue_io (f, len, src, a);
+}
+
+/**
+ * Enqueue array of @ref svm_fifo_seg_t at a->offset from the tail
+ *
+ * In-order segments, at offset 0, are enqueued like with
+ * @ref svm_fifo_enqueue_segments. Out-of-order segments are copied back to
+ * back and added to the out-of-order list as one segment. Partial enqueues
+ * are allowed if a->allow_partial is set. Reports what the enqueue found of
+ * the fifo's out-of-order data in a.
+ *
+ * @param f		fifo
  * @param segs		array of segments to enqueue
  * @param n_segs	number of segments
- * @param allow_partial	if set partial enqueues are allowed
- * @return		len if enqueue was successful, error otherwise
+ * @param a		args, see @ref svm_fifo_enq_args_t
+ * @return		in order, number of contiguous bytes that can be
+ *			consumed, out of order, number of bytes enqueued.
+ *			Error otherwise
  */
-int svm_fifo_enqueue_segments_with_offset (svm_fifo_t *f, u32 offset, const svm_fifo_seg_t segs[],
-					   u32 n_segs, u8 allow_partial);
+static inline int
+svm_fifo_enqueue_segments2 (svm_fifo_t *f, const svm_fifo_seg_t segs[], u32 n_segs,
+			    svm_fifo_enq_args_t *a)
+{
+  if (a->offset)
+    return svm_fifo_enqueue_segments_ooo (f, a->offset, segs, n_segs, a->allow_partial, a);
+  return svm_fifo_enqueue_segments_io (f, segs, n_segs, a->allow_partial, a);
+}
+
 /**
  * Overwrite fifo head with new data
  *
@@ -473,14 +550,15 @@ int svm_fifo_segments (svm_fifo_t *f, u32 offset, svm_fifo_seg_t *fs,
  * @param f	fifo
  * @return	number of out of order segments
  */
-u32 svm_fifo_n_ooo_segments (svm_fifo_t * f);
+u32 svm_fifo_n_ooo_segments (svm_fifo_t *f);
 /**
- * First out-of-order segment for fifo
+ * Out-of-order segment that holds the byte at offset from the tail
  *
  * @param f	fifo
- * @return	first out-of-order segment for fifo
+ * @param offset offset from the tail
+ * @return	segment, or 0 if the byte was not received out of order
  */
-ooo_segment_t *svm_fifo_first_ooo_segment (svm_fifo_t * f);
+ooo_segment_t *svm_fifo_find_ooo_segment (svm_fifo_t *f, u32 offset);
 /**
  * Check if fifo is sane. Debug only.
  *
@@ -488,6 +566,13 @@ ooo_segment_t *svm_fifo_first_ooo_segment (svm_fifo_t * f);
  * @return 	1 if sane, 0 otherwise
  */
 u8 svm_fifo_is_sane (svm_fifo_t * f);
+/**
+ * Check if fifo's out-of-order segment list is sane. Debug only.
+ *
+ * @param f	fifo
+ * @return 	1 if sane, 0 otherwise
+ */
+u8 svm_fifo_ooo_list_is_sane (svm_fifo_t *f);
 /**
  * Number of chunks linked into the fifo
  *
@@ -671,18 +756,26 @@ svm_fifo_has_ooo_data (svm_fifo_t * f)
   return f->ooos_list_head != OOO_SEGMENT_INVALID_INDEX;
 }
 
+/**
+ * First out-of-order segment for fifo
+ *
+ * @param f	fifo
+ * @return	first out-of-order segment for fifo, or 0 if it has none
+ */
 static inline ooo_segment_t *
-svm_fifo_newest_ooo_segment (svm_fifo_t * f)
+svm_fifo_first_ooo_segment (svm_fifo_t *f)
 {
-  if (f->ooos_newest == OOO_SEGMENT_INVALID_INDEX)
+  if (f->ooos_list_head == OOO_SEGMENT_INVALID_INDEX)
     return 0;
-  return pool_elt_at_index (f->ooo_segments, f->ooos_newest);
+  return pool_elt_at_index (f->ooo_segments, f->ooos_list_head);
 }
 
-static inline void
-svm_fifo_newest_ooo_segment_reset (svm_fifo_t * f)
+static inline ooo_segment_t *
+svm_fifo_next_ooo_segment (svm_fifo_t *f, ooo_segment_t *s)
 {
-  f->ooos_newest = OOO_SEGMENT_INVALID_INDEX;
+  if (s->next == OOO_SEGMENT_INVALID_INDEX)
+    return 0;
+  return pool_elt_at_index (f->ooo_segments, s->next);
 }
 
 static inline u32

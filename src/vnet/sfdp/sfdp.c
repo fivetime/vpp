@@ -134,9 +134,8 @@ sfdp_init_tenant_counters (sfdp_main_t *sfdp)
 static void
 sfdp_init_main_if_needed (sfdp_main_t *sfdp)
 {
-  static u32 done = 0;
   vlib_thread_main_t *tm = vlib_get_thread_main ();
-  if (done)
+  if (sfdp->init_done)
     return;
   time_t epoch = time (NULL);
   uword log_n_thread = max_log2 (tm->n_vlib_mains);
@@ -189,7 +188,7 @@ sfdp_init_main_if_needed (sfdp_main_t *sfdp)
       sfdp_timer_register_as_expiry_module ();
     }
 
-  done = 1;
+  sfdp->init_done = 1;
 }
 
 static clib_error_t *
@@ -296,6 +295,7 @@ sfdp_tenant_add_del (sfdp_main_t *sfdp, u32 tenant_id, u32 context_id,
 	  kv.value = tenant_idx;
 	  clib_bihash_add_del_8_8 (&sfdp->tenant_idx_by_id, &kv, 1);
 	  sfdp_tenant_clear_counters (sfdp, tenant_idx);
+	  sfdp_notify_new_tenant (tenant_idx);
 	}
       else
 	{
@@ -316,11 +316,10 @@ sfdp_tenant_add_del (sfdp_main_t *sfdp, u32 tenant_id, u32 context_id,
 	}
       else
 	{
+	  sfdp_notify_deleted_tenant (kv.value);
 	  sfdp_tenant_clear_counters (sfdp, kv.value);
 	  pool_put_index (sfdp->tenants, kv.value);
 	  clib_bihash_add_del_8_8 (&sfdp->tenant_idx_by_id, &kv, 0);
-	  /* TODO: Notify other users of "tenants" (like gw)?
-	   * maybe cb list? */
 	}
     }
   if (!err && ((n_tenants == 1 && is_del) || (n_tenants == 0 && !is_del)))

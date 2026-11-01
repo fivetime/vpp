@@ -2,11 +2,14 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	. "fd.io/hs-test/infra"
@@ -14,6 +17,9 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
+	"github.com/quic-go/quic-go/qlog"
+	"github.com/quic-go/quic-go/qlogwriter"
+	"github.com/quic-go/quic-go/quicvarint"
 )
 
 func init() {
@@ -22,7 +28,7 @@ func init() {
 		Http3MissingPseudoHeaderTest, Http3MissingSchemePseudoHeaderTest, Http3MissingPathPseudoHeaderTest,
 		Http3MissingAuthorityPseudoHeaderTest, Http3ConnectWithSchemePathPseudoHeadersTest,
 		Http3PseudoHeaderAfterRegularTest, Http3ReservedFrameTest, Http3DataFrameOnCtrlStreamTest,
-		Http3GoawayOnReqStreamTest, Http3GoawayInvalidLengthTest, Http3SecondSettingsFrameTest,
+		Http3GoawayOnReqStreamTest, Http3UnknownFrameOnReqStreamTest, Http3GoawayInvalidLengthTest, Http3SecondSettingsFrameTest,
 		Http3ReservedSettingsTest, Http3MissingSettingsTest, Http3SecondCtrlStreamTest,
 		Http3SecondQpackDecoderStreamTest, Http3SecondQpackEncoderStreamTest, Http3CtrlStreamClosedTest,
 		Http3QpackDecompressionFailedTest, Http3ClientOpenPushStreamTest, Http3DataBeforeHeadersTest,
@@ -367,18 +373,216 @@ func Http3PeerResetStream(s *Http3Suite) {
 	AssertContains(o, "1 streams reset by peer")
 }
 
+// http3ResetPacketConn creates a packet-number gap before the invalid request.
+// Subsequent client packets are suppressed so they cannot flush stranded reset.
+type http3ResetPacketConn struct {
+	net.PacketConn
+	mu              sync.Mutex
+	sent            []qlog.PacketSent
+	serverPending   map[qlog.PacketNumber]bool
+	settingsPackets map[qlog.PacketNumber]bool
+	settingsAcked   bool
+	handshakeDone   bool
+	armed           bool
+	primerDropped   bool
+	requestSent     bool
+	requestPacket   qlog.PacketNumber
+	requestAcked    bool
+	changed         chan struct{}
+}
+
+type http3ResetRecorder struct{ conn *http3ResetPacketConn }
+
+func (c *http3ResetPacketConn) AddProducer() qlogwriter.Recorder {
+	return http3ResetRecorder{conn: c}
+}
+
+func (c *http3ResetPacketConn) SupportsSchemas(string) bool { return true }
+func (r http3ResetRecorder) Close() error                   { return nil }
+
+func (c *http3ResetPacketConn) notify() {
+	select {
+	case c.changed <- struct{}{}:
+	default:
+	}
+}
+
+func (r http3ResetRecorder) RecordEvent(event qlogwriter.Event) {
+	c := r.conn
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	switch packet := event.(type) {
+	case qlog.PacketSent:
+		c.sent = append(c.sent, packet)
+		if packet.Header.PacketType == qlog.PacketType1RTT {
+			for _, frame := range packet.Frames {
+				if stream, ok := frame.Frame.(*qlog.StreamFrame); ok {
+					if stream.StreamID == 2 && stream.Offset == 0 {
+						c.settingsPackets[packet.Header.PacketNumber] = true
+					}
+				}
+			}
+		}
+	case qlog.PacketReceived:
+		if packet.Header.PacketType != qlog.PacketType1RTT {
+			return
+		}
+		for _, frame := range packet.Frames {
+			if ack, ok := frame.Frame.(*qlog.AckFrame); ok {
+				if c.requestSent && ack.AcksPacket(c.requestPacket) {
+					c.requestAcked = true
+				}
+				for pn := range c.settingsPackets {
+					if ack.AcksPacket(pn) {
+						c.settingsAcked = true
+					}
+				}
+			} else {
+				if _, ok := frame.Frame.(*qlog.HandshakeDoneFrame); ok {
+					c.handshakeDone = true
+				}
+				c.serverPending[packet.Header.PacketNumber] = true
+			}
+		}
+	}
+	c.notify()
+}
+
+func (c *http3ResetPacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	length, count := 0, 0
+	request, primer := false, false
+	var requestPacket qlog.PacketNumber
+	// qlog emits one event per QUIC packet before handing its datagram to WriteTo
+	for length < len(p) && count < len(c.sent) {
+		packet := c.sent[count]
+		length += packet.Raw.Length
+		count++
+		if packet.Header.PacketType != qlog.PacketType1RTT {
+			continue
+		}
+		for _, frame := range packet.Frames {
+			switch f := frame.Frame.(type) {
+			case *qlog.StreamFrame:
+				if f.StreamID == 0 {
+					request = true
+					requestPacket = packet.Header.PacketNumber
+				}
+				primer = primer || (f.StreamID == 2 && f.Offset+f.Length > 3)
+			case *qlog.AckFrame:
+				if !c.armed {
+					for pn := range c.serverPending {
+						if f.AcksPacket(pn) {
+							delete(c.serverPending, pn)
+						}
+					}
+				}
+			}
+		}
+	}
+	if length != len(p) {
+		return 0, fmt.Errorf("QUIC packet trace length %d does not match datagram length %d", length, len(p))
+	}
+	c.sent = c.sent[count:]
+	if c.armed && (!request || c.requestSent) {
+		c.primerDropped = c.primerDropped || primer
+		c.notify()
+		return len(p), nil
+	}
+	if request {
+		c.requestSent = true
+		c.requestPacket = requestPacket
+	}
+	n, err := c.PacketConn.WriteTo(p, addr)
+	c.notify()
+	return n, err
+}
+
+func (c *http3ResetPacketConn) wait(ctx context.Context, ready func() bool) error {
+	for {
+		c.mu.Lock()
+		done := ready()
+		c.mu.Unlock()
+		if done {
+			return nil
+		}
+		select {
+		case <-c.changed:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+}
+
 func http3SenInvalidReqExpectStreamError(s *Http3Suite, p []byte, expectedErrorCode http3.ErrCode) {
 	vpp := s.Containers.Vpp.VppInstance
 	serverAddress := s.VppAddr() + ":" + s.Ports.Port1
 	Log(vpp.Vppctl("http tps no-zc h3 uri https://" + serverAddress))
 
-	conn := H3ClientConnect(serverAddress)
+	socket, err := net.ListenPacket("udp4", s.HostAddr()+":0")
+	AssertNil(err)
+	defer socket.Close()
+	packets := &http3ResetPacketConn{
+		PacketConn:      socket,
+		serverPending:   make(map[qlog.PacketNumber]bool),
+		settingsPackets: make(map[qlog.PacketNumber]bool),
+		changed:         make(chan struct{}, 1),
+	}
+	transport := quic.Transport{Conn: packets}
+	defer transport.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	address, err := net.ResolveUDPAddr("udp4", serverAddress)
+	AssertNil(err)
+	conn, err := transport.Dial(ctx, address,
+		&tls.Config{InsecureSkipVerify: true, NextProtos: []string{"h3"}, SessionTicketsDisabled: true},
+		&quic.Config{
+			DisablePathMTUDiscovery: true,
+			Tracer: func(context.Context, bool, quic.ConnectionID) qlogwriter.Trace {
+				return packets
+			},
+		})
+	AssertNil(err)
 	defer conn.CloseWithError(0, "")
+	control, err := conn.OpenUniStream()
+	AssertNil(err)
+	// open control stream and send empty SETTINGS frame
+	_, err = control.Write([]byte{0x00, 0x04, 0x00})
+	AssertNil(err)
+	serverControl, err := conn.AcceptUniStream(ctx)
+	AssertNil(err)
+	deadline, _ := ctx.Deadline()
+	AssertNil(serverControl.SetReadDeadline(deadline))
+	reader := quicvarint.NewReader(serverControl)
+	streamType, err := quicvarint.Read(reader)
+	AssertNil(err)
+	AssertEqual(uint64(0x00), streamType)
+	frameType, err := quicvarint.Read(reader)
+	AssertNil(err)
+	AssertEqual(uint64(0x04), frameType)
+	length, err := quicvarint.Read(reader)
+	AssertNil(err)
+	_, err = io.CopyN(io.Discard, serverControl, int64(length))
+	AssertNil(err)
+
+	// drain handshake and SETTINGS before introducing the packet gap
+	AssertNil(packets.wait(ctx, func() bool {
+		return packets.handshakeDone && packets.settingsAcked && len(packets.serverPending) == 0
+	}), "handshake and SETTINGS must be acknowledged")
+	packets.mu.Lock()
+	packets.armed = true
+	packets.mu.Unlock()
+	// empty unknown control frame
+	_, err = control.Write([]byte{0x21, 0x00})
+	AssertNil(err)
+	AssertNil(packets.wait(ctx, func() bool { return packets.primerDropped }), "expected packet gap before request")
 	stream, err := conn.OpenStream()
 	AssertNil(err)
-	stream.Write(p)
-	time.Sleep(500 * time.Millisecond)
-	stream.SetReadDeadline(time.Now().Add(time.Second))
+	AssertNil(stream.SetDeadline(deadline))
+	_, err = stream.Write(p)
+	AssertNil(err)
+	AssertNil(packets.wait(ctx, func() bool { return packets.requestAcked }), "request must be acknowledged")
 	_, err = stream.Read([]byte{0})
 	AssertNotNil(err, "expected stream reset")
 	Log(err)
@@ -388,6 +592,13 @@ func http3SenInvalidReqExpectStreamError(s *Http3Suite, p []byte, expectedErrorC
 		Remote:    true,
 	}
 	AssertMatchError(err, &expectedErr, "expected error code "+expectedErrorCode.String())
+	select {
+	case <-stream.Context().Done():
+		AssertMatchError(context.Cause(stream.Context()), &expectedErr, "expected STOP_SENDING")
+	case <-ctx.Done():
+		Fail("expected STOP_SENDING")
+	}
+	AssertNil(context.Cause(conn.Context()), "stream reset must not close the connection")
 }
 
 func Http3ClientRequestIncompleteTest(s *Http3Suite) {
@@ -594,6 +805,51 @@ func Http3DataFrameOnCtrlStreamTest(s *Http3Suite) {
 
 func Http3GoawayOnReqStreamTest(s *Http3Suite) {
 	http3SendReqExpectConnError(s, []byte{0x07, 0x02, 0x7B, 0xBD}, http3.ErrCodeFrameUnexpected)
+}
+
+func Http3UnknownFrameOnReqStreamTest(s *Http3Suite) {
+	vpp := s.Containers.Vpp.VppInstance
+	serverAddress := s.VppAddr() + ":" + s.Ports.Port1
+	uri := "https://" + serverAddress
+	Log(vpp.Vppctl("http tps no-zc h3 uri " + uri))
+
+	for _, tc := range []struct {
+		length     uint64
+		payloadLen int
+	}{
+		{16, 16},
+		{1 << 32, 2},
+		{1<<32 + 1, 2},
+		{0x001fffff00000000, 2},
+	} {
+		By(fmt.Sprintf("discarding an unknown frame with payload length %d", tc.length))
+		conn := H3ClientConnect(serverAddress)
+		defer conn.CloseWithError(0, "")
+		h3c := (&http3.Transport{}).NewClientConn(conn)
+		stream, err := conn.OpenStream()
+		AssertNil(err)
+
+		frame := quicvarint.Append(nil, 0x21)
+		frame = quicvarint.Append(frame, tc.length)
+		_, err = stream.Write(append(frame, make([]byte, tc.payloadLen)...))
+		AssertNil(err)
+		time.Sleep(100 * time.Millisecond)
+
+		responseStream, err := h3c.OpenRequestStream(context.Background())
+		AssertNil(err)
+		AssertNil(responseStream.SetDeadline(time.Now().Add(3 * time.Second)))
+		req, err := http.NewRequest(http.MethodGet, uri+"/test_file_64", nil)
+		AssertNil(err)
+		AssertNil(responseStream.SendRequestHeader(req))
+		AssertNil(responseStream.Close())
+		resp, err := responseStream.ReadResponse()
+		AssertNil(err, "server must remain responsive while discarding a large unknown frame")
+		AssertHttpStatus(resp, http.StatusOK)
+		body, err := io.ReadAll(resp.Body)
+		AssertNil(err)
+		AssertEqual(64, len(body))
+		AssertNil(resp.Body.Close())
+	}
 }
 
 func Http3GoawayInvalidLengthTest(s *Http3Suite) {

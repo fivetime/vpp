@@ -1259,6 +1259,7 @@ http3_req_state_wait_transport_reply (http_ctx_t *stream, http_ctx_t *req,
 
   msg.type = HTTP_MSG_REPLY;
   msg.code = req->status_code;
+  msg.data.len = req->control_data_len;
   msg.data.headers_offset = req->headers_offset;
   msg.data.headers_len = req->headers_len;
   msg.data.headers_ctx = pointer_to_uword (req->headers);
@@ -1899,7 +1900,11 @@ http3_stream_transport_rx_req (http_ctx_t *req, http_ctx_t *stream, http_req_sta
 	default:
 	  /* discard payload of unknown frame */
 	  if (req->fh.length)
-	    req->fh.length -= http_io_ts_drain (stream, req->fh.length);
+	    {
+	      u32 n_drained = http_io_ts_drain (stream, clib_min (req->fh.length, (u64) left_deq));
+	      req->fh.length -= n_drained;
+	      left_deq -= n_drained;
+	    }
 	  continue;
 	}
 
