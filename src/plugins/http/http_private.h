@@ -12,6 +12,7 @@
 #include <vnet/session/transport.h>
 #include <http/http.h>
 #include <http/http_buffer.h>
+#include <http/http1/chunked.h>
 
 #define HTTP_FIFO_THRESH (16 << 10)
 
@@ -63,13 +64,14 @@ typedef union
 
 STATIC_ASSERT (sizeof (http_conn_handle_t) == sizeof (u32), "must fit in u32");
 
-#define foreach_http_conn_state                                               \
-  _ (LISTEN, "LISTEN")                                                        \
-  _ (CONNECTING, "CONNECTING")                                                \
-  _ (ESTABLISHED, "ESTABLISHED")                                              \
-  _ (HALF_CLOSED, "HALF-CLOSED")                                              \
-  _ (TRANSPORT_CLOSED, "TRANSPORT-CLOSED")                                    \
-  _ (APP_CLOSED, "APP-CLOSED")                                                \
+#define foreach_http_conn_state                                                                    \
+  _ (LISTEN, "LISTEN")                                                                             \
+  _ (CONNECTING, "CONNECTING")                                                                     \
+  _ (ESTABLISHED, "ESTABLISHED")                                                                   \
+  _ (HALF_CLOSED, "HALF-CLOSED")                                                                   \
+  _ (TRANSPORT_CLOSED, "TRANSPORT-CLOSED")                                                         \
+  _ (APP_SHUTDOWN, "APP-SHUTDOWN")                                                                 \
+  _ (APP_CLOSED, "APP-CLOSED")                                                                     \
   _ (CLOSED, "CLOSED")
 
 typedef enum http_conn_state_ : u8
@@ -91,7 +93,8 @@ typedef enum http_conn_state_ : u8
   _ (8, UDP_TUNNEL, "udp tunnel")                                                                  \
   _ (9, UDP_TUNNEL_DRAFT03, "udp tunnel draft03")                                                  \
   _ (10, APP_IO_MORE_STREAMING_DATA, "app io more streaming data")                                 \
-  _ (11, TRANSPORT_IO_DROP, "transport io drop")
+  _ (11, TRANSPORT_IO_DROP, "transport io drop")                                                   \
+  _ (12, TRANSPORT_IO_MORE_STREAMING_DATA, "transport io more streaming data")
 
 typedef enum http_req_state_ : u8
 {
@@ -117,7 +120,13 @@ typedef enum http_target_form_ : u8
   _ (PENDING_SND_WIN_UPDATE, "pending-snd-win-update")                                             \
   _ (IS_TUNNEL, "is-tunnel")                                                                       \
   _ (CONNECT_UDP_DRAFT03, "connect-udp-draft03")                                                   \
-  _ (PEER_CLOSED, "peer-closed")
+  _ (PEER_CLOSED, "peer-closed")                                                                   \
+  _ (TX_STREAMING, "tx-streaming")                                                                 \
+  _ (TX_EOF, "tx-eof")                                                                             \
+  _ (RX_STREAMING, "rx-streaming")                                                                 \
+  _ (RX_EOF, "rx-eof")                                                                             \
+  _ (RX_PROCESSING, "rx-processing")                                                               \
+  _ (RX_HEADERS_RECEIVED, "rx-headers-received")
 
 typedef enum http_req_flags_bit_
 {
@@ -127,7 +136,7 @@ typedef enum http_req_flags_bit_
     HTTP_REQ_N_F_BITS
 } http_req_flags_bit_t;
 
-typedef enum http_req_flags_ : u8
+typedef enum http_req_flags_ : u16
 {
 #define _(sym, str) HTTP_REQ_F_##sym = 1 << HTTP_REQ_F_BIT_##sym,
   foreach_http_req_flags
@@ -171,7 +180,9 @@ typedef struct
   _ (EXPECT_PEER_SETTINGS, "expect-peer-settings")                                                 \
   _ (UDP_TUNNEL_DGRAM, "udp-tunnel-dgram")                                                         \
   _ (CONNECT_UDP_DRAFT03, "connect-udp-draft03")                                                   \
-  _ (TUNNEL_RX_CLOSED, "tunnel-rx-closed")
+  _ (TUNNEL_RX_CLOSED, "tunnel-rx-closed")                                                         \
+  _ (PENDING_LAST_CHUNK, "pending-last-chunk")                                                     \
+  _ (RX_CANCELLED, "rx-cancelled")
 
 typedef enum http_conn_flags_bit_
 {
@@ -433,8 +444,10 @@ typedef struct http_ctx_
 	  u32 host_header_index;
 	  u32 connection_header_index;
 	  u32 upgrade_header_index;
+	  u32 transfer_encoding_header_index;
 	  http_target_form_t target_form;
 	  http_url_scheme_t scheme;
+	  http1_chunked_decoder_t chunked_decoder;
 	};
 	struct
 	{
@@ -500,6 +513,7 @@ typedef struct http_worker_
   clib_llist_index_t sched_head;
   u32 h2_n_sessions;
   http_wrk_stats_t stats;
+  clib_timebase_t timebase; /* uses this thread's clock */
 } http_worker_t;
 
 typedef struct http_main_
@@ -512,8 +526,6 @@ typedef struct http_main_
   u8 **rx_bufs;
   u8 **tx_bufs;
   u8 **app_header_lists;
-
-  clib_timebase_t timebase;
 
   http_status_code_t *sc_by_u16;
   /*
@@ -747,6 +759,9 @@ int http_connect_transport_stream (u32 parent_index, clib_thread_index_t thread_
  * @param stream Stream ctx.
  */
 void http_reset_transport_stream (http_ctx_t *stream);
+
+/** Stop receiving without closing TX or releasing the transport session. */
+int http_cancel_transport_stream_rx (http_ctx_t *stream, u64 error_code);
 
 /**
  * Close stream.

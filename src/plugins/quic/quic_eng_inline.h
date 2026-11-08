@@ -13,6 +13,14 @@ quic_eng_engine_init (quic_main_t *qm)
   quic_engine_vfts[qm->engine_type].engine_init (qm);
 }
 
+static_always_inline void
+quic_eng_engine_show_stats (vlib_main_t *vm)
+{
+  quic_engine_vft_t *vft = &quic_engine_vfts[quic_main.engine_type];
+  if (vft->engine_show_stats)
+    vft->engine_show_stats (vm);
+}
+
 static_always_inline int
 quic_eng_crypto_context_acquire_listen (quic_ctx_t *ctx)
 {
@@ -161,11 +169,10 @@ quic_eng_proto_on_close (u32 ctx_index, u32 thread_index)
 }
 
 static_always_inline void
-quic_eng_proto_on_half_close (u32 ctx_index, u32 thread_index)
+quic_eng_proto_on_half_close (u32 ctx_index, u32 thread_index, u8 is_rx)
 {
   quic_main_t *qm = &quic_main;
-  quic_engine_vfts[qm->engine_type].proto_on_half_close (ctx_index,
-							 thread_index);
+  quic_engine_vfts[qm->engine_type].proto_on_half_close (ctx_index, thread_index, is_rx);
 }
 
 static_always_inline void

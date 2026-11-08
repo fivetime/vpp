@@ -38,6 +38,15 @@ typedef struct
   u32 session_index;
   clib_thread_index_t thread_index;
   u8 *tx_buf;
+  u8 *rx_buf;
+  hcs_cli_args_t *pending_cli;
+  u64 rx_left;
+  u8 echo_rx;
+  u8 rx_streaming;
+  u8 stream;
+  u8 close_after_tx;
+  u8 eof_after_drain;
+  u8 tx_eof;
   u32 tx_offset;
   u32 vpp_session_index;
   http_header_table_t req_headers;
@@ -178,9 +187,34 @@ hcs_cli_output (uword arg, u8 *buffer, uword buffer_bytes)
 }
 
 static void
+hcs_finish_tx (session_t *s, hcs_session_t *hs)
+{
+  hcs_main_t *hcm = &hcs_main;
+
+  if ((!hs->stream && !hs->rx_streaming) || hs->tx_eof || hs->tx_buf)
+    return;
+  if (hs->eof_after_drain && svm_fifo_max_dequeue (s->tx_fifo))
+    {
+      svm_fifo_add_want_deq_ntf (s->tx_fifo, SVM_FIFO_WANT_DEQ_NOTIF);
+      return;
+    }
+  hs->tx_eof = 1;
+  if (hs->close_after_tx || !hs->stream)
+    {
+      vnet_disconnect_args_t a = { .handle = s->handle, .app_index = hcm->app_index };
+      vnet_disconnect_session (&a);
+    }
+  else
+    {
+      vnet_shutdown_args_t a = { .handle = s->handle, .app_index = hcm->app_index };
+      vnet_shutdown_session (&a);
+    }
+}
+
+static void
 start_send_data (hcs_session_t *hs, http_status_code_t status)
 {
-  http_msg_t msg;
+  http_msg_t msg = {};
   session_t *ts;
   int rv;
 
@@ -189,12 +223,13 @@ start_send_data (hcs_session_t *hs, http_status_code_t status)
 
   msg.type = HTTP_MSG_REPLY;
   msg.code = status;
-  msg.data.type = HTTP_MSG_DATA_INLINE;
-  msg.data.body_len = vec_len (hs->tx_buf);
+  msg.data.type = hs->stream ? HTTP_MSG_DATA_STREAMING : HTTP_MSG_DATA_INLINE;
+  msg.data.body_len = hs->stream ? 0 : vec_len (hs->tx_buf);
   msg.data.body_offset = msg.data.headers_len;
   msg.data.len = msg.data.body_len + msg.data.headers_len;
 
   ts = session_get (hs->vpp_session_index, hs->thread_index);
+  hs->tx_offset = 0;
   rv = svm_fifo_enqueue (ts->tx_fifo, sizeof (msg), (u8 *) &msg);
   ASSERT (rv == sizeof (msg));
 
@@ -205,8 +240,11 @@ start_send_data (hcs_session_t *hs, http_status_code_t status)
       ASSERT (rv == msg.data.headers_len);
     }
 
-  if (!msg.data.body_len)
-    goto done;
+  if (!vec_len (hs->tx_buf))
+    {
+      vec_free (hs->tx_buf);
+      goto done;
+    }
 
   rv = svm_fifo_enqueue (ts->tx_fifo, vec_len (hs->tx_buf), hs->tx_buf);
 
@@ -224,6 +262,7 @@ done:
 
   if (svm_fifo_set_event (ts->tx_fifo))
     session_program_tx_io_evt (ts->handle, SESSION_IO_EVT_TX);
+  hcs_finish_tx (ts, hs);
 }
 
 static void
@@ -359,6 +398,65 @@ alloc_cli_process_callback (void *cb_args)
   alloc_cli_process ((hcs_cli_args_t *) cb_args);
 }
 
+static void
+hcs_schedule_cli (hcs_cli_args_t *args)
+{
+  if (vlib_get_thread_index () != 0)
+    vlib_rpc_call_main_thread (alloc_cli_process_callback, (u8 *) args, sizeof (*args));
+  else
+    alloc_cli_process (args);
+}
+
+static void
+hcs_echo_complete (hcs_session_t *hs)
+{
+  hs->echo_rx = 0;
+  hs->tx_buf = hs->rx_buf;
+  hs->rx_buf = 0;
+  http_add_header (&hs->resp_headers, HTTP_HEADER_CONTENT_TYPE,
+		   http_content_type_token (HTTP_CONTENT_APP_OCTET_STREAM));
+  start_send_data (hs, HTTP_STATUS_OK);
+}
+
+static int
+hcs_echo_rx (session_t *ts, hcs_session_t *hs, u32 control_len)
+{
+  u32 n_deq = svm_fifo_max_dequeue (ts->rx_fifo);
+  u8 *data;
+  int rv;
+
+  if (!hs->rx_streaming)
+    n_deq = clib_min (hs->rx_left, n_deq);
+  if (n_deq)
+    {
+      vec_add2 (hs->rx_buf, data, n_deq);
+      rv = svm_fifo_dequeue (ts->rx_fifo, n_deq, data);
+      ASSERT (rv == n_deq);
+      if (!hs->rx_streaming)
+	hs->rx_left -= n_deq;
+    }
+  if (svm_fifo_needs_deq_ntf (ts->rx_fifo, n_deq + control_len))
+    {
+      svm_fifo_clear_deq_ntf (ts->rx_fifo);
+      session_program_transport_io_evt (ts->handle, SESSION_IO_EVT_RX);
+    }
+  if (!hs->rx_streaming && !hs->rx_left)
+    hcs_echo_complete (hs);
+  return 0;
+}
+
+static void
+hcs_discard_rx (session_t *ts)
+{
+  u32 n_deq = svm_fifo_max_dequeue (ts->rx_fifo);
+  svm_fifo_dequeue_drop_all (ts->rx_fifo);
+  if (svm_fifo_needs_deq_ntf (ts->rx_fifo, n_deq))
+    {
+      svm_fifo_clear_deq_ntf (ts->rx_fifo);
+      session_program_transport_io_evt (ts->handle, SESSION_IO_EVT_RX);
+    }
+}
+
 static int
 hcs_ts_rx_callback (session_t *ts)
 {
@@ -368,6 +466,13 @@ hcs_ts_rx_callback (session_t *ts)
   int rv, is_encoded = 0;
 
   hs = hcs_session_get (ts->thread_index, ts->opaque);
+  if (hs->echo_rx)
+    return hcs_echo_rx (ts, hs, 0);
+  if (hs->rx_streaming)
+    {
+      hcs_discard_rx (ts);
+      return 0;
+    }
   hs->tx_buf = 0;
   http_init_headers_ctx (&hs->resp_headers, hs->resp_headers_buf,
 			 vec_len (hs->resp_headers_buf));
@@ -376,11 +481,13 @@ hcs_ts_rx_callback (session_t *ts)
   /* Read the http message header */
   rv = svm_fifo_dequeue (ts->rx_fifo, sizeof (msg), (u8 *) &msg);
   ASSERT (rv == sizeof (msg));
+  hs->rx_streaming = msg.data.type == HTTP_MSG_DATA_STREAMING;
 
-  if (msg.type != HTTP_MSG_REQUEST || msg.method_type != HTTP_REQ_GET)
+  if (msg.type != HTTP_MSG_REQUEST ||
+      (msg.method_type != HTTP_REQ_GET && msg.method_type != HTTP_REQ_POST &&
+       msg.method_type != HTTP_REQ_PUT))
     {
-      http_add_header (&hs->resp_headers, HTTP_HEADER_ALLOW,
-		       http_token_lit ("GET"));
+      http_add_header (&hs->resp_headers, HTTP_HEADER_ALLOW, http_token_lit ("GET"));
       start_send_data (hs, HTTP_STATUS_METHOD_NOT_ALLOWED);
       goto done;
     }
@@ -393,8 +500,7 @@ hcs_ts_rx_callback (session_t *ts)
 
   /* send the command to a new/recycled vlib process */
   vec_validate (args.buf, msg.data.target_path_len - 1);
-  rv = svm_fifo_peek (ts->rx_fifo, msg.data.target_path_offset,
-		      msg.data.target_path_len, args.buf);
+  rv = svm_fifo_peek (ts->rx_fifo, msg.data.target_path_offset, msg.data.target_path_len, args.buf);
   ASSERT (rv == msg.data.target_path_len);
   HCS_DBG ("%v", args.buf);
   if (http_validate_abs_path_syntax (args.buf, &is_encoded))
@@ -410,6 +516,34 @@ hcs_ts_rx_callback (session_t *ts)
       args.buf = decoded;
     }
 
+  if (http_token_is ((char *) args.buf, vec_len (args.buf), http_token_lit ("echo")) ||
+      http_token_is ((char *) args.buf, vec_len (args.buf), http_token_lit ("echo-stream")) ||
+      http_token_is ((char *) args.buf, vec_len (args.buf), http_token_lit ("echo-stream-close")) ||
+      http_token_is ((char *) args.buf, vec_len (args.buf), http_token_lit ("echo-stream-drain")))
+    {
+      u32 control_len = (msg.data.type == HTTP_MSG_DATA_STREAMING || msg.data.body_len) ?
+			  msg.data.body_offset :
+			  msg.data.len;
+      hs->stream = vec_len (args.buf) > 4;
+      hs->close_after_tx =
+	http_token_is ((char *) args.buf, vec_len (args.buf), http_token_lit ("echo-stream-close"));
+      hs->eof_after_drain =
+	http_token_is ((char *) args.buf, vec_len (args.buf), http_token_lit ("echo-stream-drain"));
+      vec_free (args.buf);
+      hs->echo_rx = 1;
+      hs->rx_left = msg.data.body_len;
+      svm_fifo_dequeue_drop (ts->rx_fifo, control_len);
+      return hcs_echo_rx (ts, hs, control_len);
+    }
+
+  if (msg.method_type != HTTP_REQ_GET)
+    {
+      vec_free (args.buf);
+      http_add_header (&hs->resp_headers, HTTP_HEADER_ALLOW, http_token_lit ("GET"));
+      start_send_data (hs, HTTP_STATUS_METHOD_NOT_ALLOWED);
+      goto done;
+    }
+
   if (msg.data.headers_len)
     {
       http_init_header_table_buf (&hs->req_headers, msg);
@@ -417,12 +551,11 @@ hcs_ts_rx_callback (session_t *ts)
 			  msg.data.headers_len, hs->req_headers.buf);
       ASSERT (rv == msg.data.headers_len);
       http_build_header_table (&hs->req_headers, msg);
-      const http_token_t *accept_value = http_get_header (
-	&hs->req_headers, http_header_name_token (HTTP_HEADER_ACCEPT));
+      const http_token_t *accept_value =
+	http_get_header (&hs->req_headers, http_header_name_token (HTTP_HEADER_ACCEPT));
       if (accept_value)
 	{
-	  HCS_DBG ("client accept: %U", format_http_bytes, accept_value->base,
-		   accept_value->len);
+	  HCS_DBG ("client accept: %U", format_http_bytes, accept_value->base, accept_value->len);
 	  /* just for testing purpose, we don't care about precedence */
 	  if (http_token_contains (accept_value->base, accept_value->len,
 				   http_token_lit ("text/plain")))
@@ -433,15 +566,19 @@ hcs_ts_rx_callback (session_t *ts)
   args.hs_index = hs->session_index;
   args.thread_index = ts->thread_index;
 
-  /* Send RPC request to main thread */
-  if (vlib_get_thread_index () != 0)
-    vlib_rpc_call_main_thread (alloc_cli_process_callback, (u8 *) &args,
-			       sizeof (args));
+  /* Wait for request EOF before executing a streamed CLI command. */
+  if (hs->rx_streaming)
+    {
+      hs->pending_cli = clib_mem_alloc (sizeof (args));
+      *hs->pending_cli = args;
+    }
   else
-    alloc_cli_process (&args);
+    hcs_schedule_cli (&args);
 
 done:
   svm_fifo_dequeue_drop (ts->rx_fifo, msg.data.len);
+  if (hs->rx_streaming)
+    hcs_discard_rx (ts);
   return 0;
 }
 
@@ -453,8 +590,13 @@ hcs_ts_tx_callback (session_t *ts)
   int rv;
 
   hs = hcs_session_get (ts->thread_index, ts->opaque);
-  if (!hs || !hs->tx_buf)
+  if (!hs)
     return 0;
+  if (!hs->tx_buf)
+    {
+      hcs_finish_tx (ts, hs);
+      return 0;
+    }
 
   to_send = vec_len (hs->tx_buf) - hs->tx_offset;
   rv = svm_fifo_enqueue (ts->tx_fifo, to_send, hs->tx_buf + hs->tx_offset);
@@ -478,6 +620,7 @@ hcs_ts_tx_callback (session_t *ts)
   if (svm_fifo_set_event (ts->tx_fifo))
     session_program_tx_io_evt (ts->handle, SESSION_IO_EVT_TX);
 
+  hcs_finish_tx (ts, hs);
   return 0;
 }
 
@@ -497,8 +640,7 @@ hcs_ts_accept_callback (session_t *ts)
 }
 
 static int
-hcs_ts_connected_callback (u32 app_index, u32 api_context, session_t *s,
-			   session_error_t err)
+hcs_ts_connected_callback (u32 app_index, u32 api_context, session_t *s, session_error_t err)
 {
   clib_warning ("called...");
   return -1;
@@ -508,9 +650,22 @@ static void
 hcs_ts_disconnect_callback (session_t *s)
 {
   hcs_main_t *hcm = &hcs_main;
+  hcs_session_t *hs = hcs_session_get (s->thread_index, s->opaque);
   vnet_disconnect_args_t _a = { 0 }, *a = &_a;
 
   HCS_DBG ("hs_index: %u", s->opaque);
+  if (hs->rx_streaming)
+    {
+      if (hs->echo_rx)
+	hcs_echo_complete (hs);
+      else if (hs->pending_cli)
+	{
+	  hcs_schedule_cli (hs->pending_cli);
+	  clib_mem_free (hs->pending_cli);
+	  hs->pending_cli = 0;
+	}
+      return;
+    }
   a->handle = session_handle (s);
   a->app_index = hcm->app_index;
   vnet_disconnect_session (a);
@@ -542,7 +697,13 @@ hcs_ts_cleanup_callback (session_t *s, session_cleanup_ntf_t ntf)
     return;
 
   vec_free (hs->tx_buf);
+  vec_free (hs->rx_buf);
   vec_free (hs->resp_headers_buf);
+  if (hs->pending_cli)
+    {
+      vec_free (hs->pending_cli->buf);
+      clib_mem_free (hs->pending_cli);
+    }
   http_free_header_table (&hs->req_headers);
   hcs_session_free (hs);
 }

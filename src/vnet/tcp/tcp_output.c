@@ -347,76 +347,6 @@ tcp_init_buffer (vlib_main_t * vm, vlib_buffer_t * b)
   return vlib_buffer_make_headroom (b, TRANSPORT_MAX_HDRS_LEN);
 }
 
-/* Compute TCP checksum in software when offloading is disabled for a connection */
-u16
-ip6_tcp_compute_checksum_custom (vlib_main_t * vm, vlib_buffer_t * p0,
-				 ip46_address_t * src, ip46_address_t * dst)
-{
-  ip_csum_t sum0;
-  u16 payload_length_host_byte_order;
-  u32 i;
-
-  /* Initialize checksum with ip header. */
-  sum0 = clib_host_to_net_u16 (vlib_buffer_length_in_chain (vm, p0)) +
-    clib_host_to_net_u16 (IP_PROTOCOL_TCP);
-  payload_length_host_byte_order = vlib_buffer_length_in_chain (vm, p0);
-
-  for (i = 0; i < ARRAY_LEN (src->ip6.as_uword); i++)
-    {
-      sum0 = ip_csum_with_carry
-	(sum0, clib_mem_unaligned (&src->ip6.as_uword[i], uword));
-      sum0 = ip_csum_with_carry
-	(sum0, clib_mem_unaligned (&dst->ip6.as_uword[i], uword));
-    }
-
-  return ip_calculate_l4_checksum (vm, p0, sum0,
-				   payload_length_host_byte_order, NULL, 0,
-				   NULL);
-}
-
-u16
-ip4_tcp_compute_checksum_custom (vlib_main_t * vm, vlib_buffer_t * p0,
-				 ip46_address_t * src, ip46_address_t * dst)
-{
-  ip_csum_t sum0;
-  u32 payload_length_host_byte_order;
-
-  payload_length_host_byte_order = vlib_buffer_length_in_chain (vm, p0);
-  sum0 =
-    clib_host_to_net_u32 (payload_length_host_byte_order +
-			  (IP_PROTOCOL_TCP << 16));
-
-  sum0 = ip_csum_with_carry (sum0, clib_mem_unaligned (&src->ip4, u32));
-  sum0 = ip_csum_with_carry (sum0, clib_mem_unaligned (&dst->ip4, u32));
-
-  return ip_calculate_l4_checksum (vm, p0, sum0,
-				   payload_length_host_byte_order, NULL, 0,
-				   NULL);
-}
-
-static inline u16
-tcp_compute_checksum (tcp_connection_t * tc, vlib_buffer_t * b)
-{
-  u16 checksum = 0;
-  if (PREDICT_FALSE (tc->cfg_flags & TCP_CFG_F_NO_CSUM_OFFLOAD))
-    {
-      tcp_worker_ctx_t *wrk = tcp_get_worker (tc->c_thread_index);
-      vlib_main_t *vm = wrk->vm;
-
-      if (tc->c_is_ip4)
-	checksum = ip4_tcp_compute_checksum_custom
-	  (vm, b, &tc->c_lcl_ip, &tc->c_rmt_ip);
-      else
-	checksum = ip6_tcp_compute_checksum_custom
-	  (vm, b, &tc->c_lcl_ip, &tc->c_rmt_ip);
-    }
-  else
-    {
-      vnet_buffer_offload_flags_set (b, VNET_BUFFER_OFFLOAD_F_TCP_CKSUM);
-    }
-  return checksum;
-}
-
 /**
  * Prepare ACK
  */
@@ -1514,6 +1444,18 @@ tcp_timer_retransmit_handler (tcp_connection_t *tc)
 }
 
 /**
+ * Time since first syn. RTO doubles only after the first retries, so it's
+ * (rto_boff + 1) * rto_init until then and 2 * (rto + rto_init) afterwards
+ */
+static u32
+tcp_syn_sent_elapsed_time (tcp_connection_t *tc)
+{
+  if (tc->rto_boff < TCP_RTO_SYN_RETRIES)
+    return (tc->rto_boff + 1) * TCP_RTO_INIT;
+  return 2 * (tc->rto + TCP_RTO_INIT);
+}
+
+/**
  * SYN retransmit timer handler. Active open only.
  */
 void
@@ -1544,7 +1486,7 @@ tcp_timer_retransmit_syn_handler (tcp_connection_t * tc)
   tcp_worker_stats_inc (wrk, to_establish, 1);
 
   /* Active open establish timeout */
-  if (tc->rto >= TCP_ESTABLISH_TIME >> 1)
+  if (tcp_syn_sent_elapsed_time (tc) >= tcp_cfg.syn_sent_time)
     {
       session_stream_connect_notify (&tc->connection, SESSION_E_TIMEDOUT);
       tcp_connection_cleanup (tc);
@@ -1662,28 +1604,42 @@ tcp_retransmit_first_unacked (tcp_worker_ctx_t * wrk, tcp_connection_t * tc)
   return 0;
 }
 
+/* Segments of up to one mss that send bytes within space: all the bytes, the
+ * last segment possibly short, if they fit, else as many full segments as fit */
+static inline u32
+tcp_n_segs_fit (tcp_connection_t *tc, u32 bytes, u32 space)
+{
+  if (bytes <= space)
+    return (bytes + tc->snd_mss - 1) / tc->snd_mss;
+  return space / tc->snd_mss;
+}
+
 static int
 tcp_transmit_unsent (tcp_worker_ctx_t *wrk, tcp_connection_t *tc, u32 burst_size,
 		     u32 available_bytes)
 {
-  u32 offset, max_dequeue, n_segs = 0, n_written, bi, available_wnd;
+  u32 offset, max_dequeue, n_segs = 0, n_written, bi, available_wnd, max_bytes;
   vlib_main_t *vm = wrk->vm;
   vlib_buffer_t *b = 0;
 
   offset = tc->snd_nxt - tc->snd_una;
   max_dequeue = offset + available_bytes;
-  available_wnd = tc->snd_wnd - offset;
-  burst_size = clib_min (burst_size, available_wnd / tc->snd_mss);
+  available_wnd = tc->snd_wnd > offset ? tc->snd_wnd - offset : 0;
+  burst_size = clib_min (burst_size, tcp_n_segs_fit (tc, available_bytes, available_wnd));
 
-  while (n_segs < burst_size)
+  while (n_segs < burst_size && available_bytes)
     {
-      n_written = tcp_prepare_segment (wrk, tc, offset, tc->snd_mss, &b);
+      /* The burst fits the data counted above. Data the app adds meanwhile
+       * waits, else a short last segment could grow past the window */
+      max_bytes = clib_min (tc->snd_mss, available_bytes);
+      n_written = tcp_prepare_segment (wrk, tc, offset, max_bytes, &b);
       if (!n_written)
 	goto done;
 
       bi = vlib_get_buffer_index (vm, b);
       tcp_enqueue_to_output (wrk, b, bi, tc->c_is_ip4);
       offset += n_written;
+      available_bytes -= n_written;
       n_segs += 1;
 
       if (tc->cfg_flags & TCP_CFG_F_BYTE_TRACKER)
@@ -1810,8 +1766,8 @@ tcp_retransmit_sack_inline (tcp_worker_ctx_t *wrk, tcp_connection_t *tc, u32 bur
 			    tcp_rxt_backend_t backend)
 {
   u32 n_written = 0, offset, max_bytes, n_segs = 0;
-  u8 snd_limited = 0, can_rescue = 0, cc_limited = 0;
-  u32 bi, max_deq, burst_bytes, sent_bytes = 0;
+  u8 snd_limited = 0, can_rescue = 0, cc_limited = 0, have_unsent;
+  u32 bi, max_deq, burst_bytes, sent_bytes = 0, av_wnd, outstanding;
   tcp_rxt_cursor_t cursor = {};
   tcp_rxt_range_t *range = 0;
   vlib_main_t *vm = wrk->vm;
@@ -1842,31 +1798,28 @@ tcp_retransmit_sack_inline (tcp_worker_ctx_t *wrk, tcp_connection_t *tc, u32 bur
   if (backend == TCP_RXT_BACKEND_SCOREBOARD)
     cursor.hole = scoreboard_get_hole (sb, sb->cur_rxt_hole);
 
+  outstanding = tc->snd_nxt - tc->snd_una;
   max_deq = transport_max_tx_dequeue (&tc->connection);
-  max_deq -= tc->snd_nxt - tc->snd_una;
+  /* A sent fin counts in snd_nxt but not in the fifo */
+  max_deq = max_deq > outstanding ? max_deq - outstanding : 0;
+
+  /* NextSeg Rule (2) sends new data only if the peer's window allows its
+   * next segment, of up to one mss (RFC 6675) */
+  av_wnd = tc->snd_wnd > outstanding ? tc->snd_wnd - outstanding : 0;
+  have_unsent = tcp_n_segs_fit (tc, max_deq, av_wnd) != 0;
 
   while (snd_space > 0 && n_segs < burst_size)
     {
-      range = tcp_rxt_next_range (tc, backend, &cursor, max_deq != 0, &can_rescue, &snd_limited);
+      range = tcp_rxt_next_range (tc, backend, &cursor, have_unsent, &can_rescue, &snd_limited);
       if (!range)
 	{
 	  /* We are out of lost holes to retransmit so send some new data. */
-	  if (max_deq)
+	  if (have_unsent)
 	    {
-	      u32 n_segs_new, n_bytes_new, av_wnd, outstanding;
+	      u32 n_segs_new, n_bytes_new;
 
-	      /* Make sure we don't exceed available window and leave space
-	       * for one more packet, to avoid zero window acks */
-	      outstanding = tc->snd_nxt - tc->snd_una;
-	      av_wnd = tc->snd_wnd > outstanding ? tc->snd_wnd - outstanding : 0;
-	      av_wnd = av_wnd > tc->snd_mss ? av_wnd - tc->snd_mss : 0;
-	      snd_space = clib_min (snd_space, av_wnd);
-	      /* Low bound max_deq to mss to be able to send a segment even
-	       * when it is less than mss */
-	      snd_space =
-		clib_min (clib_max (max_deq, tc->snd_mss), snd_space);
-	      burst_size = clib_min (burst_size - n_segs,
-				     snd_space / tc->snd_mss);
+	      /* tcp_transmit_unsent also keeps the burst within the window */
+	      burst_size = clib_min (burst_size - n_segs, tcp_n_segs_fit (tc, max_deq, snd_space));
 	      /* A model-owned recovery allowance is already bounded by the pacer. */
 	      if (!tc->cc_algo->get_recovery_snd_space)
 		burst_size = clib_min (burst_size, TCP_RXT_MAX_BURST);
@@ -2041,8 +1994,9 @@ send_unsent:
   if (snd_space < tc->snd_mss || tc->snd_mss == 0)
     goto done;
 
+  /* A sent fin counts in snd_nxt but not in the fifo */
   max_deq = transport_max_tx_dequeue (&tc->connection);
-  max_deq -= tc->snd_nxt - tc->snd_una;
+  max_deq = max_deq > tc->snd_nxt - tc->snd_una ? max_deq - (tc->snd_nxt - tc->snd_una) : 0;
   if (max_deq)
     {
       snd_space = clib_min (max_deq, snd_space);

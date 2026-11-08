@@ -14,7 +14,7 @@ func init() {
 	RegisterVethTests(TcpConfigDiagTest, TcpListenerDiagTest, TcpSessionIndexDiagTest,
 		TcpSrcAddressDiagTest, TcpNoListenerResetTraceTest, TcpEstablishedTraceTest,
 		TcpOutputTraceDiagTest)
-	RegisterVethStartupTests(TcpCubicStartupConfigDiagTest)
+	RegisterVethStartupTests(TcpCubicStartupConfigDiagTest, TcpSynSentTimeoutTest)
 }
 
 func waitForTcpDiagOutput(vpp *VppInstance, command string, patterns ...string) string {
@@ -270,6 +270,7 @@ func TcpCubicStartupConfigDiagTest(s *VethsSuite) {
 		Append("cc-algo cubic").
 		Append("no-dsack").
 		Append("byte-tracker").
+		Append("syn-sent-time 500").
 		NewStanza("cubic").
 		Append("no-fast-convergence").
 		Append("no-hystart").
@@ -292,6 +293,7 @@ func TcpCubicStartupConfigDiagTest(s *VethsSuite) {
 	AssertContains(config, "congestion control algorithm: cubic")
 	AssertContains(config, "dsack: disabled")
 	AssertContains(config, "byte tracker: enabled")
+	AssertContains(config, "syn_sent time: 120 sec")
 
 	serverVpp.Vppctl("vperf server fifo-size 64k uri tcp://%s/%s", serverAddress, s.Ports.Port1)
 	listenerDetail := serverVpp.Vppctl("show session verbose 2 proto tcp state listening")
@@ -316,4 +318,29 @@ func TcpCubicStartupConfigDiagTest(s *VethsSuite) {
 	o := <-done
 	Log(o)
 	AssertNotContains(o, "failed")
+}
+
+// Timeout shorter than the initial syn retransmits must not expire at the first
+// retransmit. Connects to an address nobody owns, so syns are never answered.
+func TcpSynSentTimeoutTest(s *VethsSuite) {
+	var tcpConfig Stanza
+	tcpConfig.NewStanza("tcp").
+		Append("syn-sent-time 3").
+		Close()
+	s.SetupTest(tcpConfig)
+
+	clientVpp := s.Containers.ClientVpp.VppInstance
+	octets := strings.Split(s.Interfaces.Server.Ip4AddressString(), ".")
+	octets[3] = "250"
+	unreachable := strings.Join(octets, ".")
+
+	start := time.Now()
+	o := clientVpp.Vppctl("vperf client syn-timeout 13 uri tcp://%s/%s", unreachable,
+		s.Ports.Port1)
+	elapsed := time.Since(start)
+	Log(o)
+	Log("connect to %s failed after %v", unreachable, elapsed)
+	AssertContains(o, "failed")
+	AssertGreaterEqual(elapsed.Seconds(), 2.5)
+	AssertLessThan(elapsed.Seconds(), 4.5)
 }

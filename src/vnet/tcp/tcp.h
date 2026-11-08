@@ -206,6 +206,9 @@ typedef struct tcp_configuration_
   /** Time to wait (tcp ticks) for syn-rcvd connection to establish */
   u32 syn_rcvd_time;
 
+  /** Time to wait (tcp ticks) for syn-sent connection to establish */
+  u32 syn_sent_time;
+
   /** Number of preallocated connections */
   u32 preallocated_connections;
 
@@ -328,7 +331,7 @@ void tcp_program_dupack (tcp_connection_t * tc);
 void tcp_program_retransmit (tcp_connection_t * tc);
 
 void tcp_update_burst_snd_vars (tcp_connection_t * tc);
-u32 tcp_snd_space (tcp_connection_t * tc);
+__clib_export u32 tcp_snd_space (tcp_connection_t *tc);
 __clib_export int tcp_fastrecovery_prr_snd_space (tcp_connection_t *tc);
 void tcp_reschedule (tcp_connection_t * tc);
 fib_node_index_t tcp_lookup_rmt_in_fib (tcp_connection_t * tc);

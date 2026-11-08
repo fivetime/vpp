@@ -461,7 +461,7 @@ int session_wrk_handle_mq (session_worker_t *wrk, svm_msg_q_t *mq);
 __clib_export session_t *session_alloc (clib_thread_index_t thread_index);
 __clib_export void session_free (session_t *s);
 void session_cleanup (session_t *s);
-void session_program_cleanup (session_t *s);
+__clib_export void session_program_cleanup (session_t *s);
 __clib_export void session_cleanup_half_open (session_handle_t ho_handle);
 __clib_export u8 session_is_valid (u32 si, u8 thread_index);
 
@@ -540,11 +540,11 @@ int session_open (session_endpoint_cfg_t *sep, session_handle_t *rsh);
 int session_open_stream (session_endpoint_cfg_t *sep, session_handle_t *rsh);
 int session_listen (session_t * s, session_endpoint_cfg_t * sep);
 int session_stop_listen (session_t * s);
-void session_half_close (session_t *s);
+__clib_export void session_half_close (session_t *s, u8 is_rx);
 __clib_export void session_close (session_t *s);
 __clib_export void session_reset (session_t *s);
 void session_detach_app (session_t *s);
-void session_transport_half_close (session_t *s);
+void session_transport_half_close (session_t *s, u8 is_rx);
 void session_transport_close (session_t * s);
 void session_transport_reset (session_t * s);
 __clib_export void session_transport_cleanup (session_t *s);
@@ -607,8 +607,8 @@ __clib_export int session_stream_accept (transport_connection_t *tc, u32 listene
 					 clib_thread_index_t thread_index, u8 notify);
 int session_dgram_accept (transport_connection_t *tc, u32 listener_index,
 			  clib_thread_index_t thread_index);
-void session_transport_delete_request (transport_connection_t *tc,
-				       transport_cleanup_cb_fn cb_fn);
+__clib_export void session_transport_delete_request (transport_connection_t *tc,
+						     transport_cleanup_cb_fn cb_fn);
 
 /**
  * Initialize session layer for given transport proto and ip version

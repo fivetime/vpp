@@ -19,7 +19,7 @@ static http_engine_vft_t *http_vfts;
 const http_buffer_type_t msg_to_buf_type[] = {
   [HTTP_MSG_DATA_INLINE] = HTTP_BUFFER_FIFO,
   [HTTP_MSG_DATA_PTR] = HTTP_BUFFER_PTR,
-  [HTTP_MSG_DATA_STREAMING] = HTTP_BUFFER_STREAMING,
+  [HTTP_MSG_DATA_STREAMING] = HTTP_BUFFER_FIFO,
 };
 
 #define HTTP_MAX_STREAMS_UNI  3 /* control + QPACK encoder and decoder */
@@ -160,9 +160,13 @@ format_http_req_flags (u8 *s, va_list *args)
 u8 *
 format_http_time_now (u8 *s, va_list *args)
 {
-  http_ctx_t __clib_unused *hc = va_arg (*args, http_ctx_t *);
-  http_main_t *hm = &http_main;
-  f64 now = clib_timebase_now (&hm->timebase);
+  http_ctx_t *hc = va_arg (*args, http_ctx_t *);
+  http_worker_t *wrk;
+  f64 now;
+
+  ASSERT (hc->c_thread_index == vlib_get_thread_index ());
+  wrk = http_worker_get (hc->c_thread_index);
+  now = clib_timebase_now (&wrk->timebase);
   return format (s, "%U", format_clib_timebase_time, now);
 }
 
@@ -422,6 +426,22 @@ http_close_transport_stream (http_ctx_t *stream)
 
   if (vnet_disconnect_session (&a))
     clib_warning ("disconnect returned");
+}
+
+int
+http_cancel_transport_stream_rx (http_ctx_t *stream, u64 error_code)
+{
+  transport_endpt_attr_t attr = { .type = TRANSPORT_ENDPT_ATTR_APP_PROTO_ERR_CODE_RX,
+				  .app_proto_err_code_rx = error_code };
+  session_t *ts;
+  int rv;
+
+  ASSERT (http_ctx_is_stream (stream));
+  ts = session_get_from_handle (stream->hc_tc_session_handle);
+  if ((rv = session_transport_attribute (ts, 0 /* is_set */, &attr)))
+    return rv;
+  session_half_close (ts, 1 /* is_rx */);
+  return 0;
 }
 
 void
@@ -1097,6 +1117,8 @@ http_transport_enable (vlib_main_t *vm, u8 is_en)
       vec_validate (wrk->header_list, clib_max (hm->h2_settings.max_header_list_size,
 						hm->h3_settings.max_field_section_size) -
 					1);
+      clib_timebase_init (&wrk->timebase, 0 /* GMT */, CLIB_TIMEBASE_DAYLIGHT_NONE,
+			  &vlib_get_main_by_index (ti)->clib_time);
     }
   vec_validate (hm->rx_bufs, num_threads - 1);
   vec_validate (hm->tx_bufs, num_threads - 1);
@@ -1111,9 +1133,6 @@ http_transport_enable (vlib_main_t *vm, u8 is_en)
 		      HTTP_UDP_PROXY_DATAGRAM_CAPSULE_OVERHEAD);
       vec_validate (hm->app_header_lists[i], 64 << 10);
     }
-
-  clib_timebase_init (&hm->timebase, 0 /* GMT */, CLIB_TIMEBASE_DAYLIGHT_NONE,
-		      &vm->clib_time /* share the system clock */);
 
   http_timers_init (vm, http_conn_timeout_cb, http_conn_invalidate_timer_cb);
   hm->is_init = 1;
@@ -1541,8 +1560,10 @@ http_app_close (u32 rh, clib_thread_index_t thread_index, u8 is_shutdown)
 }
 
 static void
-http_transport_shutdown (u32 rh, clib_thread_index_t thread_index)
+http_transport_shutdown (u32 rh, clib_thread_index_t thread_index, u8 is_rx)
 {
+  if (PREDICT_FALSE (is_rx))
+    return;
   http_app_close (rh, thread_index, 1);
 }
 
@@ -1622,9 +1643,9 @@ http_app_tx_callback (void *session, transport_send_params_t *sp)
   else
     HTTP_DBG (1, "ignoring tx callback with empty app fifo");
 
-  if (hc->state == HTTP_CONN_STATE_APP_CLOSED)
-    http_vfts[hc->version].app_close_callback (hc, hr_handle.req_index,
-					       as->thread_index, 0);
+  if (hc->state == HTTP_CONN_STATE_APP_CLOSED || hc->state == HTTP_CONN_STATE_APP_SHUTDOWN)
+    http_vfts[hc->version].app_close_callback (hc, hr_handle.req_index, as->thread_index,
+					       hc->state == HTTP_CONN_STATE_APP_SHUTDOWN);
 
   sent = max_burst_sz - sp->max_burst_size;
 

@@ -7,11 +7,11 @@
 #include <vnet/session/session.h>
 #include <vlib/unix/plugin.h>
 #include <vppinfra/unix.h>
+#include <hsi/hsi.h>
 
 #define PROXY_LITE_MSS 1460
 
-typedef int (*proxy_lite_hsi_track_session_pair_fn) (session_t *s,
-						     session_handle_t peer_session_handle);
+typedef __typeof__ (hsi_track_pair) *proxy_lite_hsi_track_pair_fn;
 
 typedef enum proxy_lite_session_state_
 {
@@ -42,6 +42,8 @@ typedef struct proxy_lite_session_
   proxy_lite_session_state_t state;
   u8 hsi_offload;
   u8 hsi_offload_stall;
+  u8 hsi_notify_cleanup;
+  u8 hsi_tracked;
   u8 po_deleted;
   u8 ao_deleted;
 } proxy_lite_session_t;
@@ -69,15 +71,17 @@ typedef struct proxy_lite_main_
   u64 segment_size;
   u8 hsi_offload;
   u8 hsi_offload_stall;
+  u8 hsi_notify_cleanup;
   u8 started;
 
-  proxy_lite_hsi_track_session_pair_fn hsi_track_session_pair;
+  proxy_lite_hsi_track_pair_fn hsi_track_pair;
 
   u64 accepted;
   u64 connected;
   u64 proxied;
   u64 hsi_tracked;
   u64 hsi_failed;
+  u64 hsi_cleanups;
   u64 closed;
   u64 reset;
 } proxy_lite_main_t;
@@ -98,15 +102,43 @@ proxy_lite_worker_get (clib_thread_index_t thread_index)
   return vec_elt_at_index (proxy_lite_main.workers, thread_index);
 }
 
+/*
+ * Session opaque packs the thread that owns the side ctx with the ctx index, so
+ * ctx can be found for sessions hsi migrated to other threads. Ctx pools are
+ * only reallocated with workers stopped, so ctx can be read from any thread.
+ */
+#define PROXY_LITE_CTX_INDEX_BITS  24
+#define PROXY_LITE_CTX_MAX_THREADS (1 << (32 - PROXY_LITE_CTX_INDEX_BITS))
+
 static proxy_lite_side_ctx_t *
 proxy_lite_side_ctx_alloc (clib_thread_index_t thread_index)
 {
   proxy_lite_worker_t *wrk = proxy_lite_worker_get (thread_index);
   proxy_lite_side_ctx_t *ctx;
 
-  pool_get_zero (wrk->ctx_pool, ctx);
+  pool_get_aligned_safe (wrk->ctx_pool, ctx, 0);
+  clib_memset (ctx, 0, sizeof (*ctx));
   ctx->ctx_index = ctx - wrk->ctx_pool;
+  ASSERT (ctx->ctx_index < (1 << PROXY_LITE_CTX_INDEX_BITS));
   return ctx;
+}
+
+static_always_inline u32
+proxy_lite_side_ctx_opaque (clib_thread_index_t thread_index, proxy_lite_side_ctx_t *ctx)
+{
+  return ((u32) thread_index << PROXY_LITE_CTX_INDEX_BITS) | ctx->ctx_index;
+}
+
+static_always_inline clib_thread_index_t
+proxy_lite_side_ctx_opaque_thread (u32 opaque)
+{
+  return opaque >> PROXY_LITE_CTX_INDEX_BITS;
+}
+
+static_always_inline u32
+proxy_lite_side_ctx_opaque_index (u32 opaque)
+{
+  return opaque & ((1 << PROXY_LITE_CTX_INDEX_BITS) - 1);
 }
 
 static void
@@ -138,11 +170,12 @@ proxy_lite_side_ctx_free_on_thread (clib_thread_index_t thread_index, u32 ctx_in
 }
 
 static_always_inline proxy_lite_side_ctx_t *
-proxy_lite_side_ctx_get (clib_thread_index_t thread_index, u32 ctx_index)
+proxy_lite_side_ctx_get (u32 opaque)
 {
-  proxy_lite_worker_t *wrk = proxy_lite_worker_get (thread_index);
+  proxy_lite_worker_t *wrk = proxy_lite_worker_get (proxy_lite_side_ctx_opaque_thread (opaque));
 
-  return pool_elt_at_index (wrk->ctx_pool, ctx_index);
+  /* No pool_elt_at_index, free bitmap might be updated by owner thread */
+  return wrk->ctx_pool + proxy_lite_side_ctx_opaque_index (opaque);
 }
 
 static proxy_lite_session_t *
@@ -183,12 +216,12 @@ proxy_lite_hsi_symbols_init (void)
 {
   proxy_lite_main_t *pm = &proxy_lite_main;
 
-  if (pm->hsi_track_session_pair)
+  if (pm->hsi_track_pair)
     return 1;
 
-  pm->hsi_track_session_pair = vlib_get_plugin_symbol ("hsi_plugin.so", "hsi_track_session_pair");
+  pm->hsi_track_pair = vlib_get_plugin_symbol ("hsi_plugin.so", "hsi_track_pair");
 
-  return pm->hsi_track_session_pair != 0;
+  return pm->hsi_track_pair != 0;
 }
 
 static_always_inline u8
@@ -215,25 +248,57 @@ proxy_lite_session_finish_hsi (proxy_lite_session_t *ps)
 }
 
 static void
-proxy_lite_session_close_pair (proxy_lite_session_t *ps, session_handle_t skip)
+proxy_lite_session_hsi_done (proxy_lite_session_t *ps)
 {
-  proxy_lite_main_t *pm = &proxy_lite_main;
-  vnet_disconnect_args_t _a = {}, *a = &_a;
+  /* With cleanup notifications, state is freed once hsi reports cleanups */
+  if (ps->hsi_notify_cleanup)
+    ps->state = PROXY_LITE_S_HSI_DONE;
+  else
+    proxy_lite_session_finish_hsi (ps);
+}
 
-  if (ps->po_handle != SESSION_INVALID_HANDLE && ps->po_handle != skip && !ps->po_deleted)
+static void
+proxy_lite_session_disconnect_rpc (void *arg)
+{
+  session_handle_tu_t sh = { .handle = pointer_to_uword (arg) };
+  vnet_disconnect_args_t a = { .handle = sh.handle };
+  app_worker_t *app_wrk;
+  session_t *s;
+
+  /* Session might be gone or handed off to hsi */
+  s = session_get_from_handle_if_valid (sh);
+  if (!s || !(app_wrk = app_worker_get_if_valid (s->app_wrk_index)))
+    return;
+
+  a.app_index = app_wrk->app_index;
+  vnet_disconnect_session (&a);
+}
+
+/* Disconnect from the thread that owns the session */
+static void
+proxy_lite_session_disconnect (session_handle_t handle)
+{
+  session_handle_tu_t sh = { .handle = handle };
+  void *arg = uword_to_pointer (handle, void *);
+
+  if (sh.thread_index == vlib_get_thread_index ())
+    proxy_lite_session_disconnect_rpc (arg);
+  else
+    session_send_rpc_evt_to_thread (sh.thread_index, proxy_lite_session_disconnect_rpc, arg);
+}
+
+static void
+proxy_lite_session_close_pair (proxy_lite_session_t *ps)
+{
+  if (ps->po_handle != SESSION_INVALID_HANDLE && !ps->po_deleted)
     {
-      a->handle = ps->po_handle;
-      a->app_index = pm->server_app_index;
-      vnet_disconnect_session (a);
+      proxy_lite_session_disconnect (ps->po_handle);
       ps->po_deleted = 1;
     }
 
-  if (ps->ao_handle != SESSION_INVALID_HANDLE && ps->ao_handle != skip && !ps->ao_deleted)
+  if (ps->ao_handle != SESSION_INVALID_HANDLE && !ps->ao_deleted)
     {
-      clib_memset (a, 0, sizeof (*a));
-      a->handle = ps->ao_handle;
-      a->app_index = pm->active_open_app_index;
-      vnet_disconnect_session (a);
+      proxy_lite_session_disconnect (ps->ao_handle);
       ps->ao_deleted = 1;
     }
 }
@@ -258,7 +323,7 @@ proxy_lite_forward_rx (session_t *s)
 
   ASSERT (s->thread_index == vlib_get_thread_index ());
 
-  ctx = proxy_lite_side_ctx_get (s->thread_index, s->opaque);
+  ctx = proxy_lite_side_ctx_get (s->opaque);
 
   clib_spinlock_lock_if_init (&pm->sessions_lock);
   ps = proxy_lite_session_get (ctx->ps_index);
@@ -302,10 +367,15 @@ static int
 proxy_lite_start_hsi_offload (session_t *s, session_handle_t peer_handle, u32 ps_index)
 {
   proxy_lite_main_t *pm = &proxy_lite_main;
+  hsi_track_args_t args = {
+    .s = s,
+    .peer_session_handle = peer_handle,
+    .flags = pm->hsi_notify_cleanup ? HSI_TRACK_F_NOTIFY_CLEANUP : 0,
+  };
   proxy_lite_session_t *ps;
   session_handle_tu_t sh = { .handle = peer_handle };
   session_t *peer_s;
-  u8 pending, flush_pending = 0;
+  u8 pending, flush_pending = 0, closing;
 
   peer_s = session_get_from_handle_safe (sh);
   if (!peer_s)
@@ -319,15 +389,16 @@ proxy_lite_start_hsi_offload (session_t *s, session_handle_t peer_handle, u32 ps
       (void) svm_fifo_set_event (s->tx_fifo);
       (void) svm_fifo_set_event (peer_s->tx_fifo);
     }
-  if (pm->hsi_track_session_pair (s, peer_handle))
+  if (pm->hsi_track_pair (&args))
     goto fail;
 
   clib_spinlock_lock_if_init (&pm->sessions_lock);
   ps = proxy_lite_session_get (ps_index);
+  ps->hsi_tracked = 1;
   if (pending)
     {
       if (ps->hsi_offload_stall)
-	proxy_lite_session_finish_hsi (ps);
+	proxy_lite_session_hsi_done (ps);
       else
 	{
 	  ps->state = PROXY_LITE_S_PROXYING;
@@ -337,7 +408,7 @@ proxy_lite_start_hsi_offload (session_t *s, session_handle_t peer_handle, u32 ps
   else
     {
       if (s->thread_index == sh.thread_index || ps->hsi_offload_stall)
-	proxy_lite_session_finish_hsi (ps);
+	proxy_lite_session_hsi_done (ps);
       else
 	ps->state = PROXY_LITE_S_PROXYING;
     }
@@ -357,21 +428,31 @@ proxy_lite_start_hsi_offload (session_t *s, session_handle_t peer_handle, u32 ps
 fail:
   clib_spinlock_lock_if_init (&pm->sessions_lock);
   ps = proxy_lite_session_get (ps_index);
-  ps->state = PROXY_LITE_S_PROXYING;
+  closing = ps->state == PROXY_LITE_S_CLOSING;
+  if (!closing)
+    ps->state = PROXY_LITE_S_PROXYING;
   pm->hsi_failed++;
   pm->proxied++;
   clib_spinlock_unlock_if_init (&pm->sessions_lock);
+
+  /* Not tracked, so proxy data already in fifos */
+  if (!closing)
+    {
+      (void) svm_fifo_set_event (s->tx_fifo);
+      session_program_tx_io_evt (session_handle (s), SESSION_IO_EVT_TX);
+      session_program_tx_io_evt (peer_handle, SESSION_IO_EVT_TX);
+    }
   return -1;
 }
 
 static int
-proxy_lite_start_connect (proxy_lite_session_t *ps)
+proxy_lite_start_connect (u32 ps_index)
 {
   proxy_lite_main_t *pm = &proxy_lite_main;
   vnet_connect_args_t _a = {}, *a = &_a;
 
   clib_memcpy (&a->sep_ext, &pm->client_sep, sizeof (pm->client_sep));
-  a->api_context = ps - pm->sessions;
+  a->api_context = ps_index;
   a->app_index = pm->active_open_app_index;
 
   return vnet_connect2 (a);
@@ -402,20 +483,21 @@ proxy_lite_accept_callback (session_t *s)
   ps->po_thread_index = s->thread_index;
   ps->hsi_offload = pm->hsi_offload;
   ps->hsi_offload_stall = pm->hsi_offload_stall;
+  ps->hsi_notify_cleanup = pm->hsi_notify_cleanup;
   ctx->ps_index = ps_index;
   ctx->peer_handle = SESSION_INVALID_HANDLE;
   pm->accepted++;
   clib_spinlock_unlock_if_init (&pm->sessions_lock);
 
-  s->opaque = ctx->ctx_index;
+  s->opaque = proxy_lite_side_ctx_opaque (s->thread_index, ctx);
   s->session_state = SESSION_STATE_READY;
 
-  if (proxy_lite_start_connect (ps))
+  if (proxy_lite_start_connect (ps_index))
     {
       clib_spinlock_lock_if_init (&pm->sessions_lock);
       ps = proxy_lite_session_get (ps_index);
       ps->state = PROXY_LITE_S_CLOSING;
-      proxy_lite_session_close_pair (ps, SESSION_INVALID_HANDLE);
+      proxy_lite_session_close_pair (ps);
       clib_spinlock_unlock_if_init (&pm->sessions_lock);
     }
 
@@ -429,12 +511,12 @@ proxy_lite_disconnect_callback (session_t *s)
   proxy_lite_side_ctx_t *ctx;
   proxy_lite_session_t *ps;
 
-  ctx = proxy_lite_side_ctx_get (s->thread_index, s->opaque);
+  ctx = proxy_lite_side_ctx_get (s->opaque);
 
   clib_spinlock_lock_if_init (&pm->sessions_lock);
   ps = proxy_lite_session_get (ctx->ps_index);
   ps->state = PROXY_LITE_S_CLOSING;
-  proxy_lite_session_close_pair (ps, session_handle (s));
+  proxy_lite_session_close_pair (ps);
   pm->closed++;
   clib_spinlock_unlock_if_init (&pm->sessions_lock);
 }
@@ -446,12 +528,12 @@ proxy_lite_reset_callback (session_t *s)
   proxy_lite_side_ctx_t *ctx;
   proxy_lite_session_t *ps;
 
-  ctx = proxy_lite_side_ctx_get (s->thread_index, s->opaque);
+  ctx = proxy_lite_side_ctx_get (s->opaque);
 
   clib_spinlock_lock_if_init (&pm->sessions_lock);
   ps = proxy_lite_session_get (ctx->ps_index);
   ps->state = PROXY_LITE_S_CLOSING;
-  proxy_lite_session_close_pair (ps, session_handle (s));
+  proxy_lite_session_close_pair (ps);
   pm->reset++;
   clib_spinlock_unlock_if_init (&pm->sessions_lock);
 }
@@ -462,19 +544,22 @@ proxy_lite_cleanup_callback (session_t *s, session_cleanup_ntf_t ntf)
   proxy_lite_main_t *pm = &proxy_lite_main;
   proxy_lite_side_ctx_t *ctx;
   proxy_lite_session_t *ps;
-  u32 ctx_index, ps_index;
+  u32 ps_index;
 
   if (ntf == SESSION_CLEANUP_TRANSPORT)
     return;
 
-  ctx_index = s->opaque;
-  ctx = proxy_lite_side_ctx_get (s->thread_index, ctx_index);
+  /* Ctx might belong to another thread if hsi migrated the session */
+  ctx = proxy_lite_side_ctx_get (s->opaque);
   ps_index = ctx->ps_index;
   u8 is_active_open = ctx->is_active_open;
-  proxy_lite_side_ctx_free (s->thread_index, ctx_index);
+  proxy_lite_side_ctx_free_on_thread (proxy_lite_side_ctx_opaque_thread (s->opaque),
+				      ctx->ctx_index);
 
   clib_spinlock_lock_if_init (&pm->sessions_lock);
   ps = proxy_lite_session_get (ps_index);
+  if (ps->hsi_tracked)
+    pm->hsi_cleanups++;
   if (is_active_open)
     {
       ps->ao_handle = SESSION_INVALID_HANDLE;
@@ -545,11 +630,15 @@ proxy_lite_active_open_connected_callback (u32 app_index, u32 opaque, session_t 
 					   session_error_t err)
 {
   proxy_lite_main_t *pm = &proxy_lite_main;
-  proxy_lite_side_ctx_t *ao_ctx;
+  proxy_lite_side_ctx_t *ao_ctx = 0;
   proxy_lite_session_t *ps;
   session_handle_t po_handle;
   u32 ps_index;
   u8 hsi_offload;
+
+  /* Alloc before taking the lock, growing the pool might sync workers */
+  if (!err)
+    ao_ctx = proxy_lite_side_ctx_alloc (s->thread_index);
 
   clib_spinlock_lock_if_init (&pm->sessions_lock);
   ps = proxy_lite_session_get (opaque);
@@ -558,12 +647,14 @@ proxy_lite_active_open_connected_callback (u32 app_index, u32 opaque, session_t 
   if (err || ps->state == PROXY_LITE_S_CLOSING)
     {
       ps->state = PROXY_LITE_S_CLOSING;
-      proxy_lite_session_close_pair (ps, SESSION_INVALID_HANDLE);
+      proxy_lite_session_close_pair (ps);
       clib_spinlock_unlock_if_init (&pm->sessions_lock);
-      return 0;
+      if (ao_ctx)
+	proxy_lite_side_ctx_free (s->thread_index, ao_ctx->ctx_index);
+      /* Session layer detaches and closes the session */
+      return -1;
     }
 
-  ao_ctx = proxy_lite_side_ctx_alloc (s->thread_index);
   ao_ctx->ps_index = opaque;
   ao_ctx->is_active_open = 1;
   ao_ctx->peer_handle = ps->po_handle;
@@ -574,7 +665,7 @@ proxy_lite_active_open_connected_callback (u32 app_index, u32 opaque, session_t 
   po_handle = ps->po_handle;
   hsi_offload = ps->hsi_offload;
 
-  s->opaque = ao_ctx->ctx_index;
+  s->opaque = proxy_lite_side_ctx_opaque (s->thread_index, ao_ctx);
 
   pm->connected++;
   if (!hsi_offload)
@@ -690,6 +781,8 @@ proxy_lite_start (vlib_main_t *vm)
 
       vtm = vlib_get_thread_main ();
       n_threads = 1 + vtm->n_threads;
+      if (n_threads > PROXY_LITE_CTX_MAX_THREADS)
+	return -1;
       vec_validate (pm->workers, n_threads - 1);
 
       if (proxy_lite_attach ())
@@ -726,6 +819,7 @@ proxy_lite_command_fn (vlib_main_t *vm, unformat_input_t *input, vlib_cli_comman
   pm->segment_size = 512 << 20;
   pm->hsi_offload = 0;
   pm->hsi_offload_stall = 0;
+  pm->hsi_notify_cleanup = 0;
 
   if (!unformat_user (input, unformat_line_input, line_input))
     return clib_error_return (0, "expected server-uri and client-uri");
@@ -747,6 +841,11 @@ proxy_lite_command_fn (vlib_main_t *vm, unformat_input_t *input, vlib_cli_comman
 	}
       else if (unformat (line_input, "hsi-offload"))
 	pm->hsi_offload = 1;
+      else if (unformat (line_input, "hsi-notify-cleanup"))
+	{
+	  pm->hsi_offload = 1;
+	  pm->hsi_notify_cleanup = 1;
+	}
       else
 	{
 	  error = clib_error_return (0, "unknown input `%U'", format_unformat_error, line_input);
@@ -802,7 +901,7 @@ VLIB_CLI_COMMAND (proxy_lite_command, static) = {
   .short_help = "proxy-lite server-uri <tcp://ip:port|udp://ip:port> "
 		"client-uri <tcp://ip:port|udp://ip:port> "
 		"[fifo-size <n>[k|m]] [segment-size <n>[k|m]] "
-		"[hsi-offload] [hsi-offload-stall]",
+		"[hsi-offload] [hsi-offload-stall] [hsi-notify-cleanup]",
   .function = proxy_lite_command_fn,
 };
 
@@ -811,12 +910,14 @@ proxy_lite_show_command_fn (vlib_main_t *vm, unformat_input_t *input, vlib_cli_c
 {
   proxy_lite_main_t *pm = &proxy_lite_main;
 
-  vlib_cli_output (vm, "proxy-lite %s%s%s", pm->started ? "started" : "stopped",
+  vlib_cli_output (vm, "proxy-lite %s%s%s%s", pm->started ? "started" : "stopped",
 		   pm->hsi_offload ? " hsi-offload" : "",
-		   pm->hsi_offload_stall ? " hsi-offload-stall" : "");
+		   pm->hsi_offload_stall ? " hsi-offload-stall" : "",
+		   pm->hsi_notify_cleanup ? " hsi-notify-cleanup" : "");
   vlib_cli_output (vm, "accepted %lu connected %lu proxied %lu", pm->accepted, pm->connected,
 		   pm->proxied);
   vlib_cli_output (vm, "hsi tracked %lu failed %lu", pm->hsi_tracked, pm->hsi_failed);
+  vlib_cli_output (vm, "hsi cleanups %lu", pm->hsi_cleanups);
   vlib_cli_output (vm, "closed %lu reset %lu active-sessions %u", pm->closed, pm->reset,
 		   pool_elts (pm->sessions));
   return 0;

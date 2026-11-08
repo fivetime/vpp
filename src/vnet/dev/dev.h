@@ -192,6 +192,19 @@ typedef struct vnet_dev_port_cfg_change_req
 
 } vnet_dev_port_cfg_change_req_t;
 
+/* raw SFP/QSFP module EEPROM read request, i2c_address in 7-bit form
+ * (0x50 = module/page data, 0x51 = SFP A2h diagnostic page), page/bank
+ * select the upper memory page for modules that support paging (QSFP) */
+typedef struct
+{
+  u8 i2c_address;
+  u8 page;
+  u8 bank;
+  u16 offset;
+  u16 length;
+  u8 *data;
+} vnet_dev_port_module_eeprom_req_t;
+
 typedef struct
 {
   vnet_dev_hw_addr_t hw_addr;
@@ -270,6 +283,7 @@ typedef struct
   vnet_dev_port_op_no_rv_t *clear_counters;
   vnet_dev_port_op_with_ptr_t *add_sec_if;
   vnet_dev_port_op_with_ptr_t *del_sec_if;
+  vnet_dev_port_op_with_ptr_t *get_module_eeprom;
   format_function_t *format_status;
   format_function_t *format_flow;
 } vnet_dev_port_ops_t;
@@ -646,6 +660,10 @@ clib_error_t *vnet_dev_interface_set_rss_queues (vnet_main_t *,
 						 clib_bitmap_t *);
 void vnet_dev_clear_hw_interface_counters (u32);
 void vnet_dev_set_interface_next_node (vnet_main_t *, u32, u32);
+clib_error_t *vnet_dev_port_eeprom_read (vnet_main_t *, vnet_hw_interface_t *,
+					 vnet_interface_eeprom_t **);
+vnet_dev_rv_t vnet_dev_port_get_module_eeprom (vlib_main_t *, vnet_dev_port_t *,
+					       vnet_interface_eeprom_t *);
 
 /* port.c */
 
@@ -727,9 +745,8 @@ vnet_dev_rv_t vnet_dev_process_call_op (vlib_main_t *, vnet_dev_t *,
 					vnet_dev_op_t *);
 vnet_dev_rv_t vnet_dev_process_call_op_no_rv (vlib_main_t *, vnet_dev_t *,
 					      vnet_dev_op_no_rv_t *);
-vnet_dev_rv_t vnet_dev_process_call_op_with_ptr (vlib_main_t *, vnet_dev_t *,
-						 vnet_dev_op_with_ptr_t *,
-						 void *);
+__clib_export vnet_dev_rv_t vnet_dev_process_call_op_with_ptr (vlib_main_t *, vnet_dev_t *,
+							       vnet_dev_op_with_ptr_t *, void *);
 __clib_export void vnet_dev_process_call_op_no_wait (vlib_main_t *, vnet_dev_t *,
 						     vnet_dev_op_no_rv_t *);
 vnet_dev_rv_t vnet_dev_process_call_port_op (vlib_main_t *, vnet_dev_port_t *,
@@ -787,7 +804,7 @@ format_function_t format_vnet_dev_port_info;
 format_function_t format_vnet_dev_port_rx_offloads;
 format_function_t format_vnet_dev_port_tx_offloads;
 format_function_t format_vnet_dev_port_primary_intf_name;
-format_function_t format_vnet_dev_rv;
+__clib_export format_function_t format_vnet_dev_rv;
 format_function_t format_vnet_dev_rx_queue_info;
 format_function_t format_vnet_dev_tx_queue_info;
 format_function_t format_vnet_dev_flow;

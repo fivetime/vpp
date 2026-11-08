@@ -1,7 +1,9 @@
 package hst
 
 import (
+	"encoding/binary"
 	"fmt"
+	"net"
 	"os/exec"
 	"reflect"
 	"regexp"
@@ -11,6 +13,8 @@ import (
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
+	"golang.org/x/net/icmp"
+	"golang.org/x/net/ipv4"
 )
 
 type HsiSuite struct {
@@ -172,6 +176,7 @@ func (s *HsiSuite) TeardownTest() {
 	vpp := s.Containers.Vpp.VppInstance
 	if CurrentSpecReport().Failed() {
 		Log(vpp.Vppctl("show session verbose 2"))
+		Log(vpp.Vppctl("show interface"))
 		Log(vpp.Vppctl("show error"))
 		Log(vpp.Vppctl("show tcp stats"))
 		Log(vpp.Vppctl("show proxy-lite"))
@@ -291,18 +296,167 @@ func (s *HsiSuite) BlockServerReplies() func() {
 	return unblock
 }
 
+// AddClientNetem applies netem to the packets the client sends to vpp. The
+// returned function removes it.
+func (s *HsiSuite) AddClientNetem(args ...string) func() {
+	clientIf := s.Interfaces.Client.Host.Name()
+	run := func(args ...string) {
+		output, err := CommandInNetns(append([]string{"tc", "qdisc"}, args...),
+			s.NetNamespaces.Client).CombinedOutput()
+		AssertNil(err, string(output))
+	}
+	run(append([]string{"add", "dev", clientIf, "root", "netem"}, args...)...)
+
+	applied := true
+	return func() {
+		if !applied {
+			return
+		}
+		run("del", "dev", clientIf, "root")
+		applied = false
+	}
+}
+
+// AddHostLoss drops percent of the packets the client and the target send to
+// vpp. The returned function removes the loss.
+func (s *HsiSuite) AddHostLoss(percent int) func() {
+	loss := fmt.Sprintf("%d%%", percent)
+	clientIf := s.Interfaces.Client.Host.Name()
+	serverIf := s.Interfaces.Server.Host.Name()
+	run := func(cmd *exec.Cmd) {
+		output, err := cmd.CombinedOutput()
+		AssertNil(err, string(output))
+	}
+	run(CommandInNetns([]string{"tc", "qdisc", "add", "dev", clientIf, "root", "netem", "loss",
+		loss}, s.NetNamespaces.Client))
+	run(exec.Command("tc", "qdisc", "add", "dev", serverIf, "root", "netem", "loss", loss))
+
+	lossy := true
+	return func() {
+		if !lossy {
+			return
+		}
+		run(CommandInNetns([]string{"tc", "qdisc", "del", "dev", clientIf, "root"},
+			s.NetNamespaces.Client))
+		run(exec.Command("tc", "qdisc", "del", "dev", serverIf, "root"))
+		lossy = false
+	}
+}
+
+// DropServerDataSegments drops full size TCP segments sent to the target, i.e.,
+// IPv4 total length between 1024 and 2047, so handshakes and acks pass but
+// data is never acked. The returned function removes the filter.
+func (s *HsiSuite) DropServerDataSegments() func() {
+	serverIf := s.Interfaces.Server.Host.Name()
+	output, err := exec.Command("tc", "qdisc", "add", "dev", serverIf, "handle", "ffff:",
+		"ingress").CombinedOutput()
+	AssertNil(err, string(output))
+	output, err = exec.Command("tc", "filter", "add", "dev", serverIf, "parent", "ffff:",
+		"protocol", "ip", "prio", "1", "u32", "match", "ip", "protocol", "6", "0xff",
+		"match", "u16", "0x0400", "0xfc00", "at", "2", "action", "drop").CombinedOutput()
+	AssertNil(err, string(output))
+
+	dropping := true
+	return func() {
+		if !dropping {
+			return
+		}
+		output, err := exec.Command("tc", "qdisc", "del", "dev", serverIf, "ingress").CombinedOutput()
+		AssertNil(err, string(output))
+		dropping = false
+	}
+}
+
+// SendServerIcmpPortUnreachable sends vpp, from the target host, an icmp port
+// unreachable error for the proxy-lite udp session to the target.
+func (s *HsiSuite) SendServerIcmpPortUnreachable() {
+	vpp := s.Containers.Vpp.VppInstance
+	vppAddr := s.Interfaces.Server.Ip4AddressString()
+	session := regexp.MustCompile(regexp.QuoteMeta("[U] "+vppAddr+":") + `(\d+)` +
+		regexp.QuoteMeta(fmt.Sprintf("->%s:%d", s.ServerAddr(), s.Ports.Server)))
+	sessions := vpp.Vppctl("show session verbose")
+	m := session.FindStringSubmatch(sessions)
+	AssertNotNil(m, "proxy-lite udp session to target not found:\n"+sessions)
+	lclPort, err := strconv.Atoi(m[1])
+	AssertNil(err)
+
+	// Datagram that triggered the error, ip header and first 8 bytes of udp
+	orig := make([]byte, 28)
+	orig[0] = 0x45
+	binary.BigEndian.PutUint16(orig[2:], 28)
+	orig[8] = 64
+	orig[9] = 17
+	copy(orig[12:16], net.ParseIP(vppAddr).To4())
+	copy(orig[16:20], net.ParseIP(s.ServerAddr()).To4())
+	binary.BigEndian.PutUint16(orig[20:], uint16(lclPort))
+	binary.BigEndian.PutUint16(orig[22:], s.Ports.Server)
+	binary.BigEndian.PutUint16(orig[24:], 8)
+
+	msg, err := (&icmp.Message{Type: ipv4.ICMPTypeDestinationUnreachable, Code: 3,
+		Body: &icmp.DstUnreach{Data: orig}}).Marshal(nil)
+	AssertNil(err)
+	conn, err := icmp.ListenPacket("ip4:icmp", s.ServerAddr())
+	AssertNil(err)
+	defer conn.Close()
+	_, err = conn.WriteTo(msg, &net.IPAddr{IP: net.ParseIP(vppAddr)})
+	AssertNil(err)
+}
+
 func WaitProxyLitePendingRx(vpp *VppInstance) {
-	pendingRx := regexp.MustCompile(`(?m)^\s*Rx fifo: cursize [1-9][0-9]*\b`)
+	WaitProxyLitePendingRxAtLeast(vpp, 1)
+}
+
+// WaitProxyLitePendingRxAtLeast waits until a proxy-lite session has at least
+// minBytes queued in its rx fifo
+func WaitProxyLitePendingRxAtLeast(vpp *VppInstance, minBytes int) {
+	pendingRx := regexp.MustCompile(`(?m)^\s*Rx fifo: cursize (\d+)\b`)
 	var lastOutput string
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		lastOutput = vpp.Vppctl("show session verbose 2")
-		if pendingRx.MatchString(lastOutput) {
+		for _, m := range pendingRx.FindAllStringSubmatch(lastOutput, -1) {
+			if n, err := strconv.Atoi(m[1]); err == nil && n >= minBytes {
+				return
+			}
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	AssertFail("timed out waiting for %d bytes of proxy-lite RX data:\n%s", minBytes,
+		lastOutput)
+}
+
+// HsiShowSessions returns verbose sessions of all threads. Unlike plain show
+// session, it doesn't suppress threads with many sessions.
+func HsiShowSessions(vpp *VppInstance) string {
+	var out strings.Builder
+	for thread := 0; thread <= vpp.CpuConfig.NumWorkers; thread++ {
+		out.WriteString(vpp.Vppctl("show session thread %d verbose 2 force-print", thread))
+		out.WriteString("\n")
+	}
+	return out.String()
+}
+
+// WaitProxyLitePendingRxSessions waits until at least sessions proxy-lite
+// sessions have data queued in their rx fifos
+func WaitProxyLitePendingRxSessions(vpp *VppInstance, sessions int) {
+	pendingRx := regexp.MustCompile(`(?m)^\s*Rx fifo: cursize (\d+)\b`)
+	var lastOutput string
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		lastOutput = HsiShowSessions(vpp)
+		pending := 0
+		for _, m := range pendingRx.FindAllStringSubmatch(lastOutput, -1) {
+			if n, err := strconv.Atoi(m[1]); err == nil && n > 0 {
+				pending++
+			}
+		}
+		if pending >= sessions {
 			return
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
-	AssertFail("timed out waiting for proxy-lite RX data:\n%s", lastOutput)
+	AssertFail("timed out waiting for %d proxy-lite sessions with RX data:\n%s", sessions,
+		lastOutput)
 }
 
 func WaitProxyLiteTrackedCount(vpp *VppInstance, count int, cancel func()) string {
@@ -352,8 +506,13 @@ func WaitHsiContains(vpp *VppInstance, want string) string {
 }
 
 func WaitHsiCounterAtLeast(vpp *VppInstance, name string, want int) string {
+	return WaitHsiCounterAtLeastWithin(vpp, name, want, 10*time.Second)
+}
+
+func WaitHsiCounterAtLeastWithin(vpp *VppInstance, name string, want int,
+	timeout time.Duration) string {
 	var lastOutput string
-	deadline := time.Now().Add(10 * time.Second)
+	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		output := vpp.Vppctl("show hsi")
 		if output != "" {
@@ -455,7 +614,7 @@ func AssertProxyLiteSessionsCleanedCount(s *HsiSuite, expectedCleanups int) {
 		s.Interfaces.Client.Host.Ip4AddressString())
 	proxyTargetConn := fmt.Sprintf("->%s:%d", s.ServerAddr(), s.Ports.Server)
 	for range 10 {
-		sessions := vpp.Vppctl("show session verbose 2")
+		sessions := HsiShowSessions(vpp)
 		if !strings.Contains(sessions, proxyClientConn) &&
 			!strings.Contains(sessions, proxyTargetConn) {
 			break
@@ -464,7 +623,7 @@ func AssertProxyLiteSessionsCleanedCount(s *HsiSuite, expectedCleanups int) {
 	}
 
 	hsi := vpp.Vppctl("show hsi")
-	sessions := vpp.Vppctl("show session verbose 2")
+	sessions := HsiShowSessions(vpp)
 	Log(hsi)
 	Log(sessions)
 	AssertNotContains(sessions, proxyClientConn, "client-proxy session not cleaned up")
@@ -477,6 +636,36 @@ func AssertProxyLiteSessionsCleanedCount(s *HsiSuite, expectedCleanups int) {
 
 func AssertProxyLiteSessionsCleaned(s *HsiSuite) {
 	AssertProxyLiteSessionsCleanedCount(s, 2)
+}
+
+func proxyLiteHsiCleanupsDone(output string, want int) bool {
+	cleanups := regexp.MustCompile(`hsi cleanups (\d+)`).FindStringSubmatch(output)
+	active := regexp.MustCompile(`active-sessions (\d+)`).FindStringSubmatch(output)
+	return cleanups != nil && active != nil && cleanups[1] == strconv.Itoa(want) &&
+		active[1] == "0"
+}
+
+// AssertProxyLiteHsiCleanups waits for proxy-lite to get exactly want hsi
+// cleanup notifications, i.e., one per tracked session, and to free all its
+// sessions. It then checks that no extra notification shows up.
+func AssertProxyLiteHsiCleanups(vpp *VppInstance, want int) string {
+	var lastOutput string
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		lastOutput = vpp.Vppctl("show proxy-lite")
+		if proxyLiteHsiCleanupsDone(lastOutput, want) {
+			time.Sleep(500 * time.Millisecond)
+			lastOutput = vpp.Vppctl("show proxy-lite")
+			Log(lastOutput)
+			AssertEqual(true, proxyLiteHsiCleanupsDone(lastOutput, want),
+				"unexpected proxy-lite hsi cleanups:\n"+lastOutput)
+			return lastOutput
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	AssertFail("timed out waiting for %d proxy-lite hsi cleanups; last output:\n%s", want,
+		lastOutput)
+	return lastOutput
 }
 
 var _ = Describe("HsiSuite", Ordered, ContinueOnFailure, Label("HSI"), func() {

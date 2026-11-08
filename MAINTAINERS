@@ -453,7 +453,7 @@ F:	src/drivers
 Marvel Scalable mGig NICs Device driver
 I:	atlantic
 M:	Damjan Marion <dmarion@me.com>
-F:	src/drivers/atlantic/
+F:	src/drivers/net/atlantic/
 
 IAVF Device driver
 I:	iavf
@@ -463,7 +463,7 @@ F:	src/drivers/iavf/
 IGE Device driver
 I:	ige
 M:	Damjan Marion <damarion@cisco.com>
-F:	src/drivers/ige/
+F:	src/drivers/net/ige/
 
 Marvell Armada device driver
 I:	armada
@@ -475,6 +475,11 @@ I:	octeon
 M:	Monendra Singh Kushwaha <kmonendra@marvell.com>
 M:	Damjan Marion <damarion@cisco.com>
 F:	src/drivers/octeon/
+
+Intel E8xx (ice) device driver
+I:	ice
+M:	Damjan Marion <dmarion@0xa5.net>
+F:	src/drivers/net/ice/
 
 Plugin - Dispatch Trace PCAP
 I:	dispatch-trace

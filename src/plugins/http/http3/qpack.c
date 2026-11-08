@@ -35,7 +35,7 @@ static qpack_static_table_entry_t qpack_static_table[] = {
   { name_val_token_lit ("referer", "") },
   { name_val_token_lit ("set-cookie", "") },
   { name_val_token_lit (":method", "CONNECT") },
-  { name_val_token_lit (":metho", "DELETE") },
+  { name_val_token_lit (":method", "DELETE") },
   { name_val_token_lit (":method", "GET") },
   { name_val_token_lit (":method", "HEAD") },
   { name_val_token_lit (":method", "OPTIONS") },
@@ -859,8 +859,7 @@ qpack_get_static_table_entry (uword index, http_token_t *name,
   name->len = e->name_len;
   if (value_is_indexed)
     {
-      if (e->value_len == 0)
-	return HPACK_ERROR_COMPRESSION;
+      /* Static entries can have empty values (RFC 9204, 3.1). */
       value->base = e->value;
       value->len = e->value_len;
     }
@@ -1177,8 +1176,8 @@ qpack_encode_status_code (u8 *dst, http_status_code_t sc)
 static u8 *
 qpack_encode_content_len (u8 *dst, u64 content_len)
 {
-  u8 digit_buffer[20];
-  u8 *d = digit_buffer + sizeof (digit_buffer);
+  u8 digit_buffer[HTTP_U64_MAX_DECIMAL_DIGITS];
+  u8 *d;
   u8 *a;
 
   /* save some cycles and encode "content-length: 0" directly */
@@ -1190,12 +1189,7 @@ qpack_encode_content_len (u8 *dst, u64 content_len)
       return dst;
     }
 
-  do
-    {
-      *--d = '0' + content_len % 10;
-      content_len /= 10;
-    }
-  while (content_len);
+  d = http_encode_u64_decimal (digit_buffer + sizeof (digit_buffer), content_len);
 
   dst = qpack_encode_header (dst, HTTP_HEADER_CONTENT_LENGTH, d,
 			     digit_buffer + sizeof (digit_buffer) - d, 0);
@@ -1319,12 +1313,19 @@ qpack_parse_headers_prefix (u8 **src, u8 *end, qpack_decoder_ctx_t *ctx)
   p = *src;
 
   ctx->req_insert_count = hpack_decode_int (&p, end, 8);
-  if (ctx->req_insert_count == HPACK_INVALID_INT || p == end)
+  /* We don't suport dynamic table, so only zero is valid for Required Insert Count
+   * (RFC9204, 4.5.1.1). */
+  if (ctx->req_insert_count != 0 || p == end)
     return HPACK_ERROR_COMPRESSION;
 
   ctx->delta_base_sign = *p & 0x80;
   ctx->delta_base = hpack_decode_int (&p, end, 7);
-  if (ctx->req_insert_count == HPACK_INVALID_INT)
+  if (ctx->delta_base == HPACK_INVALID_INT)
+    return HPACK_ERROR_COMPRESSION;
+
+  /* Base must not be negative (RFC 9204, 4.5.1.2). Positive Delta Base
+   * with zero sign is valid even without dynamic table references. */
+  if (ctx->delta_base_sign && ctx->req_insert_count <= ctx->delta_base)
     return HPACK_ERROR_COMPRESSION;
 
   *src = p;
@@ -1342,7 +1343,7 @@ qpack_parse_request (u8 *src, u32 src_len, u8 *dst, u32 dst_len,
 
   ASSERT (dst_len);
 
-  if (src_len < 3)
+  if (src_len < 2)
     return HTTP3_ERROR_QPACK_DECOMPRESSION_FAILED;
 
   p = src;
@@ -1350,8 +1351,12 @@ qpack_parse_request (u8 *src, u32 src_len, u8 *dst, u32 dst_len,
 
   /* encoded field section prefix */
   rv = qpack_parse_headers_prefix (&p, end, decoder_ctx);
-  if (rv || p == end)
+  if (rv)
     return hpack_error_to_http3_error[rv];
+
+  /* missing mandatory request pseudo-headers */
+  if (p == end)
+    return HTTP3_ERROR_MESSAGE_ERROR;
 
   rv = hpack_decode_request (p, end, dst, dst_len, control_data, headers,
 			     decoder_ctx, (void *) qpack_decode_header);
@@ -1369,7 +1374,7 @@ qpack_parse_response (u8 *src, u32 src_len, u8 *dst, u32 dst_len,
 
   ASSERT (dst_len);
 
-  if (src_len < 3)
+  if (src_len < 2)
     return HTTP3_ERROR_QPACK_DECOMPRESSION_FAILED;
 
   p = src;
@@ -1377,8 +1382,12 @@ qpack_parse_response (u8 *src, u32 src_len, u8 *dst, u32 dst_len,
 
   /* encoded field section prefix */
   rv = qpack_parse_headers_prefix (&p, end, decoder_ctx);
-  if (rv || p == end)
+  if (rv)
     return hpack_error_to_http3_error[rv];
+
+  /* missing mandatory :status pseudo-header */
+  if (p == end)
+    return HTTP3_ERROR_MESSAGE_ERROR;
 
   rv = hpack_decode_response (p, end, dst, dst_len, control_data, headers,
 			      decoder_ctx, qpack_decode_header);

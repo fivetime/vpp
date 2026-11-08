@@ -133,6 +133,7 @@ class TestTCPUnitTests(VppAsfTestCase):
             "lookup",
             "delivery",
             "persist",
+            "limited-transmit",
             "rto",
             "rst",
             "fin-rst",
@@ -152,11 +153,15 @@ class TestTCPUnitTests(VppAsfTestCase):
             "tamper recov-pt",
             "tamper dsack-early",
             "tamper strand-head",
+            "tamper full-wnd",
             "tamper rto",
             "tamper rto-head",
             "tamper dupack-run",
+            "tamper dupack-loss",
             "tamper dsack-rto",
             "tamper dsack-partial",
+            "tamper dupack-cwnd",
+            "tamper nosack-cwnd",
         )
 
         for test_case in test_cases:

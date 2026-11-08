@@ -152,11 +152,11 @@ hsi_udp_lookup (vlib_buffer_t *b, void *ip_hdr, udp_header_t **rhdr, u8 is_ip4)
 }
 
 always_inline transport_connection_t *
-hsi_tcp_lookup (vlib_main_t *vm, vlib_buffer_t *b, void *ip_hdr, tcp_header_t **rhdr, u8 is_ip4)
+hsi_tcp_lookup (vlib_main_t *vm, vlib_buffer_t *b, void *ip_hdr, tcp_header_t **rhdr, u8 is_ip4,
+		u8 *result)
 {
   transport_connection_t *tc;
   tcp_header_t *hdr;
-  u8 result = 0;
 
   if (is_ip4)
     {
@@ -164,7 +164,7 @@ hsi_tcp_lookup (vlib_main_t *vm, vlib_buffer_t *b, void *ip_hdr, tcp_header_t **
       *rhdr = hdr = ip4_next_header (ip4);
       tc = session_lookup_connection_wt4 (vnet_buffer (b)->ip.fib_index, &ip4->dst_address,
 					  &ip4->src_address, hdr->dst_port, hdr->src_port,
-					  TRANSPORT_PROTO_TCP, vm->thread_index, &result);
+					  TRANSPORT_PROTO_TCP, vm->thread_index, result);
     }
   else
     {
@@ -172,26 +172,49 @@ hsi_tcp_lookup (vlib_main_t *vm, vlib_buffer_t *b, void *ip_hdr, tcp_header_t **
       *rhdr = hdr = ip6_next_header (ip6);
       tc = session_lookup_connection_wt6 (vnet_buffer (b)->ip.fib_index, &ip6->dst_address,
 					  &ip6->src_address, hdr->dst_port, hdr->src_port,
-					  TRANSPORT_PROTO_TCP, vm->thread_index, &result);
+					  TRANSPORT_PROTO_TCP, vm->thread_index, result);
     }
 
-  return result == 0 ? tc : 0;
+  return *result == SESSION_LOOKUP_RESULT_NONE ? tc : 0;
+}
+
+/* Intercept listener might have been removed since intercept was enabled */
+always_inline session_t *
+hsi_intercept_listener_get (transport_proto_t proto, u8 is_ip4)
+{
+  session_handle_tu_t sh = { .handle = hsi_main.intercept_listeners[!is_ip4][proto] };
+  session_t *ls;
+
+  if (sh.handle == SESSION_INVALID_HANDLE)
+    return 0;
+
+  ls = session_get_from_handle_if_valid (sh);
+  if (!ls || ls->session_state != SESSION_STATE_LISTENING ||
+      ls->session_type != session_type_from_proto_and_ip (proto, is_ip4))
+    return 0;
+
+  return ls;
 }
 
 always_inline hsi_lookup_result_t
-hsi_tcp_lookup_handler (vlib_main_t *vm, vlib_buffer_t *b, void *ip_hdr, u32 *next, u8 is_ip4,
-			u8 is_input)
+hsi_tcp_lookup_handler (vlib_main_t *vm, vlib_buffer_t *b, void *ip_hdr, u32 *next, u8 *error,
+			u8 is_ip4, u8 is_input)
 {
+  u8 result = SESSION_LOOKUP_RESULT_NONE;
   tcp_header_t *tcp_hdr = 0;
   tcp_connection_t *tc;
   tcp_state_t state;
+  session_t *ls;
 
-  tc = (tcp_connection_t *) hsi_tcp_lookup (vm, b, ip_hdr, &tcp_hdr, is_ip4);
+  tc = (tcp_connection_t *) hsi_tcp_lookup (vm, b, ip_hdr, &tcp_hdr, is_ip4, &result);
   if (!tc)
     {
       u32 error = 0;
 
-      if (!hsi_have_intercept_proto (TRANSPORT_PROTO_TCP, is_ip4) || !tcp_syn (tcp_hdr))
+      /* Filtered or on another thread, normal path handles it */
+      if (result != SESSION_LOOKUP_RESULT_NONE ||
+	  !hsi_have_intercept_proto (TRANSPORT_PROTO_TCP, is_ip4) || !tcp_syn (tcp_hdr) ||
+	  !(ls = hsi_intercept_listener_get (TRANSPORT_PROTO_TCP, is_ip4)))
 	{
 	  vnet_feature_next (next, b);
 	  return HSI_LOOKUP_RESULT_PASS;
@@ -205,8 +228,7 @@ hsi_tcp_lookup_handler (vlib_main_t *vm, vlib_buffer_t *b, void *ip_hdr, u32 *ne
 	  return HSI_LOOKUP_RESULT_PASS;
 	}
 
-      vnet_buffer (b)->tcp.connection_index =
-	hsi_main.intercept_listeners[!is_ip4][TRANSPORT_PROTO_TCP];
+      vnet_buffer (b)->tcp.connection_index = ls->connection_index;
       vnet_buffer (b)->tcp.flags = TCP_STATE_LISTEN;
 
       *next = HSI_INPUT_NEXT_TCP_LISTEN;
@@ -233,14 +255,19 @@ hsi_tcp_lookup_handler (vlib_main_t *vm, vlib_buffer_t *b, void *ip_hdr, u32 *ne
       if (PREDICT_FALSE (tc->cfg_flags & TCP_CFG_F_TRACKED))
 	{
 	  hsi_tcp_tracked_action_t action;
+	  u8 is_drain = 0;
 
-	  if (!is_input && tc->state != TCP_STATE_CLOSED)
+	  if (!is_input && !hsi_tcp_connection_is_committed (tc))
 	    {
 	      vnet_feature_next (next, b);
 	      return HSI_LOOKUP_RESULT_PASS;
 	    }
 
-	  action = hsi_tcp_tracked_connection_action (vm, b, tc, ip_hdr, tcp_hdr, is_ip4, 1, 0);
+	  action =
+	    hsi_tcp_tracked_connection_action (vm, b, tc, ip_hdr, tcp_hdr, is_ip4, 1, 0, &is_drain);
+	  /* Drain consumes pure acks, also the one that commits the connection */
+	  if (PREDICT_FALSE (action == HSI_TCP_TRACKED_ACTION_DROP))
+	    *error = is_drain ? HSI_ERROR_TCP_DRAIN_DROP : HSI_ERROR_TCP_TRACKED_DROP;
 	  return hsi_tracked_action_to_lookup_result (action, next);
 	}
       /* Lookup already done, use result */
@@ -254,13 +281,14 @@ hsi_tcp_lookup_handler (vlib_main_t *vm, vlib_buffer_t *b, void *ip_hdr, u32 *ne
 always_inline hsi_lookup_result_t
 hsi_udp_tracked_lookup_handler (vlib_main_t *vm, vlib_buffer_t *b, session_t *s,
 				udp_connection_t *uc, void *ip_hdr, udp_header_t *udp_hdr,
-				u32 *next, u8 is_ip4, u8 is_input)
+				u32 *next, u8 *error, u8 is_ip4, u8 is_input)
 {
   hsi_udp_tracked_action_t action;
 
   if (uc->c_thread_index != vm->thread_index)
     {
-      if (hsi_udp_connection_is_draining (uc))
+      /* Owner's drain state is not safe to read, let owner decide */
+      if (!hsi_udp_connection_is_committed (uc))
 	{
 	  if (!is_input)
 	    {
@@ -269,12 +297,15 @@ hsi_udp_tracked_lookup_handler (vlib_main_t *vm, vlib_buffer_t *b, session_t *s,
 	    }
 
 	  action = hsi_udp_drain_cache_buffer_remote (vm, b, s, uc, ip_hdr, udp_hdr, is_ip4);
+	  if (PREDICT_FALSE (action == HSI_UDP_TRACKED_ACTION_DROP))
+	    *error = HSI_ERROR_UDP_DRAIN_DROP;
 	  return hsi_drain_cache_action_to_lookup_result (action, next);
 	}
 
       uc = hsi_udp_migrate_tracked_connection (&s, uc);
       if (!uc)
 	{
+	  *error = HSI_ERROR_UDP_MIGRATION_FAILED;
 	  *next = HSI_INPUT_NEXT_DROP;
 	  return HSI_LOOKUP_RESULT_INTERCEPT;
 	}
@@ -287,12 +318,14 @@ hsi_udp_tracked_lookup_handler (vlib_main_t *vm, vlib_buffer_t *b, session_t *s,
     }
 
   action = hsi_udp_tracked_connection_action (vm, b, uc, ip_hdr, udp_hdr, is_ip4);
+  if (PREDICT_FALSE (action == HSI_UDP_TRACKED_ACTION_DROP))
+    *error = HSI_ERROR_UDP_DRAIN_DROP;
   return hsi_tracked_action_to_lookup_result (action, next);
 }
 
 always_inline hsi_lookup_result_t
-hsi_udp_lookup_handler (vlib_main_t *vm, vlib_buffer_t *b, void *ip_hdr, u32 *next, u8 is_ip4,
-			u8 is_input)
+hsi_udp_lookup_handler (vlib_main_t *vm, vlib_buffer_t *b, void *ip_hdr, u32 *next, u8 *error,
+			u8 is_ip4, u8 is_input)
 {
   udp_header_t *udp_hdr = 0;
   udp_connection_t *uc;
@@ -304,17 +337,17 @@ hsi_udp_lookup_handler (vlib_main_t *vm, vlib_buffer_t *b, void *ip_hdr, u32 *ne
     {
       uc = udp_connection_get (s->connection_index, s->thread_index);
       if (uc && (uc->cfg_flags & UDP_CFG_F_TRACKED))
-	return hsi_udp_tracked_lookup_handler (vm, b, s, uc, ip_hdr, udp_hdr, next, is_ip4,
+	return hsi_udp_tracked_lookup_handler (vm, b, s, uc, ip_hdr, udp_hdr, next, error, is_ip4,
 					       is_input);
     }
   else
     {
-      if (!hsi_have_intercept_proto (TRANSPORT_PROTO_UDP, is_ip4))
+      if (!hsi_have_intercept_proto (TRANSPORT_PROTO_UDP, is_ip4) ||
+	  !(s = hsi_intercept_listener_get (TRANSPORT_PROTO_UDP, is_ip4)))
 	{
 	  vnet_feature_next (next, b);
 	  return HSI_LOOKUP_RESULT_PASS;
 	}
-      s = session_get_from_handle (hsi_main.intercept_listeners[!is_ip4][TRANSPORT_PROTO_UDP]);
     }
   *next = HSI_INPUT_NEXT_UDP_INPUT_NOLOOKUP;
   /* Emulate udp-local and consume headers up to udp payload */
@@ -327,7 +360,8 @@ hsi_udp_lookup_handler (vlib_main_t *vm, vlib_buffer_t *b, void *ip_hdr, u32 *ne
 }
 
 always_inline u8
-hsi_lookup_and_update (vlib_main_t *vm, vlib_buffer_t *b, u32 *next, u8 is_ip4, u8 is_input)
+hsi_lookup_and_update (vlib_main_t *vm, vlib_buffer_t *b, u32 *next, u8 *error, u8 is_ip4,
+		       u8 is_input)
 {
   u32 l3_offset = 0;
   hsi_lookup_result_t result;
@@ -371,9 +405,9 @@ hsi_lookup_and_update (vlib_main_t *vm, vlib_buffer_t *b, u32 *next, u8 is_ip4, 
     }
 
   if (proto == IP_PROTOCOL_TCP)
-    result = hsi_tcp_lookup_handler (vm, b, ip_hdr, next, is_ip4, is_input);
+    result = hsi_tcp_lookup_handler (vm, b, ip_hdr, next, error, is_ip4, is_input);
   else
-    result = hsi_udp_lookup_handler (vm, b, ip_hdr, next, is_ip4, is_input);
+    result = hsi_udp_lookup_handler (vm, b, ip_hdr, next, error, is_ip4, is_input);
 
   if (!is_input)
     {
@@ -401,6 +435,14 @@ hsi_input_trace_frame (vlib_main_t *vm, vlib_node_runtime_t *node, u32 *buffer_i
       t = vlib_add_trace (vm, node, b, sizeof (*t));
       t->next_node = nexts[i];
     }
+}
+
+/* Drops without an error are reported as blackholed by null-node */
+always_inline void
+hsi_set_drop_error (vlib_node_runtime_t *node, vlib_buffer_t *b, u8 error, u8 enqueue)
+{
+  if (PREDICT_FALSE (error != HSI_ERROR_NONE) && enqueue)
+    b->error = node->errors[error];
 }
 
 always_inline void
@@ -434,6 +476,7 @@ hsi46_input_inline (vlib_main_t *vm, vlib_node_runtime_t *node, vlib_frame_t *fr
   while (n_left_from >= 4)
     {
       u32 next0 = 0, next1 = 0;
+      u8 error0 = HSI_ERROR_NONE, error1 = HSI_ERROR_NONE;
       u8 enqueue0, enqueue1;
 
       vlib_prefetch_buffer_header (b[2], LOAD);
@@ -442,10 +485,12 @@ hsi46_input_inline (vlib_main_t *vm, vlib_node_runtime_t *node, vlib_frame_t *fr
       vlib_prefetch_buffer_header (b[3], LOAD);
       CLIB_PREFETCH (b[3]->data, 2 * CLIB_CACHE_LINE_BYTES, LOAD);
 
-      enqueue0 = hsi_lookup_and_update (vm, b[0], &next0, is_ip4, is_input);
+      enqueue0 = hsi_lookup_and_update (vm, b[0], &next0, &error0, is_ip4, is_input);
+      hsi_set_drop_error (node, b[0], error0, enqueue0);
       hsi_enqueue_if_owned (&to_next, &next, &n_to_next, from[0], next0, enqueue0);
 
-      enqueue1 = hsi_lookup_and_update (vm, b[1], &next1, is_ip4, is_input);
+      enqueue1 = hsi_lookup_and_update (vm, b[1], &next1, &error1, is_ip4, is_input);
+      hsi_set_drop_error (node, b[1], error1, enqueue1);
       hsi_enqueue_if_owned (&to_next, &next, &n_to_next, from[1], next1, enqueue1);
 
       b += 2;
@@ -456,9 +501,11 @@ hsi46_input_inline (vlib_main_t *vm, vlib_node_runtime_t *node, vlib_frame_t *fr
   while (n_left_from)
     {
       u32 next0 = 0;
+      u8 error0 = HSI_ERROR_NONE;
       u8 enqueue0;
 
-      enqueue0 = hsi_lookup_and_update (vm, b[0], &next0, is_ip4, is_input);
+      enqueue0 = hsi_lookup_and_update (vm, b[0], &next0, &error0, is_ip4, is_input);
+      hsi_set_drop_error (node, b[0], error0, enqueue0);
       hsi_enqueue_if_owned (&to_next, &next, &n_to_next, from[0], next0, enqueue0);
 
       b += 1;
@@ -590,25 +637,24 @@ hsi_intercept_proto (transport_proto_t proto, u8 is_ip4, u8 is_enable)
 {
   hsi_main_t *hm = &hsi_main;
   session_endpoint_t sep = { .transport_proto = proto, .is_ip4 = is_ip4 };
+  u32 table_index;
   session_t *ls;
 
-  ls = session_lookup_listener_wildcard (0, &sep);
-  if (!ls)
-    return;
-
-  if (is_enable)
-    {
-      if (proto == TRANSPORT_PROTO_TCP)
-	hm->intercept_listeners[!is_ip4][proto] = ls->connection_index;
-      else
-	hm->intercept_listeners[!is_ip4][proto] = ls->handle;
-      hm->intercept_type |= hsi_intercept_proto_flag (proto, is_ip4);
-    }
-  else
+  /* Disable even if the listener is gone */
+  if (!is_enable)
     {
       hm->intercept_listeners[!is_ip4][proto] = SESSION_INVALID_HANDLE;
       hm->intercept_type &= ~hsi_intercept_proto_flag (proto, is_ip4);
+      return;
     }
+
+  table_index = session_lookup_get_index_for_fib (is_ip4 ? FIB_PROTOCOL_IP4 : FIB_PROTOCOL_IP6, 0);
+  ls = session_lookup_listener_wildcard (table_index, &sep);
+  if (!ls)
+    return;
+
+  hm->intercept_listeners[!is_ip4][proto] = session_handle (ls);
+  hm->intercept_type |= hsi_intercept_proto_flag (proto, is_ip4);
 }
 
 static clib_error_t *

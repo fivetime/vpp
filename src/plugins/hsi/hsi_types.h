@@ -9,7 +9,7 @@
 #include <vnet/ip/ip46_address.h>
 #include <vnet/session/session.h>
 
-#define HSI_TCP_DRAIN_CACHE_DEFAULT_PACKETS	  3
+#define HSI_TCP_DRAIN_CACHE_DEFAULT_PACKETS	  16
 #define HSI_TCP_DRAIN_NO_PROGRESS_DEFAULT_TIMEOUT 10.0
 #define HSI_UDP_DRAIN_CACHE_DEFAULT_PACKETS	  3
 #define HSI_UDP_DRAIN_NO_PROGRESS_DEFAULT_TIMEOUT 10.0
@@ -28,6 +28,7 @@ typedef struct hsi_tcp_track_snapshot_
   u16 rmt_port;
   u32 snd_nxt;
   u32 rcv_nxt;
+  u32 snd_wnd;
   u32 ts_now;
   u32 tsval_recent;
   clib_thread_index_t thread_index;
@@ -39,6 +40,7 @@ typedef struct hsi_tcp_track_snapshot_
 typedef struct hsi_tcp_track_commit_req_
 {
   session_handle_t session_handle;
+  hsi_tcp_track_snapshot_t self;
   hsi_tcp_track_snapshot_t peer;
 } hsi_tcp_track_commit_req_t;
 
@@ -60,6 +62,7 @@ typedef struct hsi_udp_drain_cache_req_ hsi_udp_drain_cache_req_t;
   _ (tcp_drain_started, u64, "tcp-drain-started")                                                  \
   _ (tcp_drain_completed, u64, "tcp-drain-completed")                                              \
   _ (tcp_drain_stalled, u64, "tcp-drain-stalled")                                                  \
+  _ (tcp_drain_transport_closed, u64, "tcp-drain-transport-closed")                                \
   _ (tcp_drain_cached, u64, "tcp-drain-cached")                                                    \
   _ (tcp_drain_cache_overflow, u64, "tcp-drain-cache-overflow")                                    \
   _ (tcp_drain_cache_dropped, u64, "tcp-drain-cache-dropped")                                      \
@@ -78,6 +81,7 @@ typedef struct hsi_udp_drain_cache_req_ hsi_udp_drain_cache_req_t;
   _ (udp_drain_started, u64, "udp-drain-started")                                                  \
   _ (udp_drain_completed, u64, "udp-drain-completed")                                              \
   _ (udp_drain_stalled, u64, "udp-drain-stalled")                                                  \
+  _ (udp_drain_transport_closed, u64, "udp-drain-transport-closed")                                \
   _ (udp_drain_cached, u64, "udp-drain-cached")                                                    \
   _ (udp_drain_cache_overflow, u64, "udp-drain-cache-overflow")                                    \
   _ (udp_drain_cache_dropped, u64, "udp-drain-cache-dropped")                                      \
