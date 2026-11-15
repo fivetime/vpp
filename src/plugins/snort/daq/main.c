@@ -234,12 +234,18 @@ daq_vpp_instantiate (DAQ_ModuleConfig_h modcfg, DAQ_ModuleInstance_h modinst,
   end_of_name = strchrnul (input_name, ':');
   input_name_len = end_of_name - input_name;
   ctx = calloc (1, sizeof (daq_vpp_ctx_t));
+  if (ctx == 0)
+    return DAQ_ERROR_NOMEM;
   ctx->modinst = modinst;
+  ctx->epoll_fd = -1;
   ctx->timeout = (int) vdm->daq_base_api.config_get_timeout (modcfg);
   ctx->instance_id = instance_id;
 
   if (input_name_len >= DAQ_VPP_MAX_INST_NAME_LEN)
-    return daq_vpp_err (ctx, "input name '%s' too long", input_name);
+    {
+      rv = daq_vpp_err (ctx, "input name '%s' too long", input_name);
+      goto err;
+    }
 
   strncpy (name, input_name, input_name_len);
   name[input_name_len] = 0;
@@ -267,7 +273,7 @@ daq_vpp_instantiate (DAQ_ModuleConfig_h modcfg, DAQ_ModuleInstance_h modinst,
 			msg_pool_size * sizeof (daq_vpp_msg_pool_entry_t));
   if (ctx == 0)
     {
-      free (oldctx);
+      ctx = oldctx;
       rv = daq_vpp_err (ctx, "failed to realloc");
       goto err;
     }
@@ -333,9 +339,8 @@ daq_vpp_instantiate (DAQ_ModuleConfig_h modcfg, DAQ_ModuleInstance_h modinst,
 	  qp = daq_vpp_find_qpair (in, qpair_ids[i]);
 	  if (!qp)
 	    {
-	      rv = daq_vpp_err (ctx, "cannot find qpair %u.%u",
-				qpair_ids[i].thread_id, qpair_ids[i].queue_id,
-				ctx->instance_id);
+	      rv = daq_vpp_err (ctx, "cannot find qpair %u.%u", qpair_ids[i].thread_id,
+				qpair_ids[i].queue_id);
 	      goto err;
 	    }
 	  rv = daq_vpp_add_qpair_to_instance (ctx, qp);
@@ -485,8 +490,8 @@ daq_vpp_inject_relative (void *handle, DAQ_Msg_h msg, const uint8_t *data,
     vdm->bpools[empty_buf_desc->buffer_pool].base + empty_buf_desc->offset;
 
   if (empty_buf_desc->length < data_len)
-    return daq_vpp_err (ctx, "descriptor %u buffer too small (%u < %u)",
-			tail & mask, empty_buf_desc->length, data_len);
+    return daq_vpp_err (ctx, "descriptor %lu buffer too small (%u < %u)", tail & mask,
+			empty_buf_desc->length, data_len);
 
   memcpy (buf_data, data, data_len);
   empty_buf_desc->length = data_len;

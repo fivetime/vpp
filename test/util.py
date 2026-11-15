@@ -157,30 +157,108 @@ def ip6_normalize(ip6):
     return socket.inet_ntop(socket.AF_INET6, socket.inet_pton(socket.AF_INET6, ip6))
 
 
-def get_core_path(tempdir):
+# Timestamp used for classifying core recency
+_START_TIMESTAMP = time.time()
+
+
+def _expand_core_pattern(pattern: str, vpp_pid: int | None, as_glob: bool) -> str:
+    """Expand kernel core_pattern %-specifiers.
+
+    %p is substituted when the VPP PID is known, so we pick up the core of
+    the current VPP process rather than one left by a parallel or older
+    suite. Specifiers whose values aren't known here (e.g. %e comm, %t time)
+    become '*' when building a glob (as_glob=True) and are kept as-is
+    otherwise; literal text is glob-escaped for the glob.
+    """
+    out = []
+    for part in re.split(r"(%.)", pattern):
+        if part == "%%":
+            out.append(glob.escape("%") if as_glob else "%")
+        elif part == "%p" and vpp_pid is not None:
+            out.append(str(vpp_pid))
+        elif len(part) == 2 and part[0] == "%":
+            out.append("*" if as_glob else part)
+        else:
+            out.append(glob.escape(part) if as_glob else part)
+    return "".join(out)
+
+
+def get_core_path(tempdir: str, vpp_pid: int | None = None) -> str:
     pattern = get_core_pattern()
     if pattern.startswith("|"):
         # The kernel pipes the core to a handler (e.g. systemd-coredump)
         # instead of writing it to tempdir. When we've pulled it back out of
         # the handler's storage (see extract_coredumpctl_core) it lands here
         # as core.<pid>; otherwise there's nothing on disk to find.
-        glob_pat = "core.*"
-        fallback = "core"
+        suffix = "*" if vpp_pid is None else str(vpp_pid)
+        glob_pat = os.path.join(glob.escape(tempdir), "core." + suffix)
+        fallback = os.path.join(tempdir, "core")
     else:
-        # Pattern may contain kernel %-specifiers (%p pid, %t time, ...) whose
-        # values aren't known here, so glob them to find an actual core.
-        glob_pat = re.sub(r"%[a-zA-Z]", "*", pattern)
-        fallback = pattern
-    matches = glob.glob(os.path.join(tempdir, glob_pat))
+        # A relative pattern is resolved against VPP's cwd, which is tempdir;
+        # an absolute one (e.g. /var/lib/vpp/vppcore.%e.%p) puts the core
+        # outside tempdir, so os.path.join() keeps it as is.
+        glob_pat = os.path.join(
+            glob.escape(tempdir), _expand_core_pattern(pattern, vpp_pid, True)
+        )
+        fallback = os.path.join(tempdir, _expand_core_pattern(pattern, vpp_pid, False))
+    matches = [m for m in glob.glob(glob_pat) if is_recent_core(m)]
     if matches:
         return max(matches, key=os.path.getmtime)
     # No core on disk yet — return the expected location so log messages still
     # show where one would be.
-    return os.path.join(tempdir, fallback)
+    return fallback
 
 
-def is_core_present(tempdir):
-    return os.path.isfile(get_core_path(tempdir))
+def is_recent_core(path: str) -> bool:
+    """True if path is a regular file written during this test run."""
+    try:
+        return os.path.isfile(path) and os.path.getmtime(path) >= _START_TIMESTAMP - 1
+    except OSError:
+        return False
+
+
+def is_core_present(tempdir: str, vpp_pid: int | None = None) -> bool:
+    return is_recent_core(get_core_path(tempdir, vpp_pid))
+
+
+def check_core_dir() -> str | None:
+    """Ensure the kernel can write a VPP core where we will look for it.
+
+    Returns a warning string if cores are likely to be lost, else None.
+
+    With an absolute core_pattern, the kernel does not create missing
+    directories and silently drops the core if it cannot write it, so no
+    gdb backtrace ever makes it into the test logs. Create the directory,
+    and warn if it cannot be created or is not writable due to permissions.
+    """
+    try:
+        pattern = get_core_pattern()
+    except OSError:
+        return None
+    if pattern.startswith("|") or not os.path.isabs(pattern):
+        return None
+    core_dir = os.path.dirname(pattern)
+    if "%" in core_dir:
+        return None
+    try:
+        os.makedirs(core_dir, exist_ok=True)
+    except OSError as e:
+        return (
+            f"core_pattern is '{pattern}' but directory '{core_dir}' cannot be "
+            f"created ({e.strerror}): VPP core files will not be written and "
+            "no backtrace will be decoded into the test logs."
+        )
+    if not os.access(core_dir, os.W_OK | os.X_OK):
+        return (
+            f"core_pattern is '{pattern}' but directory '{core_dir}' is not "
+            "writable: VPP core files will not be written and no backtrace "
+            "will be decoded into the test logs."
+        )
+    return None
+
+
+CORE_PATTERN_PROC = "/proc/sys/kernel/core_pattern"
+CI_CORE_PATTERN = "/var/lib/vpp/vppcore.%e.%p"
 
 
 def get_core_pattern():
@@ -188,7 +266,7 @@ def get_core_pattern():
         import sysctl
 
         return sysctl.filter("kern.corefile")[0].value
-    with open("/proc/sys/kernel/core_pattern", "r") as f:
+    with open(CORE_PATTERN_PROC, "r") as f:
         corefmt = f.read().strip()
     if corefmt.startswith("|"):
         # A pipe handler owns the core; core_uses_pid doesn't apply and the
@@ -199,6 +277,34 @@ def get_core_pattern():
     if uses_pid and "%p" not in corefmt:
         corefmt += ".%p"
     return corefmt
+
+
+def set_ci_core_pattern() -> tuple[bool, str]:
+    """Set core_pattern to CI_CORE_PATTERN in CI, as hs-test does.
+
+    Returns (True, message) if core_pattern is CI_CORE_PATTERN on return,
+    else (False, reason it was not set).
+
+    A core_pattern that pipes cores to a handler does not leave
+    a core file for gdb to decode, so set the same pattern as
+    test/hs-test/Makefile (.set-core-pattern).
+    """
+    if not os.environ.get("GITHUB_REPO_URL"):
+        return False, "not running in CI (GITHUB_REPO_URL unset)"
+    try:
+        with open(CORE_PATTERN_PROC, "r") as f:
+            current = f.read().strip()
+        if current == CI_CORE_PATTERN:
+            return True, f"core_pattern is '{current}'"
+        with open(CORE_PATTERN_PROC, "w") as f:
+            f.write(CI_CORE_PATTERN)
+    except OSError as e:
+        return (
+            False,
+            f"OSError raised while opening, reading or writing {CORE_PATTERN_PROC}: "
+            f"{e.strerror}",
+        )
+    return True, f"core_pattern changed from '{current}' to '{CI_CORE_PATTERN}'"
 
 
 def uses_coredumpctl():

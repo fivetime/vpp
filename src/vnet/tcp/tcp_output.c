@@ -108,8 +108,16 @@ tcp_initial_window_to_advertise (tcp_connection_t * tc)
   return tc->rcv_wnd;
 }
 
-static inline void
-tcp_update_rcv_wnd (tcp_connection_t * tc)
+/**
+ * Compute rcv window to advertise
+ *
+ * The window is not rounded and never moves the right edge rcv_las + rcv_wnd left. The header
+ * carries rcv_wnd >> rcv_wscale, so the advertised edge may fall short of it, and retract, by less
+ * than 1 << rcv_wscale, but never goes past it. Accepting segments up to rcv_las + rcv_wnd thus
+ * accepts any segment in window for an ack sent, as per RFC7323 sec. 2.4.
+ */
+static inline u32
+tcp_rcv_wnd_compute (tcp_connection_t *tc)
 {
   u32 available_space, wnd;
   i32 observed_wnd;
@@ -119,30 +127,44 @@ tcp_update_rcv_wnd (tcp_connection_t * tc)
    */
   available_space = transport_max_rx_enqueue (&tc->connection);
 
-  /*
-   * Use the above and what we know about what we've previously advertised
-   * to compute the new window
-   */
-  observed_wnd = (i32) tc->rcv_wnd - (tc->rcv_nxt - tc->rcv_las);
-
-  /* Check if we are about to retract the window. Do the comparison before
-   * rounding to avoid errors. Per RFC7323 sec. 2.4 we could remove this */
-  if (PREDICT_FALSE ((i32) available_space < observed_wnd))
-    {
-      wnd = round_down_pow2 (clib_max (observed_wnd, 0), 1 << tc->rcv_wscale);
-      TCP_EVT (TCP_EVT_RCV_WND_SHRUNK, tc, observed_wnd, available_space);
-    }
-  else
-    {
-      /* Make sure we have a multiple of 1 << rcv_wscale. We round down to
-       * avoid advertising a window larger than what can be buffered */
-      wnd = round_down_pow2 (available_space, 1 << tc->rcv_wscale);
-    }
-
-  if (PREDICT_FALSE (wnd < tc->rcv_opts.mss))
+  /* Receiver SWS avoidance: offer new space only if at least an mss of it can be advertised */
+  wnd = available_space;
+  if (PREDICT_FALSE (round_down_pow2 (wnd, 1 << tc->rcv_wscale) < tc->rcv_opts.mss))
     wnd = 0;
 
-  tc->rcv_wnd = clib_min (wnd, TCP_WND_MAX << tc->rcv_wscale);
+  /* Do not move the right edge left of what we already advertised, as per RFC9293 sec. 3.8.6. That
+   * space was available when advertised */
+  observed_wnd = (i32) tc->rcv_wnd - (tc->rcv_nxt - tc->rcv_las);
+  if (PREDICT_FALSE ((i32) wnd < observed_wnd))
+    {
+      if ((i32) available_space < observed_wnd)
+	TCP_EVT (TCP_EVT_RCV_WND_SHRUNK, tc, observed_wnd, available_space);
+      wnd = observed_wnd;
+    }
+
+  return clib_min (wnd, TCP_WND_MAX << tc->rcv_wscale);
+}
+
+/**
+ * Record rcv window about to be advertised
+ *
+ * Must be called only when sending the window, so rcv_las and rcv_wnd describe the last window
+ * advertised.
+ */
+static inline void
+tcp_rcv_wnd_commit (tcp_connection_t *tc, u32 wnd)
+{
+  tc->rcv_wnd = wnd;
+  tc->rcv_las = tc->rcv_nxt;
+
+  /* Peer may wait for a window update if the window is less than an mss */
+  if (PREDICT_FALSE (round_down_pow2 (wnd, 1 << tc->rcv_wscale) < tc->rcv_opts.mss))
+    {
+      transport_rx_fifo_req_deq_ntf (&tc->connection);
+      tcp_zero_rwnd_sent_on (tc);
+    }
+  else
+    tcp_zero_rwnd_sent_off (tc);
 }
 
 /**
@@ -154,7 +176,7 @@ tcp_window_to_advertise (tcp_connection_t * tc, tcp_state_t state)
   if (state < TCP_STATE_ESTABLISHED)
     return tcp_initial_window_to_advertise (tc);
 
-  tcp_update_rcv_wnd (tc);
+  tcp_rcv_wnd_commit (tc, tcp_rcv_wnd_compute (tc));
   return tc->rcv_wnd >> tc->rcv_wscale;
 }
 
@@ -298,7 +320,6 @@ tcp_make_options (tcp_connection_t * tc, tcp_options_t * opts,
  * - Updates snd_mss to reflect the effective segment size that we can send
  * by taking into account all TCP options, including SACKs.
  * - Cache 'on the wire' options for reuse
- * - Updates receive window which can be reused for a burst.
  *
  * This should *only* be called when doing bursts
  */
@@ -317,8 +338,6 @@ tcp_update_burst_snd_vars (tcp_connection_t * tc)
   ASSERT (tc->snd_mss > 0);
 
   tcp_options_write (wrk->cached_opts, &tc->snd_opts);
-
-  tcp_update_rcv_wnd (tc);
 
   if (tc->snd_una == tc->snd_nxt)
     {
@@ -373,14 +392,6 @@ tcp_make_ack_i (tcp_connection_t * tc, vlib_buffer_t * b, tcp_state_t state,
   th->checksum = tcp_compute_checksum (tc, b);
 
   vnet_buffer (b)->tcp.connection_index = tc->c_c_index;
-
-  if (wnd == 0)
-    {
-      transport_rx_fifo_req_deq_ntf (&tc->connection);
-      tcp_zero_rwnd_sent_on (tc);
-    }
-  else
-    tcp_zero_rwnd_sent_off (tc);
 }
 
 /**
@@ -389,9 +400,10 @@ tcp_make_ack_i (tcp_connection_t * tc, vlib_buffer_t * b, tcp_state_t state,
 static inline void
 tcp_make_ack (tcp_connection_t * tc, vlib_buffer_t * b)
 {
+  u32 __clib_unused prev_las = tc->rcv_las;
+
   tcp_make_ack_i (tc, b, TCP_STATE_ESTABLISHED, TCP_FLAG_ACK);
-  TCP_EVT (TCP_EVT_ACK_SENT, tc);
-  tc->rcv_las = tc->rcv_nxt;
+  TCP_EVT (TCP_EVT_ACK_SENT, tc, prev_las);
 }
 
 /**
@@ -912,6 +924,31 @@ tcp_push_one_header (tcp_connection_t *tc, vlib_buffer_t *b, tcp_push_hdr_flags_
   return 0;
 }
 
+/**
+ * Start rtt tracking and retransmit timer after sending new data
+ */
+always_inline void
+tcp_new_data_sent (tcp_connection_t *tc)
+{
+  /* If not tracking an ACK, start tracking */
+  if (tc->rtt_ts == 0 && !tcp_in_cong_recovery (tc))
+    {
+      tc->rtt_ts = tcp_time_now_us (tc->c_thread_index);
+      tc->rtt_seq = tc->snd_nxt;
+    }
+  if (PREDICT_FALSE (tcp_rack_enabled (tc) || !tcp_timer_is_active (tc, TCP_TIMER_RETRANSMIT)))
+    {
+      if (tcp_rack_enabled (tc))
+	tcp_rack_timer_update_on_new_data (tc);
+      else
+	{
+	  tcp_worker_ctx_t *wrk = tcp_get_worker (tc->c_thread_index);
+	  tcp_retransmit_timer_set (&wrk->timer_wheel, tc);
+	  tc->rto_boff = 0;
+	}
+    }
+}
+
 u32
 tcp_session_push_header (transport_connection_t *tconn, vlib_buffer_t **bs, u32 n_bufs,
 			 u32 available_bytes)
@@ -922,6 +959,9 @@ tcp_session_push_header (transport_connection_t *tconn, vlib_buffer_t **bs, u32 
 
   if (PREDICT_FALSE (tc->cfg_flags & TCP_CFG_F_TSO))
     push_hdr_flags |= TCP_PUSH_HDR_F_MAYBE_GSO;
+
+  /* All segments in the burst advertise the same window */
+  tcp_rcv_wnd_commit (tc, tcp_rcv_wnd_compute (tc));
 
   while (n_bufs >= 4)
     {
@@ -946,24 +986,8 @@ tcp_session_push_header (transport_connection_t *tconn, vlib_buffer_t **bs, u32 
     }
 
   tcp_cc_check_limited (tc, max_dequeue);
+  tcp_new_data_sent (tc);
 
-  /* If not tracking an ACK, start tracking */
-  if (tc->rtt_ts == 0 && !tcp_in_cong_recovery (tc))
-    {
-      tc->rtt_ts = tcp_time_now_us (tc->c_thread_index);
-      tc->rtt_seq = tc->snd_nxt;
-    }
-  if (PREDICT_FALSE (tcp_rack_enabled (tc) || !tcp_timer_is_active (tc, TCP_TIMER_RETRANSMIT)))
-    {
-      if (tcp_rack_enabled (tc))
-	tcp_rack_timer_update_on_new_data (tc);
-      else
-	{
-	  tcp_worker_ctx_t *wrk = tcp_get_worker (tc->c_thread_index);
-	  tcp_retransmit_timer_set (&wrk->timer_wheel, tc);
-	  tc->rto_boff = 0;
-	}
-    }
   return 0;
 }
 
@@ -977,7 +1001,6 @@ tcp_send_ack (tcp_connection_t *tc)
 
   if (PREDICT_FALSE (!vlib_buffer_alloc (vm, &bi, 1)))
     {
-      tcp_update_rcv_wnd (tc);
       tcp_worker_stats_inc (wrk, no_buffer, 1);
       return;
     }
@@ -1031,8 +1054,7 @@ tcp_send_window_update_ack (tcp_connection_t * tc)
 {
   if (tcp_zero_rwnd_sent (tc))
     {
-      tcp_update_rcv_wnd (tc);
-      if (tc->rcv_wnd >= tcp_cfg.rwnd_min_update_ack * tc->snd_mss)
+      if (tcp_rcv_wnd_compute (tc) >= tcp_cfg.rwnd_min_update_ack * tc->snd_mss)
 	{
 	  tcp_zero_rwnd_sent_off (tc);
 	  tcp_program_ack (tc);
@@ -1520,7 +1542,37 @@ tcp_timer_retransmit_syn_handler (tcp_connection_t * tc)
 }
 
 /**
- * Got 0 snd_wnd from peer, try to do something about it.
+ * Send what fits in a peer window too small to send into, see tcp_round_snd_space
+ */
+static u32
+tcp_send_small_wnd_data (tcp_worker_ctx_t *wrk, tcp_connection_t *tc)
+{
+  u32 offset = tc->snd_nxt - tc->snd_una, n_bytes;
+  vlib_buffer_t *b;
+
+  n_bytes = transport_max_tx_dequeue (&tc->connection);
+  if (n_bytes <= offset || tc->snd_wnd <= offset)
+    return 0;
+
+  n_bytes = tcp_prepare_segment (wrk, tc, offset, clib_min (n_bytes, tc->snd_wnd) - offset, &b);
+  if (!n_bytes)
+    return 0;
+
+  if (tc->cfg_flags & TCP_CFG_F_BYTE_TRACKER)
+    tcp_bt_track_tx (tc, n_bytes);
+  tc->snd_nxt += n_bytes;
+  tcp_enqueue_to_output (wrk, b, vlib_get_buffer_index (wrk->vm, b), tc->c_is_ip4);
+  tcp_new_data_sent (tc);
+
+  /* The segment carries the ack, if one is programmed */
+  if ((tc->flags & TCP_CONN_SNDACK) && !tc->pending_dupacks)
+    tc->flags &= ~TCP_CONN_SNDACK;
+
+  return n_bytes;
+}
+
+/**
+ * Got 0 snd_wnd from peer, or one too small to send into, try to do something about it.
  */
 void
 tcp_timer_persist_handler (tcp_connection_t * tc)
@@ -1537,7 +1589,13 @@ tcp_timer_persist_handler (tcp_connection_t * tc)
 
   /* Problem already solved or worse */
   if (tc->snd_wnd || (tc->flags & TCP_CONN_FINSNT))
-    goto update_scheduler;
+    {
+      /* Window too small to send into, see tcp_round_snd_space */
+      if (tc->snd_wnd && tc->snd_wnd < tc->snd_mss && tc->snd_una == tc->snd_nxt &&
+	  !(tc->flags & TCP_CONN_FINSNT) && tcp_send_small_wnd_data (wrk, tc))
+	return;
+      goto update_scheduler;
+    }
 
   available_bytes = transport_max_tx_dequeue (&tc->connection);
   offset = tc->snd_nxt - tc->snd_una;
@@ -2027,8 +2085,9 @@ tcp_send_acks (tcp_connection_t * tc, u32 max_burst_size)
 
   if (!tc->pending_dupacks)
     {
-      if (tcp_in_cong_recovery (tc) || !tcp_max_tx_deq (tc)
-	  || tc->state != TCP_STATE_ESTABLISHED)
+      /* Data, if any, carries the ack, unless the peer's window is too small to send into */
+      if (tcp_in_cong_recovery (tc) || !tcp_max_tx_deq (tc) || tc->state != TCP_STATE_ESTABLISHED ||
+	  (tc->snd_wnd < tc->snd_mss && !tcp_snd_space (tc)))
 	{
 	  tcp_send_ack (tc);
 	  return 1;

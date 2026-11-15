@@ -216,10 +216,14 @@ stats_segment_socket_init (void)
 	     CLIB_SOCKET_F_ALLOW_GROUP_WRITE | CLIB_SOCKET_F_PASSCRED;
 
   if ((error = clib_socket_init (s)))
-    return error;
+    {
+      clib_mem_free (s);
+      return error;
+    }
 
   clib_file_t template = { 0 };
   template.read_function = stats_socket_accept_ready;
+  /* coverity[overflow_const] - s->fd is valid when clib_socket_init succeeds */
   template.file_descriptor = s->fd;
   template.description = format (0, "stats segment listener %s", s->config);
   clib_file_add (&file_main, &template);

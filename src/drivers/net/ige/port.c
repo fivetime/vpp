@@ -260,7 +260,6 @@ ige_port_init (vlib_main_t *vm, vnet_dev_port_t *port)
       ige_reg_wr (dev, IGE_REG_EIAM, vectors);
     }
 
-  vnet_dev_poll_port_add (vm, port, 1, ige_port_status_poll);
   return VNET_DEV_OK;
 }
 
@@ -273,6 +272,7 @@ ige_port_deinit (vlib_main_t *vm, vnet_dev_port_t *port)
   if (!ip->irq_registered)
     return;
 
+  /* coverity[tainted_data] - n_rx_vectors is set at port init */
   rv = vnet_dev_pci_msix_disable (vm, port->dev, 1, ip->n_rx_vectors);
   if (rv == VNET_DEV_OK)
     rv = vnet_dev_pci_msix_remove_handler (vm, port->dev, 1, ip->n_rx_vectors);
@@ -282,6 +282,24 @@ ige_port_deinit (vlib_main_t *vm, vnet_dev_port_t *port)
 	     format_vnet_dev_rv, rv);
   else
     ip->irq_registered = 0;
+}
+
+static vnet_dev_rv_t
+ige_change_primary_hw_addr (vlib_main_t *vm, vnet_dev_port_t *port,
+			    const vnet_dev_hw_addr_t *hw_addr)
+{
+  vnet_dev_t *dev = port->dev;
+  ige_receive_addr_t ra = {
+    .av = 1,
+  };
+
+  clib_memcpy (ra.hw_addr, hw_addr->eth_mac, sizeof (ra.hw_addr));
+
+  ige_reg_wr (dev, IGE_REG_RAH (0), ra.rah);
+  ige_reg_wr (dev, IGE_REG_RAL (0), ra.ral);
+
+  log_debug (dev, "receive addr table:\n%U", format_ige_receive_addr_table, dev);
+  return VNET_DEV_OK;
 }
 
 vnet_dev_rv_t
@@ -298,7 +316,11 @@ ige_port_start (vlib_main_t *vm, vnet_dev_port_t *port)
 
   log_debug (dev, "port %u", port->port_id);
 
+  if ((rv = ige_phy_set_power (vm, dev, 1)) != VNET_DEV_OK)
+    return rv;
+
   ip->last_status.as_u32 = 0;
+  ige_change_primary_hw_addr (vm, port, &port->primary_hw_addr);
 
   ige_reg_rd (dev, IGE_REG_RCTL, &rctl.as_u32);
   if (rctl.rx_enable)
@@ -416,6 +438,7 @@ ige_port_start (vlib_main_t *vm, vnet_dev_port_t *port)
   rctl.long_pkt_reception_ena = 1;
   rctl.vlan_filter_ena = 0;
   rctl.bcast_accept_mode = 1;
+  rctl.mc_promisc_ena = 1;
   rctl.discard_pause_frames = 1;
   ige_reg_wr (dev, IGE_REG_RCTL, rctl.as_u32);
   ige_reg_wr (dev, IGE_REG_RLPML, port->max_rx_frame_size);
@@ -440,6 +463,7 @@ ige_port_start (vlib_main_t *vm, vnet_dev_port_t *port)
     }
 
   vnet_dev_poll_port_add (vm, port, 3, ige_port_counter_poll);
+  vnet_dev_poll_port_add (vm, port, 1, ige_port_status_poll);
   return 0;
 
 error:
@@ -493,6 +517,7 @@ ige_port_stop (vlib_main_t *vm, vnet_dev_port_t *port)
   log_debug (dev, "port %u", port->port_id);
   ige_reg_rctl_t rctl;
   ige_reg_tctl_t tctl;
+  vnet_dev_poll_port_remove (vm, port, ige_port_status_poll);
   vnet_dev_poll_port_remove (vm, port, ige_port_counter_poll);
 
   if (port->attr.caps.interrupt_mode)
@@ -562,6 +587,9 @@ ige_port_stop (vlib_main_t *vm, vnet_dev_port_t *port)
 	  ige_reg_wr (dev, IGE_REG_TDWBAH (txq->queue_id), 0);
 	}
     }
+
+  /* power down the PHY so the link partner sees link down */
+  ige_phy_set_power (vm, dev, 0);
 }
 
 static vnet_dev_rv_t
@@ -572,29 +600,9 @@ ige_set_promisc_mode (vlib_main_t *vm, vnet_dev_port_t *port, int enabled)
 
   ige_reg_rd (dev, IGE_REG_RCTL, &rctl.as_u32);
   rctl.uc_promisc_ena = enabled;
-  rctl.mc_promisc_ena = enabled;
   ige_reg_wr (dev, IGE_REG_RCTL, rctl.as_u32);
   ige_reg_rd (dev, IGE_REG_RCTL, &rctl.as_u32);
   log_debug (dev, "\n %U", format_ige_reg_read, IGE_REG_RCTL, rctl.as_u32);
-  return VNET_DEV_OK;
-}
-
-static vnet_dev_rv_t
-ige_change_primary_hw_addr (vlib_main_t *vm, vnet_dev_port_t *port,
-			    const vnet_dev_hw_addr_t *hw_addr)
-{
-  vnet_dev_t *dev = port->dev;
-  ige_receive_addr_t ra = {
-    .av = 1,
-  };
-
-  clib_memcpy (ra.hw_addr, hw_addr->eth_mac, sizeof (ra.hw_addr));
-
-  ige_reg_wr (dev, IGE_REG_RAH (0), ra.rah);
-  ige_reg_wr (dev, IGE_REG_RAL (0), ra.ral);
-
-  log_debug (dev, "receive addr table:\n%U", format_ige_receive_addr_table,
-	     dev);
   return VNET_DEV_OK;
 }
 

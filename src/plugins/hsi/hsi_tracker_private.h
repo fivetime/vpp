@@ -10,6 +10,7 @@
 #include <vnet/session/application.h>
 #include <vnet/tcp/tcp.h>
 #include <vppinfra/pool.h>
+#include <vppinfra/ring.h>
 
 #define HSI_TCP_TRACKER_MAGIC	      0x48534954
 #define HSI_TCP_DRAIN_INDEX_INVALID   ((u32) ~0)
@@ -143,6 +144,10 @@ typedef enum hsi_tcp_drain_flags_
   HSI_TCP_DRAIN_F_ABORT_SENT = 1 << 3,
   HSI_TCP_DRAIN_F_COMMIT_SENT = 1 << 4,
   HSI_TCP_DRAIN_F_HSI_CLOSED = 1 << 5,
+  /** Across workers, drain of the session hsi_track_pair was called on */
+  HSI_TCP_DRAIN_F_COMMITTER = 1 << 6,
+  HSI_TCP_DRAIN_F_READY_SENT = 1 << 7,
+  HSI_TCP_DRAIN_F_PEER_READY = 1 << 8,
 } hsi_tcp_drain_flags_t;
 
 typedef enum hsi_udp_drain_state_
@@ -184,6 +189,8 @@ struct hsi_tcp_drain_
   u32 *cached_buffers;
   hsi_tcp_drain_flags_t flags;
   hsi_tcp_drain_state_t state;
+  /** Committer only, snapshot the peer reported once drained */
+  hsi_tcp_track_snapshot_t peer_snapshot;
 };
 
 struct hsi_tcp_drain_start_req_
@@ -231,68 +238,92 @@ hsi_worker_get (clib_thread_index_t thread_index)
   return vec_elt_at_index (hsi_main.wrk, thread_index);
 }
 
-/*
- * Cross-thread rpc requests are passed as (owner thread, pool index) packed
- * into the rpc arg. Owner pools must be grown with pool_get_aligned_safe so
- * that the pool base only moves under the worker barrier.
- */
+static_always_inline void
+hsi_rpc_count (hsi_worker_t *wrk, u8 is_self)
+{
+  if (is_self)
+    hsi_worker_counter_inc (wrk, rpc_self);
+  else
+    hsi_worker_counter_inc (wrk, rpc_remote);
+}
 
-#define hsi_rpc_req_arg(thread, index)                                                             \
-  uword_to_pointer (((uword) (thread) << 32) | (u32) (index), void *)
-#define hsi_rpc_req_thread(arg) ((clib_thread_index_t) (pointer_to_uword (arg) >> 32))
-#define hsi_rpc_req_index(arg)	((u32) pointer_to_uword (arg))
+/* Rpc to thread_index, also deferred if that's the current thread */
+static_always_inline void
+hsi_send_rpc_force (clib_thread_index_t thread_index, void *fp, void *arg)
+{
+  clib_thread_index_t cur_thread = vlib_get_thread_index ();
 
-#define foreach_hsi_rpc_req                                                                        \
-  _ (tcp_track_commit)                                                                             \
-  _ (tcp_drain_start)                                                                              \
-  _ (tcp_fin_ack)                                                                                  \
-  _ (tcp_peer_fin)                                                                                 \
-  _ (session_fifos_cleanup)                                                                        \
-  _ (udp_track_commit)                                                                             \
-  _ (udp_peer_update)                                                                              \
-  _ (udp_drain_start)                                                                              \
-  _ (udp_drain_cache)
+  hsi_rpc_count (hsi_worker_get (cur_thread), thread_index == cur_thread);
+  session_send_rpc_evt_to_thread_force (thread_index, fp, arg);
+}
 
 /*
- * For each request type <n>, hsi_<n>_req_get resolves the request on the
- * consumer thread (never cache the result across a barrier), hsi_<n>_req_put
- * releases it on the owner thread and hsi_<n>_req_alloc allocates it on the
- * owner thread and returns the packed rpc arg.
+ * Messages hsi workers send each other, or themselves to defer work. Each
+ * worker has one queue that all workers add to, see hsi_mq_send.
  */
-#define _(n)                                                                                       \
-  static_always_inline hsi_##n##_req_t *hsi_##n##_req_get (void *arg)                              \
-  {                                                                                                \
-    hsi_worker_t *wrk = hsi_worker_get (hsi_rpc_req_thread (arg));                                 \
-    u32 index = hsi_rpc_req_index (arg);                                                           \
-                                                                                                   \
-    ASSERT (index < vec_len (wrk->n##_reqs));                                                      \
-    return wrk->n##_reqs + index;                                                                  \
-  }                                                                                                \
-                                                                                                   \
-  static_always_inline void hsi_##n##_req_put (void *arg)                                          \
-  {                                                                                                \
-    clib_thread_index_t thread = hsi_rpc_req_thread (arg);                                         \
-                                                                                                   \
-    ASSERT (thread == vlib_get_thread_index ());                                                   \
-    pool_put_index (hsi_worker_get (thread)->n##_reqs, hsi_rpc_req_index (arg));                   \
-  }                                                                                                \
-                                                                                                   \
-  static_always_inline void *hsi_##n##_req_alloc (hsi_worker_t *wrk, hsi_##n##_req_t **a,          \
-						  clib_thread_index_t thread)                      \
-  {                                                                                                \
-    hsi_##n##_req_t *req;                                                                          \
-                                                                                                   \
-    ASSERT (thread == vlib_get_thread_index ());                                                   \
-    pool_get_aligned_safe (wrk->n##_reqs, req, 0);                                                 \
-    clib_memset (req, 0, sizeof (*req));                                                           \
-    *a = req;                                                                                      \
-    return hsi_rpc_req_arg (thread, req - wrk->n##_reqs);                                          \
-  }
-foreach_hsi_rpc_req
+#define foreach_hsi_msg                                                                            \
+  _ (TCP_DRAIN_START)                                                                              \
+  _ (TCP_TRACK_COMMIT)                                                                             \
+  _ (TCP_TRACK_READY)                                                                              \
+  _ (TCP_FIN_ACKED)                                                                                \
+  _ (TCP_PEER_FIN_PENDING)                                                                         \
+  _ (TCP_ABORT)                                                                                    \
+  _ (TCP_ABORT_SILENT)                                                                             \
+  _ (UDP_DRAIN_START)                                                                              \
+  _ (UDP_DRAIN_CACHE)                                                                              \
+  _ (UDP_TRACK_COMMIT)                                                                             \
+  _ (UDP_PEER_UPDATE)                                                                              \
+  _ (UDP_MIGRATED_CLEANUP)                                                                         \
+  _ (SESSION_CLEANUP)                                                                              \
+  _ (SESSION_CLEANUP_PAIR)                                                                         \
+  _ (SESSION_FIFOS_CLEANUP)
+
+typedef enum hsi_msg_type_
+{
+#define _(sym) HSI_MSG_##sym,
+  foreach_hsi_msg
 #undef _
+    HSI_MSG_N_TYPES,
+} hsi_msg_type_t;
 
-  static_always_inline uword
-  hsi_session_conn_key (u32 session_index, u32 conn_index)
+struct hsi_msg_
+{
+  hsi_msg_type_t type;
+  union
+  {
+    session_handle_t session_handle;
+    hsi_tcp_drain_start_req_t tcp_drain_start;
+    hsi_tcp_track_commit_req_t tcp_track_commit;
+    hsi_tcp_track_ready_req_t tcp_track_ready;
+    hsi_tcp_fin_ack_req_t tcp_fin_ack;
+    hsi_tcp_peer_fin_req_t tcp_peer_fin;
+    hsi_udp_drain_start_req_t udp_drain_start;
+    hsi_udp_drain_cache_req_t udp_drain_cache;
+    hsi_udp_track_commit_req_t udp_track_commit;
+    hsi_udp_peer_update_req_t udp_peer_update;
+    hsi_session_fifos_cleanup_req_t session_fifos_cleanup;
+  };
+};
+
+void hsi_mq_send (clib_thread_index_t thread_index, hsi_msg_t *msg);
+void hsi_timer_schedule (clib_thread_index_t thread_index, f64 when);
+u32 hsi_wheel_arm (clib_thread_index_t thread_index, hsi_wheel_timer_t timer, u32 index,
+		   f64 interval, f64 now);
+void hsi_wheel_disarm (clib_thread_index_t thread_index, u32 *handle);
+
+static_always_inline void
+hsi_mq_send_handle (clib_thread_index_t thread_index, hsi_msg_type_t type,
+		    session_handle_t session_handle)
+{
+  hsi_msg_t msg = { .type = type, .session_handle = session_handle };
+  hsi_mq_send (thread_index, &msg);
+}
+
+void hsi_tcp_handle_msg (hsi_msg_t *msg);
+void hsi_udp_handle_msg (hsi_msg_t *msg);
+
+static_always_inline uword
+hsi_session_conn_key (u32 session_index, u32 conn_index)
 {
   return ((uword) session_index << 32) | conn_index;
 }
@@ -438,8 +469,8 @@ hsi_udp_session_conn_key_from_connection (udp_connection_t *uc)
 static_always_inline u8
 hsi_session_uses_remote_fifos (session_t *s)
 {
-  return (s->rx_fifo && s->rx_fifo->master_thread_index != s->thread_index) ||
-	 (s->tx_fifo && s->tx_fifo->master_thread_index != s->thread_index);
+  return (s->rx_fifo && segment_manager_fifo_alloc_thread (s->rx_fifo) != s->thread_index) ||
+	 (s->tx_fifo && segment_manager_fifo_alloc_thread (s->tx_fifo) != s->thread_index);
 }
 
 static_always_inline void
@@ -454,6 +485,15 @@ hsi_drain_program_tx (session_t *s)
 {
   if (svm_fifo_max_dequeue_cons (s->tx_fifo) && svm_fifo_set_event (s->tx_fifo))
     session_program_tx_io_evt (session_handle (s), SESSION_IO_EVT_TX);
+}
+
+/* Data received before hsi took over the session, the peer's tx fifo, is not
+ * forwarded by the app anymore, so the peer must send it */
+static_always_inline void
+hsi_drain_program_peer_tx (session_t *s, session_handle_t peer_handle)
+{
+  if (svm_fifo_max_dequeue (s->rx_fifo) && svm_fifo_set_event (s->rx_fifo))
+    session_program_tx_io_evt (peer_handle, SESSION_IO_EVT_TX);
 }
 
 static_always_inline u8

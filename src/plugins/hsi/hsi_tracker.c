@@ -83,37 +83,14 @@ hsi_session_cleanup_peer_handle (session_t *s)
 }
 
 static void
-hsi_session_fifos_cleanup_req_free_rpc (void *arg)
-{
-  hsi_session_fifos_cleanup_req_put (arg);
-}
-
-static void
-hsi_session_fifos_cleanup_on_thread_rpc (void *arg)
-{
-  hsi_session_fifos_cleanup_req_t *a = hsi_session_fifos_cleanup_req_get (arg);
-
-  segment_manager_dealloc_fifos (a->rx_fifo, a->tx_fifo);
-  session_send_rpc_evt_to_thread (hsi_rpc_req_thread (arg), hsi_session_fifos_cleanup_req_free_rpc,
-				  arg);
-}
-
-static void
 hsi_session_send_fifos_cleanup_on_thread (clib_thread_index_t thread_index, svm_fifo_t *rx_fifo,
 					  svm_fifo_t *tx_fifo)
 {
-  hsi_session_fifos_cleanup_req_t *a;
-  hsi_worker_t *wrk;
-  clib_thread_index_t owner_thread;
-  void *arg;
+  hsi_msg_t msg = { .type = HSI_MSG_SESSION_FIFOS_CLEANUP };
 
-  owner_thread = vlib_get_thread_index ();
-  wrk = hsi_worker_get (owner_thread);
-  arg = hsi_session_fifos_cleanup_req_alloc (wrk, &a, owner_thread);
-
-  a->rx_fifo = rx_fifo;
-  a->tx_fifo = tx_fifo;
-  session_send_rpc_evt_to_thread_force (thread_index, hsi_session_fifos_cleanup_on_thread_rpc, arg);
+  msg.session_fifos_cleanup.rx_fifo = rx_fifo;
+  msg.session_fifos_cleanup.tx_fifo = tx_fifo;
+  hsi_mq_send (thread_index, &msg);
 }
 
 static_always_inline void
@@ -128,7 +105,7 @@ void
 hsi_session_cleanup_fifos (session_t *s)
 {
   svm_fifo_t *rx_fifo, *tx_fifo;
-  u8 local_uses_remote_fifos;
+  clib_thread_index_t alloc_thread;
 
   ASSERT (s->thread_index == vlib_get_thread_index ());
 
@@ -143,12 +120,14 @@ hsi_session_cleanup_fifos (session_t *s)
 
   rx_fifo = s->rx_fifo;
   tx_fifo = s->tx_fifo;
+  alloc_thread = segment_manager_fifo_alloc_thread (rx_fifo);
+  ASSERT (alloc_thread == segment_manager_fifo_alloc_thread (tx_fifo));
 
-  local_uses_remote_fifos = hsi_session_uses_remote_fifos (s);
-  if (local_uses_remote_fifos && s->thread_index != rx_fifo->master_thread_index)
+  /* Only the thread that allocated the fifos can free them */
+  if (alloc_thread != s->thread_index)
     {
       hsi_session_clear_fifos (s);
-      hsi_session_send_fifos_cleanup_on_thread (rx_fifo->master_thread_index, rx_fifo, tx_fifo);
+      hsi_session_send_fifos_cleanup_on_thread (alloc_thread, rx_fifo, tx_fifo);
       return;
     }
 
@@ -181,8 +160,8 @@ hsi_session_cleanup (session_t *s)
   hsi_session_transport_cleanup (s);
 }
 
-static void
-hsi_handle_cleanups (f64 time_now, u8 thread_index)
+static f64
+hsi_handle_cleanups (clib_thread_index_t thread_index, f64 now)
 {
   hsi_worker_t *wrk;
   session_t *s;
@@ -192,19 +171,15 @@ hsi_handle_cleanups (f64 time_now, u8 thread_index)
   while (clib_fifo_elts (wrk->pending_cleanups))
     {
       req = clib_fifo_head (wrk->pending_cleanups);
-      if (req->free_time > time_now)
-	break;
+      if (req->free_time > now)
+	return req->free_time;
       clib_fifo_sub2 (wrk->pending_cleanups, req);
       s = session_get_from_handle_if_valid (req->sh);
       if (s)
 	hsi_session_cleanup (s);
     }
 
-  if (!clib_fifo_elts (wrk->pending_cleanups))
-    {
-      session_register_update_time_fn_w_thread (hsi_handle_cleanups, 0, thread_index);
-      wrk->pending_cleanups_registered = 0;
-    }
+  return HSI_TIMER_NONE;
 }
 
 void
@@ -216,21 +191,17 @@ hsi_session_program_cleanup (session_t *s)
   f64 now;
 
   wrk = hsi_worker_get (thread_index);
-  now = vlib_time_now (vlib_get_main ());
+  now = vlib_time_now (vlib_get_main_by_index (thread_index));
   clib_fifo_add2 (wrk->pending_cleanups, req);
   req->sh = session_handle (s);
   req->free_time = now + hsi_main.postponed_cleanup_time;
-  if (!wrk->pending_cleanups_registered)
-    {
-      session_register_update_time_fn_w_thread (hsi_handle_cleanups, 1, thread_index);
-      wrk->pending_cleanups_registered = 1;
-    }
+  hsi_timer_schedule (thread_index, req->free_time);
 }
 
 static void
-hsi_session_cleanup_rpc (void *arg)
+hsi_session_cleanup_msg (session_handle_t session_handle)
 {
-  session_handle_tu_t sh = { .handle = pointer_to_uword (arg) };
+  session_handle_tu_t sh = { .handle = session_handle };
   session_t *s;
 
   s = session_get_from_handle_if_valid (sh);
@@ -243,14 +214,13 @@ hsi_session_send_cleanup (session_handle_t session_handle)
 {
   session_handle_tu_t sh = { .handle = session_handle };
 
-  session_send_rpc_evt_to_thread_force (sh.thread_index, hsi_session_cleanup_rpc,
-					uword_to_pointer (session_handle, void *));
+  hsi_mq_send_handle (sh.thread_index, HSI_MSG_SESSION_CLEANUP, session_handle);
 }
 
 static void
-hsi_session_cleanup_pair_rpc (void *arg)
+hsi_session_cleanup_pair_msg (session_handle_t session_handle)
 {
-  session_handle_tu_t sh = { .handle = pointer_to_uword (arg) };
+  session_handle_tu_t sh = { .handle = session_handle };
   session_handle_t peer_handle = SESSION_INVALID_HANDLE;
   session_t *s;
 
@@ -269,8 +239,317 @@ hsi_session_send_cleanup_pair (session_handle_t first)
 {
   session_handle_tu_t sh = { .handle = first };
 
-  session_send_rpc_evt_to_thread_force (sh.thread_index, hsi_session_cleanup_pair_rpc,
-					uword_to_pointer (first, void *));
+  hsi_mq_send_handle (sh.thread_index, HSI_MSG_SESSION_CLEANUP_PAIR, first);
+}
+
+static void
+hsi_handle_msg (hsi_msg_t *msg)
+{
+  switch (msg->type)
+    {
+    case HSI_MSG_SESSION_CLEANUP:
+      hsi_session_cleanup_msg (msg->session_handle);
+      break;
+    case HSI_MSG_SESSION_CLEANUP_PAIR:
+      hsi_session_cleanup_pair_msg (msg->session_handle);
+      break;
+    case HSI_MSG_SESSION_FIFOS_CLEANUP:
+      segment_manager_dealloc_fifos (msg->session_fifos_cleanup.rx_fifo,
+				     msg->session_fifos_cleanup.tx_fifo);
+      break;
+    case HSI_MSG_TCP_DRAIN_START:
+    case HSI_MSG_TCP_TRACK_COMMIT:
+    case HSI_MSG_TCP_TRACK_READY:
+    case HSI_MSG_TCP_FIN_ACKED:
+    case HSI_MSG_TCP_PEER_FIN_PENDING:
+    case HSI_MSG_TCP_ABORT:
+    case HSI_MSG_TCP_ABORT_SILENT:
+      hsi_tcp_handle_msg (msg);
+      break;
+    case HSI_MSG_UDP_DRAIN_START:
+    case HSI_MSG_UDP_DRAIN_CACHE:
+    case HSI_MSG_UDP_TRACK_COMMIT:
+    case HSI_MSG_UDP_PEER_UPDATE:
+    case HSI_MSG_UDP_MIGRATED_CLEANUP:
+      hsi_udp_handle_msg (msg);
+      break;
+    default:
+      ASSERT (0);
+      break;
+    }
+}
+
+/*
+ * Handle all messages queued for this worker. Messages are moved to a vector
+ * this worker owns first, so the queue is held only to copy them and producers
+ * can add new messages, including handlers on this worker.
+ */
+static void
+hsi_mq_handle_rpc (void *arg)
+{
+  hsi_worker_t *wrk = hsi_worker_get (vlib_get_thread_index ());
+  hsi_msg_t *msg;
+  u32 i;
+
+  clib_spinlock_lock (&wrk->mq_lock);
+  while ((msg = clib_ring_deq (wrk->mq)))
+    vec_add1 (wrk->mq_msgs, *msg);
+  clib_spinlock_unlock (&wrk->mq_lock);
+
+  for (i = 0; i < vec_len (wrk->mq_msgs); i++)
+    hsi_handle_msg (vec_elt_at_index (wrk->mq_msgs, i));
+
+  vec_reset_length (wrk->mq_msgs);
+}
+
+/*
+ * Queue msg for thread_index. Its queue is drained when the producer that
+ * finds it empty notifies it with an rpc. Notify with the queue locked, so
+ * producers that find the queue non-empty know the rpc is ahead of any
+ * other rpc they send to the thread afterwards.
+ */
+void
+hsi_mq_send (clib_thread_index_t thread_index, hsi_msg_t *msg)
+{
+  clib_thread_index_t cur_thread = vlib_get_thread_index ();
+  hsi_worker_t *wrk = hsi_worker_get (thread_index);
+  hsi_worker_t *src_wrk = hsi_worker_get (cur_thread);
+  hsi_msg_t *slot;
+  u8 was_empty;
+
+  /* Callers might still use what the message refers to, so it's handled with
+   * hsi timers in a later main loop, see hsi_handle_local_msgs */
+  if (thread_index == cur_thread)
+    {
+      vec_add1 (wrk->local_msgs, *msg);
+      wrk->local_msgs_loop = vlib_get_main_by_index (thread_index)->main_loop_count;
+      hsi_worker_counter_inc (wrk, local_msgs);
+      hsi_timer_schedule (thread_index, 0 /* asap */);
+      return;
+    }
+
+  clib_spinlock_lock (&wrk->mq_lock);
+
+  was_empty = !clib_ring_n_enq (wrk->mq);
+  slot = clib_ring_enq (wrk->mq);
+  if (PREDICT_FALSE (!slot))
+    {
+      /* Queues must be sized so this never happens */
+      clib_spinlock_unlock (&wrk->mq_lock);
+      hsi_worker_counter_inc (src_wrk, mq_full);
+      clib_warning ("hsi mq of thread %u full", thread_index);
+      ASSERT (0);
+      return;
+    }
+  *slot = *msg;
+  if (was_empty)
+    session_send_rpc_evt_to_thread_force (thread_index, hsi_mq_handle_rpc, 0);
+
+  clib_spinlock_unlock (&wrk->mq_lock);
+
+  hsi_worker_counter_inc (src_wrk, mq_msgs);
+  if (was_empty)
+    {
+      hsi_worker_counter_inc (src_wrk, mq_doorbells);
+      hsi_rpc_count (src_wrk, 0 /* is_self */);
+    }
+}
+
+/*
+ * Messages are handled only in a main loop after the one they were added in,
+ * when frames that might refer to their sessions were processed. Messages
+ * handlers add are handled in the next run.
+ */
+static f64
+hsi_handle_local_msgs (vlib_main_t *vm, hsi_worker_t *wrk)
+{
+  u32 i, n_msgs = vec_len (wrk->local_msgs);
+  hsi_msg_t msg;
+
+  if (!n_msgs)
+    return HSI_TIMER_NONE;
+
+  if (wrk->local_msgs_loop == vm->main_loop_count)
+    return 0;
+
+  for (i = 0; i < n_msgs; i++)
+    {
+      /* Handlers might add messages */
+      msg = wrk->local_msgs[i];
+      hsi_handle_msg (&msg);
+    }
+  vec_delete (wrk->local_msgs, n_msgs, 0);
+
+  return vec_len (wrk->local_msgs) ? 0 : HSI_TIMER_NONE;
+}
+
+/* Expired timer handles carry the timer in the top bit */
+#define HSI_WHEEL_HANDLE_TIMER_SHIFT 31
+#define HSI_WHEEL_HANDLE_INDEX_MASK  0x7fffffff
+
+STATIC_ASSERT (HSI_WHEEL_N_TIMERS <= 2, "wheel supports two timers");
+
+typedef void (*hsi_wheel_expired_fn) (clib_thread_index_t thread_index, u32 *indices, f64 now);
+
+/* Called with the indices of all their timers that expired */
+static const hsi_wheel_expired_fn hsi_wheel_expired_fns[HSI_WHEEL_N_TIMERS] = {
+  [HSI_WHEEL_TIMER_UDP_IDLE] = hsi_udp_idle_expired,
+};
+
+/*
+ * Arms a timer that fires in at least interval seconds, rounded up to wheel
+ * ticks, or after one wheel turn if longer. Users rearm with the time left.
+ * Returns the handle needed to disarm it.
+ */
+u32
+hsi_wheel_arm (clib_thread_index_t thread_index, hsi_wheel_timer_t timer, u32 index, f64 interval,
+	       f64 now)
+{
+  hsi_worker_t *wrk = hsi_worker_get (thread_index);
+  tw_timer_wheel_2t_1w_2048sl_t *tw = &wrk->wheel;
+  u64 ticks;
+
+  ASSERT (timer < HSI_WHEEL_N_TIMERS && index <= HSI_WHEEL_HANDLE_INDEX_MASK);
+
+  if (PREDICT_FALSE (!tw->timers))
+    tw_timer_wheel_init_2t_1w_2048sl (tw, 0 /* no callback */, HSI_WHEEL_TICK, ~0);
+  else if (!wrk->wheel_n_armed && now - tw->last_run_time > 2 * HSI_WHEEL_TICK)
+    /* Wheel is not advanced while empty, resync it on next expire instead
+     * of catching up on all the ticks missed */
+    tw->last_run_time = 0;
+
+  ticks = interval > 0 ? (u64) (interval / HSI_WHEEL_TICK) + 1 : 1;
+  ticks = clib_min (ticks, HSI_WHEEL_MAX_TICKS);
+  wrk->wheel_n_armed += 1;
+  hsi_timer_schedule (thread_index, now + HSI_WHEEL_TICK);
+
+  return tw_timer_start_2t_1w_2048sl (tw, index, timer, ticks);
+}
+
+void
+hsi_wheel_disarm (clib_thread_index_t thread_index, u32 *handle)
+{
+  hsi_worker_t *wrk = hsi_worker_get (thread_index);
+
+  if (*handle == HSI_WHEEL_HANDLE_INVALID)
+    return;
+
+  tw_timer_stop_2t_1w_2048sl (&wrk->wheel, *handle);
+  *handle = HSI_WHEEL_HANDLE_INVALID;
+  ASSERT (wrk->wheel_n_armed > 0);
+  wrk->wheel_n_armed -= 1;
+}
+
+/* Hands expired timers to their users, returns when the wheel has to run again */
+static f64
+hsi_wheel_run (clib_thread_index_t thread_index, f64 now)
+{
+  hsi_worker_t *wrk = hsi_worker_get (thread_index);
+  u32 *handles, *handle, timer;
+
+  if (!wrk->wheel_n_armed)
+    return HSI_TIMER_NONE;
+
+  handles = tw_timer_expire_timers_2t_1w_2048sl (&wrk->wheel, now);
+  ASSERT (wrk->wheel_n_armed >= vec_len (handles));
+  wrk->wheel_n_armed -= vec_len (handles);
+
+  /* Copied, users rearm and the wheel reuses its vector */
+  for (timer = 0; timer < HSI_WHEEL_N_TIMERS; timer++)
+    vec_reset_length (wrk->wheel_expired[timer]);
+  vec_foreach (handle, handles)
+    vec_add1 (wrk->wheel_expired[*handle >> HSI_WHEEL_HANDLE_TIMER_SHIFT],
+	      *handle & HSI_WHEEL_HANDLE_INDEX_MASK);
+
+  for (timer = 0; timer < HSI_WHEEL_N_TIMERS; timer++)
+    if (vec_len (wrk->wheel_expired[timer]))
+      hsi_wheel_expired_fns[timer](thread_index, wrk->wheel_expired[timer], now);
+
+  return wrk->wheel_n_armed ? wrk->wheel.next_run_time : HSI_TIMER_NONE;
+}
+
+static void hsi_timer_update_time (f64 now, u8 thread_index);
+
+/* Out of line, so the per loop deadline check stays cheap */
+static __clib_noinline void
+hsi_timer_run (f64 now, clib_thread_index_t thread_index)
+{
+  vlib_main_t *vm = vlib_get_main_by_index (thread_index);
+  hsi_worker_t *wrk = hsi_worker_get (thread_index);
+  f64 next;
+
+  /* Handlers schedule new work, which can only move the deadline earlier */
+  wrk->timer_next = HSI_TIMER_NONE;
+  next = hsi_handle_local_msgs (vm, wrk);
+  next = clib_min (next, hsi_handle_cleanups (thread_index, now));
+  next = clib_min (next, hsi_tcp_drain_timer (thread_index, now));
+  next = clib_min (next, hsi_tcp_fin_wait_timer (thread_index, now));
+  next = clib_min (next, hsi_udp_drain_timer (thread_index, now));
+  next = clib_min (next, hsi_wheel_run (thread_index, now));
+  next = clib_min (next, wrk->timer_next);
+
+  if (next != HSI_TIMER_NONE)
+    {
+      wrk->timer_next = next;
+      return;
+    }
+
+  /* Nothing pending. Safe while subscribers are being called, see
+   * hsi_timer_schedule */
+  session_register_update_time_fn_w_thread (hsi_timer_update_time, 0, thread_index);
+  wrk->timer_registered = 0;
+}
+
+/*
+ * Only session time subscriber of hsi. Registered only while the worker has
+ * hsi timers pending, it checks a single deadline, so it's cheap when nothing
+ * is due.
+ */
+static void
+hsi_timer_update_time (f64 now, u8 thread_index)
+{
+  if (PREDICT_TRUE (now < hsi_worker_get (thread_index)->timer_next))
+    return;
+  hsi_timer_run (now, thread_index);
+}
+
+/*
+ * Make sure hsi timers run on the worker at when, or earlier. Only the worker's
+ * own thread schedules them, also from session time subscribers, which is safe
+ * because the session layer walks subscribers by index.
+ */
+void
+hsi_timer_schedule (clib_thread_index_t thread_index, f64 when)
+{
+  hsi_worker_t *wrk = hsi_worker_get (thread_index);
+
+  ASSERT (thread_index == vlib_get_thread_index ());
+
+  if (!wrk->timer_registered)
+    {
+      session_register_update_time_fn_w_thread (hsi_timer_update_time, 1, thread_index);
+      wrk->timer_registered = 1;
+      wrk->timer_next = when;
+      return;
+    }
+
+  if (when < wrk->timer_next)
+    wrk->timer_next = when;
+}
+
+/* Allocate or resize mq, only before workers can use it */
+void
+hsi_mq_init (hsi_worker_t *wrk)
+{
+  if (!wrk->mq_lock)
+    clib_spinlock_init (&wrk->mq_lock);
+
+  if (wrk->mq && vec_len (wrk->mq) == hsi_main.mq_length)
+    return;
+
+  ASSERT (!wrk->mq || !clib_ring_n_enq (wrk->mq));
+  clib_ring_free (wrk->mq);
+  clib_ring_new_aligned (wrk->mq, hsi_main.mq_length, CLIB_CACHE_LINE_BYTES);
 }
 
 int
@@ -314,6 +593,12 @@ hsi_track_pair (hsi_track_args_t *a)
   if (!hsi_track_sessions_compatible (s, peer_s))
     {
       hsi_worker_proto_counter_inc (wrk, proto, track_failed);
+      if (!peer_s || s == peer_s || s->session_type != peer_s->session_type)
+	hsi_worker_proto_counter_inc (wrk, proto, track_fail_peer);
+      else if (s->session_state >= SESSION_STATE_TRANSPORT_CLOSING)
+	hsi_worker_proto_counter_inc (wrk, proto, track_fail_closing);
+      else
+	hsi_worker_proto_counter_inc (wrk, proto, track_fail_peer_closing);
       return -1;
     }
 

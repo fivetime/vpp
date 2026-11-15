@@ -474,6 +474,9 @@ cryptodev_session_create (vlib_main_t *vm, vnet_crypto_ctx_t *ctx, u32 aad_len, 
   int ret = 0;
   u8 found = 0;
 
+  if (ad->alg_type == VNET_CRYPTO_ALG_T_AEAD)
+    digest_len = ad->auth_len;
+
   numa_data = vec_elt_at_index (cmt->per_numa_data, numa_node);
 
   clib_spinlock_lock (&cmt->tlock);
@@ -910,6 +913,7 @@ dpdk_cryptodev_engine_init (vnet_crypto_engine_registration_t *r __clib_unused)
 
   cmt->iova_mode = rte_eal_iova_mode ();
 
+  /* coverity[overflow_const] - the end of the bitmap is not assigned to node */
   clib_bitmap_foreach (node, tm->cpu_socket_bitmap)
     {
       if (node >= nodes)

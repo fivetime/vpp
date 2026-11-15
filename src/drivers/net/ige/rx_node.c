@@ -10,10 +10,11 @@
 #include <vnet/ethernet/ethernet.h>
 
 static_always_inline void
-ige_rxq_refill (vlib_main_t *vm, vnet_dev_rx_queue_t *rxq, int use_va_dma)
+ige_rxq_refill (vlib_main_t *vm, vlib_node_runtime_t *node, vnet_dev_rx_queue_t *rxq,
+		int use_va_dma)
 {
   ige_rxq_t *iq = vnet_dev_get_rx_queue_data (rxq);
-  u16 n, off, n_before_wrap, size, mask, n_refill, tail;
+  u16 n, n_want, off, n_before_wrap, size, mask, n_refill, tail;
   u8 buffer_pool_index = vnet_dev_get_rx_queue_buffer_pool_index (rxq);
 
   tail = iq->tail;
@@ -27,16 +28,24 @@ ige_rxq_refill (vlib_main_t *vm, vnet_dev_rx_queue_t *rxq, int use_va_dma)
   mask = size - 1;
   off = tail & mask;
   n_before_wrap = size - off;
-  n = clib_min (n_refill, n_before_wrap);
+  n_want = clib_min (n_refill, n_before_wrap);
 
-  n = ige_rxq_refill_no_wrap (vm, iq->buffer_indices + off, iq->descs + off, n,
+  n = ige_rxq_refill_no_wrap (vm, iq->buffer_indices + off, iq->descs + off, n_want,
 			      buffer_pool_index, use_va_dma);
   tail += n;
 
-  if (n == n_before_wrap)
-    tail += ige_rxq_refill_no_wrap (vm, iq->buffer_indices, iq->descs,
-				    n_refill - n_before_wrap,
-				    buffer_pool_index, use_va_dma);
+  if (PREDICT_FALSE (n != n_want))
+    vlib_error_count (vm, node->node_index, IGE_RX_NODE_CTR_BUFFER_ALLOC, 1);
+  else if (n == n_before_wrap)
+    {
+      n_want = n_refill - n_before_wrap;
+      n = ige_rxq_refill_no_wrap (vm, iq->buffer_indices, iq->descs, n_want, buffer_pool_index,
+				  use_va_dma);
+      tail += n;
+
+      if (PREDICT_FALSE (n != n_want))
+	vlib_error_count (vm, node->node_index, IGE_RX_NODE_CTR_BUFFER_ALLOC, 1);
+    }
 
   if (iq->tail != tail)
     {
@@ -58,7 +67,8 @@ ige_rx_deq_64_desc (vlib_main_t *vm, vlib_node_runtime_t *node, vnet_dev_rx_queu
   u32 bc[64], *buffer_indices = iq->buffer_indices,
 	      *bi = buffer_indices + slot;
   vlib_buffer_t *buffers[64];
-  u32 n_descs = 0, n_pkts = 0;
+  u32 n_descs = 0, n_pkts = 0, n_err = 0, n_drop = 0, n_drop_pkts = 0;
+  u32 drop[ARRAY_LEN (dc)];
 
   while (d->dd && n_descs < ARRAY_LEN (dc) && n_pkts < max_pkts)
     {
@@ -75,7 +85,7 @@ ige_rx_deq_64_desc (vlib_main_t *vm, vlib_node_runtime_t *node, vnet_dev_rx_queu
     return 0;
 
   /* remove descriptors from incomplete packets */
-  while (dc[n_descs - 1].eop == 0)
+  while (n_descs && dc[n_descs - 1].eop == 0)
     n_descs--;
 
   /* advance head */
@@ -101,10 +111,11 @@ ige_rx_deq_64_desc (vlib_main_t *vm, vlib_node_runtime_t *node, vnet_dev_rx_queu
       buffers[hi]->flags |= l4i * VNET_BUFFER_F_L4_CHECKSUM_COMPUTED |
 			    (l4i & !dc[i].l4e) * VNET_BUFFER_F_L4_CHECKSUM_CORRECT;
       *ip4_bad |= dc[i].ipv4 & (dc[i].ipcs == 0 || dc[i].ipe);
+      n_err += dc[i].rxe;
       hi = i + 1;
     }
 
-  if (n_pkts < n_descs)
+  if (n_pkts < n_descs || PREDICT_FALSE (n_err))
     {
       u32 hi = 0;    /* head index */
       u32 tlnif = 0; /* total length not including first buffer */
@@ -119,12 +130,22 @@ ige_rx_deq_64_desc (vlib_main_t *vm, vlib_node_runtime_t *node, vnet_dev_rx_queu
 	    }
 	  if (dc[i].eop)
 	    {
-	      to++[0] = bc[hi];
-	      if (tlnif)
+	      if (PREDICT_FALSE (dc[i].rxe))
 		{
-		  buffers[hi]->total_length_not_including_first_buffer = tlnif;
-		  buffers[hi]->flags |= VLIB_BUFFER_TOTAL_LENGTH_VALID;
+		  for (u32 j = hi; j <= i; j++)
+		    drop[n_drop++] = bc[j];
+		  n_drop_pkts++;
 		  tlnif = 0;
+		}
+	      else
+		{
+		  to++[0] = bc[hi];
+		  if (tlnif)
+		    {
+		      buffers[hi]->total_length_not_including_first_buffer = tlnif;
+		      buffers[hi]->flags |= VLIB_BUFFER_TOTAL_LENGTH_VALID;
+		      tlnif = 0;
+		    }
 		}
 	      hi = i + 1;
 	    }
@@ -168,7 +189,13 @@ ige_rx_deq_64_desc (vlib_main_t *vm, vlib_node_runtime_t *node, vnet_dev_rx_queu
 	}
     }
 
-  return n_pkts;
+  if (PREDICT_FALSE (n_drop))
+    {
+      vlib_buffer_free (vm, drop, n_drop);
+      vlib_error_count (vm, node->node_index, IGE_RX_NODE_CTR_DESC_ERROR, n_drop_pkts);
+    }
+
+  return n_pkts - n_drop_pkts;
 }
 
 static_always_inline u32
@@ -275,9 +302,9 @@ VNET_DEV_NODE_FN (ige_rx_node)
 
       /* refill RX queue */
       if (dev->va_dma)
-	ige_rxq_refill (vm, rxq, /*use_va_dma */ 1);
+	ige_rxq_refill (vm, node, rxq, /*use_va_dma */ 1);
       else
-	ige_rxq_refill (vm, rxq, /*use_va_dma */ 0);
+	ige_rxq_refill (vm, node, rxq, /*use_va_dma */ 0);
 
       if (PREDICT_FALSE (rxq->interrupt_mode) && iq->tail == iq->head)
 	vlib_node_set_interrupt_pending (vm, node->node_index);

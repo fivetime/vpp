@@ -882,6 +882,28 @@ vlib_pci_register_intx_handler (vlib_main_t * vm, vlib_pci_dev_handle_t h,
   t.description = format (0, "PCI %U INTx", format_vlib_pci_addr, &p->addr);
   irq->clib_file_index = clib_file_add (&file_main, &t);
   irq->intx_handler = intx_handler;
+
+  if (p->type == LINUX_PCI_DEVICE_TYPE_VFIO)
+    {
+      clib_error_t *err =
+	vfio_set_irqs (vm, p, VFIO_PCI_INTX_IRQ_INDEX, 0, 1, VFIO_IRQ_SET_ACTION_TRIGGER, &irq->fd);
+      if (!err)
+	err = linux_pci_vfio_unmask_intx (vm, p);
+
+      if (err)
+	{
+	  clib_error_t *disable_err =
+	    vfio_set_irqs (vm, p, VFIO_PCI_INTX_IRQ_INDEX, 0, 0, VFIO_IRQ_SET_ACTION_TRIGGER, 0);
+	  clib_error_free (disable_err);
+	  clib_file_del_by_index (&file_main, irq->clib_file_index);
+	  close (irq->fd);
+	  irq->fd = -1;
+	  irq->clib_file_index = -1;
+	  irq->intx_handler = 0;
+	  return err;
+	}
+    }
+
   return 0;
 }
 
@@ -894,6 +916,14 @@ vlib_pci_unregister_intx_handler (vlib_main_t *vm, vlib_pci_dev_handle_t h)
   if (irq->intx_handler == 0)
     return 0;
 
+  if (p->type == LINUX_PCI_DEVICE_TYPE_VFIO)
+    {
+      clib_error_t *err =
+	vfio_set_irqs (vm, p, VFIO_PCI_INTX_IRQ_INDEX, 0, 0, VFIO_IRQ_SET_ACTION_TRIGGER, 0);
+      if (err)
+	return err;
+    }
+
   clib_file_del_by_index (&file_main, irq->clib_file_index);
   if (p->type == LINUX_PCI_DEVICE_TYPE_VFIO)
     {
@@ -901,6 +931,7 @@ vlib_pci_unregister_intx_handler (vlib_main_t *vm, vlib_pci_dev_handle_t h)
       irq->fd = -1;
     }
 
+  irq->clib_file_index = -1;
   irq->intx_handler = 0;
 
   return 0;
@@ -1207,7 +1238,7 @@ vlib_pci_disable_msix_irq (vlib_main_t * vm, vlib_pci_dev_handle_t h,
 			    VFIO_IRQ_SET_ACTION_TRIGGER, fds)))
     return err;
 
-  for (i = 0; i < count; i++)
+  for (i = 0; i < count && start + i < vec_len (p->msix_irqs); i++)
     vec_elt_at_index (p->msix_irqs, start + i)->enabled = 0;
 
   return 0;
@@ -1506,6 +1537,7 @@ vlib_pci_get_region_size (vlib_main_t *vm, vlib_pci_dev_handle_t h, u32 bar, u64
   err = vlib_pci_region (vm, h, bar, &fd, size, &offset);
   if (p->type == LINUX_PCI_DEVICE_TYPE_UIO && fd >= 0)
     close (fd);
+  /* coverity[leaked_handle] - for VFIO fd is owned by the pci device */
   return err;
 }
 

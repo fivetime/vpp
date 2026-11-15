@@ -40,6 +40,7 @@ list(APPEND VNET_SOURCES
   dev/process.c
   dev/queue.c
   dev/runtime.c
+  dev/slab.c
   error.c
   flow/flow.c
   flow/flow_cli.c
@@ -1111,6 +1112,7 @@ list(APPEND VNET_HEADERS
   adj/adj.h
   adj/adj_types.h
   adj/adj_glean.h
+  adj/adj_delegate.h
   adj/adj_nsh.h
   adj/adj_nbr.h
   adj/adj_midchain.h

@@ -477,9 +477,7 @@ typedef struct
 {
   vnet_dev_op_t *device_open;
   vnet_dev_op_no_rv_t *device_close;
-  vnet_dev_rv_t (*dma_mem_alloc_fn) (vlib_main_t *, vnet_dev_t *, u32, u32,
-				     void **);
-  void (*dma_mem_free_fn) (vlib_main_t *, vnet_dev_t *, void *);
+  vnet_dev_rv_t (*dma_mem_map_fn) (vlib_main_t *, vnet_dev_t *, void *);
   void *(*get_device_info) (vlib_main_t *, char *);
   void (*free_device_info) (vlib_main_t *, void *);
   format_function_t *format_device_info;
@@ -520,6 +518,7 @@ struct vnet_dev_driver_registration
       vnet_dev_drv_op_no_rv_t *deinit;
     } ops;
     clib_arg_t *args;
+    u16 data_sz;
   } driver;
 };
 
@@ -533,7 +532,7 @@ typedef struct
 typedef struct vnet_dev_driver
 {
   u32 index;
-  void *dev_data;
+  void *data;
   vnet_dev_driver_registration_t *registration;
   char *description;
   u32 dev_class_index;
@@ -628,6 +627,7 @@ void vnet_dev_wait_for_startup_config_complete (vlib_main_t *);
 vnet_dev_t *vnet_dev_alloc (vlib_main_t *, vnet_dev_device_id_t,
 			    vnet_dev_driver_t *);
 vnet_dev_op_no_rv_t vnet_dev_free;
+vnet_dev_op_no_rv_t vnet_dev_discard;
 vnet_dev_op_t vnet_dev_init;
 vnet_dev_op_no_rv_t vnet_dev_deinit;
 vnet_dev_op_t vnet_dev_reset;
@@ -639,6 +639,12 @@ __clib_export vnet_dev_rv_t vnet_dev_dma_mem_alloc (vlib_main_t *, vnet_dev_t *,
 __clib_export void vnet_dev_dma_mem_free (vlib_main_t *, vnet_dev_t *, void *);
 vnet_dev_bus_t *vnet_dev_find_device_bus (vlib_main_t *, vnet_dev_device_id_t);
 void *vnet_dev_get_device_info (vlib_main_t *, vnet_dev_device_id_t);
+
+/* slab.c */
+__clib_export void *vnet_dev_dma_slab_alloc (vlib_main_t *, vnet_dev_t *, u32, u32);
+__clib_export void vnet_dev_dma_slab_free (vlib_main_t *, vnet_dev_t *, void *);
+__clib_export u64 vnet_dev_dma_slab_get_dma_addr (vlib_main_t *, vnet_dev_t *, void *);
+format_function_t format_vnet_dev_dma_slabs;
 
 /* error.c */
 clib_error_t *vnet_dev_port_err (vlib_main_t *, vnet_dev_port_t *,
@@ -788,12 +794,14 @@ typedef struct
   u8 counters : 1;
   u8 show_zero_counters : 1;
   u8 clear : 1;
+  u8 plain_text : 1;
   u8 debug : 3;
 } vnet_dev_format_args_t;
 
 __clib_export format_function_t format_vnet_dev_addr;
 format_function_t format_vnet_dev_flags;
 __clib_export format_function_t format_vnet_dev_hw_addr;
+__clib_export u8 *vnet_dev_format_in_process (u8 *, vnet_dev_t *, char *, ...);
 format_function_t format_vnet_dev_info;
 format_function_t format_vnet_dev_interface_info;
 format_function_t format_vnet_dev_interface_name;

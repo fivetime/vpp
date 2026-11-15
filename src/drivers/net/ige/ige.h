@@ -244,6 +244,7 @@ format_function_t format_ige_receive_addr_table;
 /* phy.c */
 vnet_dev_rv_t ige_phy_init (vlib_main_t *, vnet_dev_t *);
 vnet_dev_rv_t ige_phy_set_speed (vlib_main_t *, vnet_dev_t *, u32);
+vnet_dev_rv_t ige_phy_set_power (vlib_main_t *, vnet_dev_t *, int);
 
 /* port.c */
 vnet_dev_rv_t ige_port_init (vlib_main_t *, vnet_dev_port_t *);
@@ -332,6 +333,17 @@ ige_reg_wr (vnet_dev_t *dev, u32 reg, u32 val)
   _ (NO_FREE_SLOTS, no_free_slots, ERROR, "no free tx slots")                 \
   _ (BUFFER_CHAIN_TOO_LONG, buffer_chain_too_long, ERROR,                     \
      "buffer chain too long")
+
+#define foreach_ige_rx_node_counter                                                                \
+  _ (BUFFER_ALLOC, buffer_alloc, ERROR, "buffer allocation failed")                                \
+  _ (DESC_ERROR, desc_error, ERROR, "receive descriptor error")
+
+typedef enum
+{
+#define _(f, n, s, d) IGE_RX_NODE_CTR_##f,
+  foreach_ige_rx_node_counter
+#undef _
+} ige_rx_node_counter_t;
 
 typedef enum
 {

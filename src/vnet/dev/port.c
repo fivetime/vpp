@@ -188,6 +188,12 @@ vnet_dev_port_stop (vlib_main_t *vm, vnet_dev_port_t *port)
   port->port_ops.stop (vm, port);
   vlib_worker_thread_barrier_release (vm);
 
+  vnet_dev_port_state_change (vm, port,
+			      (vnet_dev_port_state_changes_t) {
+				.change.link_state = 1,
+				.change.link_speed = 1,
+			      });
+
   foreach_vnet_dev_port_rx_queue (q, port)
     {
       q->started = 0;
@@ -487,6 +493,7 @@ vnet_dev_port_cfg_change (vlib_main_t *vm, vnet_dev_port_t *port,
 
     case VNET_DEV_PORT_CFG_RXQ_INTR_MODE_ENABLE:
       enable = 1;
+      /* fallthrough */
     case VNET_DEV_PORT_CFG_RXQ_INTR_MODE_DISABLE:
       if (req->all_queues)
 	{
@@ -774,6 +781,7 @@ vnet_dev_port_if_create (vlib_main_t *vm, vnet_dev_port_t *port, void *ptr)
 	vnm, &(vnet_eth_interface_registration_t) {
 	       .address = port->primary_hw_addr.eth_mac,
 	       .max_frame_size = port->max_rx_frame_size - VNET_DEV_ETH_FCS_LEN,
+	       .frame_overhead = sizeof (ethernet_header_t),
 	       .dev_class_index = driver->dev_class_index,
 	       .dev_instance = ifs->primary_interface.dev_instance,
 	       .cb.set_max_frame_size = vnet_dev_port_set_max_frame_size,
@@ -1022,6 +1030,7 @@ vnet_dev_port_add_sec_if (vlib_main_t *vm, vnet_dev_port_t *port, void *ptr)
 	vnm, &(vnet_eth_interface_registration_t) {
 	       .address = port->primary_hw_addr.eth_mac,
 	       .max_frame_size = port->max_rx_frame_size - VNET_DEV_ETH_FCS_LEN,
+	       .frame_overhead = sizeof (ethernet_header_t),
 	       .dev_class_index = driver->dev_class_index,
 	       .dev_instance = sif->dev_instance,
 	       .cb.set_max_frame_size = vnet_dev_port_set_max_frame_size,
@@ -1071,7 +1080,7 @@ vnet_dev_port_add_sec_if (vlib_main_t *vm, vnet_dev_port_t *port, void *ptr)
 	vm, q, (vnet_dev_rx_queue_rt_req_t){ .update_next_index = 1 });
     }
 
-  if (sif && port->port_ops.add_sec_if)
+  if (port->port_ops.add_sec_if)
     rv = port->port_ops.add_sec_if (vm, port, sif);
 
   if (rv != VNET_DEV_OK)

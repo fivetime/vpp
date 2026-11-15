@@ -217,22 +217,23 @@ atl_tx_path_init (vnet_dev_port_t *port)
   r.tpb_tx_buf.tc_q_rand_map_en = 1;
   atl_reg_wr (dev, ATL_REG_TPB_TX_BUF, r);
 
-  atl_reg_wr (dev, ATL_REG_THM_LSO_TCP_FLAG1,
+  atl_reg_wr (dev, ATL_REG_TDM_LSO_EN,
 	      (atl_reg_t){
-		.thm_lso_tcp_flag = {
-		  .val = 0x0ff6,
+		.tdm_lso_en = {
+		  .queue_mask = 0xffffffff,
 		},
 	      });
-  atl_reg_wr (dev, ATL_REG_THM_LSO_TCP_FLAG1 + 4,
+  atl_reg_wr (dev, ATL_REG_THM_LSO_TCP_FLAG1,
 	      (atl_reg_t){
-		.thm_lso_tcp_flag = {
-		  .val = 0x0ff6,
+		.thm_lso_tcp_flag1 = {
+		  .first = 0x0ff6,
+		  .middle = 0x0ff6,
 		},
-	      }); /* MID */
+	      });
   atl_reg_wr (dev, ATL_REG_THM_LSO_TCP_FLAG2,
 	      (atl_reg_t){
-		.thm_lso_tcp_flag = {
-		  .val = 0x0f7f,
+		.thm_lso_tcp_flag2 = {
+		  .last = 0x0f7f,
 		},
 	      });
 
@@ -391,7 +392,7 @@ atl_rx_path_init (vnet_dev_port_t *port)
 
   /* disable L2 promiscuous filtering in ART */
   tag = (atl_aq2_art_tag_t){};
-  mask = (atl_aq2_art_tag_t){ .uc = 0x3f };
+  mask = (atl_aq2_art_tag_t) { .uc = 0x3f, .allmc = 1 };
   action = (atl_aq2_art_action_t){ .enable = 1, .action = ATL_AQ2_ART_ACTION_DISCARD };
   rv = aq2_filter_art_set (dev, AQ2_RPF_INDEX_L2_PROMISC_OFF, tag, mask, action);
 
@@ -780,6 +781,7 @@ atl_port_deinit (vlib_main_t *vm, vnet_dev_port_t *port)
   if (!ap->irq_registered)
     return;
 
+  /* coverity[tainted_data] - n_rx_vectors is set at port init */
   rv = vnet_dev_pci_msix_disable (vm, port->dev, 1, ap->n_rx_vectors);
   if (rv == VNET_DEV_OK)
     rv = vnet_dev_pci_msix_remove_handler (vm, port->dev, 1, ap->n_rx_vectors);
@@ -806,17 +808,13 @@ atl_set_promisc (vnet_dev_port_t *port, int enabled)
   r.aq2_fw_interface_in_request_policy.promisc_mcast = enabled;
   atl_reg_wr (dev, ATL_REG_AQ2_FW_INTERFACE_IN_REQUEST_POLICY, r);
 
-  r = atl_reg_rd (dev, ATL_REG_AQ2_FW_INTERFACE_IN_LINK_CONTROL);
-  r.aq2_fw_interface_in_link_control.promiscuous_mode = enabled;
-  atl_reg_wr (dev, ATL_REG_AQ2_FW_INTERFACE_IN_LINK_CONTROL, r);
-
   r = atl_reg_rd (dev, ATL_REG_RPF_L2BC);
   r.rpf_l2bc.promisc = enabled;
   atl_reg_wr (dev, ATL_REG_RPF_L2BC, r);
 
   action = enabled ? action : (atl_aq2_art_action_t){ .enable = 1 };
 
-  mask = (atl_aq2_art_tag_t){ .uc = 0x3f };
+  mask = (atl_aq2_art_tag_t) { .uc = 0x3f, .allmc = 1 };
   rv = aq2_filter_art_set (dev, AQ2_RPF_INDEX_L2_PROMISC_OFF, tag, mask, action);
   if (rv != VNET_DEV_OK)
     return rv;

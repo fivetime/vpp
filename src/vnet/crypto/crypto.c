@@ -313,7 +313,7 @@ vnet_crypto_set_handlers (vnet_crypto_set_handlers_args_t *a)
   vnet_crypto_engine_t *e;
   vnet_crypto_alg_t alg;
   vnet_crypto_engine_id_t engine;
-  int i;
+  u8 i;
 
   p = hash_get_mem (cm->alg_index_by_name, a->handler_name);
   if (!p)
@@ -421,7 +421,7 @@ vnet_crypto_update_cm_dequeue_handlers (void)
   vnet_crypto_engine_id_t last_ei = VNET_CRYPTO_ENGINE_ID_INVALID;
   u32 i;
 
-  vec_reset_length (cm->dequeue_handlers);
+  vec_reset_length (cm->dequeue_engines);
 
   for (i = 1; i < VNET_CRYPTO_N_ALGS; i++)
     {
@@ -449,8 +449,7 @@ vnet_crypto_update_cm_dequeue_handlers (void)
       if (ei[0] == VNET_CRYPTO_ENGINE_ID_INVALID)
 	continue;
 
-      e = cm->engines + ei[0];
-      vec_add1 (cm->dequeue_handlers, e->dequeue_handler);
+      vec_add1 (cm->dequeue_engines, ei[0]);
       last_ei = ei[0];
     }
 
@@ -470,6 +469,12 @@ vnet_crypto_register_dequeue_handler (vlib_main_t *vm __clib_unused, vnet_crypto
   e->dequeue_handler = deq_fn;
 
   vnet_crypto_update_cm_dequeue_handlers ();
+}
+
+void
+vnet_crypto_set_engine_user_data (vnet_crypto_engine_id_t engine, uword user_data)
+{
+  vec_elt_at_index (crypto_main.engines, engine)->user_data = user_data;
 }
 
 u32
@@ -544,10 +549,12 @@ vnet_crypto_load_engines (vlib_main_t *vm)
 	  if (!ext || strncmp (ext, ".so", 3) != 0)
 	    {
 	      log_debug ("skipping %s, not .so", entry->d_name);
+	      continue;
 	    }
 	  vec_set_len (path, path_len);
 	  path = format (path, "/%s%c", entry->d_name, 0);
 
+	  /* coverity[leaked_storage] - engines stay loaded for the life of the process */
 	  if (!dlopen ((char *) path, RTLD_LAZY))
 	    {
 	      log_err ("failed to dlopen %s", path);

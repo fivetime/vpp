@@ -113,8 +113,7 @@ typedef union
   u64 qwords[2];
   struct
   {
-    u32 _reserved0;
-    u32 len;
+    u64 _reserved_0_63;
     union
     {
       u32 ctl;
@@ -122,11 +121,12 @@ typedef union
       {
 	u32 type_txd : 1;
 	u32 type_txc : 1;
-	u32 tcp : 1;
-	u32 _reserved_3_20 : 18;
+	u32 _reserved_2_20 : 19;
 	u32 ipv6 : 1;
-	u32 _reserved_22_30 : 9;
-	u32 cmd : 1;
+	u32 tcp : 1;
+	u32 _reserved_23 : 1;
+	u32 l2_len : 7;
+	u32 l3_len_lo : 1;
       };
     };
     union
@@ -134,10 +134,9 @@ typedef union
       u32 len2;
       struct
       {
-	u32 l2_len : 7;
-	u32 l3_len : 9;
+	u32 l3_len_hi : 8;
 	u32 l4_len : 8;
-	u32 mss : 8;
+	u32 mss : 16;
       };
     };
   };
@@ -292,7 +291,8 @@ typedef struct
   _ (NO_FREE_SLOTS, no_free_slots, ERROR, "no free TX slots")                                      \
   _ (CHAIN_TOO_LONG, chain_too_long, ERROR, "packet dropped: TX chain too long")
 #define foreach_atl_rx_node_counter                                                                \
-  _ (RX_DESC_ERROR_DROP, rx_desc_error_drop, ERROR, "buffers dropped due to mac_err/dma_err")
+  _ (RX_DESC_ERROR_DROP, rx_desc_error_drop, ERROR, "buffers dropped due to mac_err/dma_err")      \
+  _ (BUFFER_ALLOC, buffer_alloc, ERROR, "buffer allocation failed")
 
 typedef enum
 {

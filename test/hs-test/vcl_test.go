@@ -18,7 +18,7 @@ func init() {
 		VclQuicBidirectionalStreamTest, VclQuicUnidirectionalStreamClientResetTest,
 		VclQuicUnidirectionalStreamServerResetTest, VclQuicBidirectionalStreamClientResetTest,
 		VclQuicBidirectionalStreamServerResetTest, VclQuicClientCloseConnectionTest, VclQuicServerCloseConnectionTest,
-		VclDtlsOverMTUTest, VclRetryAttachTest)
+		VclDtlsOverMTUTest, VclRetryAttachTest, VclEpollLtSlowReaderTest)
 	RegisterVclMWTests(VclQuicUnidirectionalStreamsMWTest)
 }
 
@@ -379,9 +379,9 @@ func VclClUdpDscpTest(s *VclSuite) {
 	serverVethAddress := s.Interfaces.Server.Ip4AddressString()
 
 	// DSCP 40 - Class selector 5 - Signalling
-	vclSrvCmd := fmt.Sprintf("vperf_cl_udp -s %s -d 40", serverVethAddress)
+	vclSrvCmd := fmt.Sprintf("vcl_test_app -s %s -d 40", serverVethAddress)
 	srvAppCont.ExecServer(true, vclSrvCmd)
-	srvVppCont.VppInstance.WaitForApp("vperf_cl_udp", 3)
+	srvVppCont.VppInstance.WaitForApp("vcl_test_app", 3)
 
 	cliVppCont := s.Containers.ClientVpp
 	cliAppCont := s.Containers.ClientApp
@@ -393,7 +393,7 @@ func VclClUdpDscpTest(s *VclSuite) {
 	srvVppCont.VppInstance.Vppctl("trace add tap-input 10")
 
 	// DSCP 16 - Class selector 2 - Network operations
-	cliSrvCmd := fmt.Sprintf("vperf_cl_udp -c %s -d 16", serverVethAddress)
+	cliSrvCmd := fmt.Sprintf("vcl_test_app -c %s -d 16", serverVethAddress)
 	o, err := cliAppCont.Exec(true, cliSrvCmd)
 	AssertNil(err, o)
 
@@ -401,4 +401,32 @@ func VclClUdpDscpTest(s *VclSuite) {
 	AssertContains(o, "dscp CS2")
 	o = cliVppCont.VppInstance.Vppctl("show trace")
 	AssertContains(o, "dscp CS5")
+}
+
+// Server reads in small chunks from a level-triggered epolled session and
+// waits with infinite timeouts. Vpp does not notify again until the rx fifo
+// is drained, so epoll wait must not block if level-triggered events exist.
+func VclEpollLtSlowReaderTest(s *VclSuite) {
+	s.SetupAppContainers()
+
+	srvVppCont := s.Containers.ServerVpp
+	srvAppCont := s.Containers.ServerApp
+	srvAppCont.CreateFile("/vcl.conf", getVclConfig(srvVppCont))
+	srvAppCont.AddEnvVar("VCL_CONFIG", "/vcl.conf")
+	serverVethAddress := s.Interfaces.Server.Ip4AddressString()
+
+	srvAppCont.ExecServer(true, fmt.Sprintf("vcl_test_app -s %s -p tcp", serverVethAddress))
+	srvVppCont.VppInstance.WaitForApp("vcl_test_app", 3)
+
+	cliVppCont := s.Containers.ClientVpp
+	cliAppCont := s.Containers.ClientApp
+	cliAppCont.CreateFile("/vcl.conf", getVclConfig(cliVppCont))
+	cliAppCont.AddEnvVar("VCL_CONFIG", "/vcl.conf")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	o, err := cliAppCont.ExecContext(ctx, true, fmt.Sprintf("vcl_test_app -c %s -p tcp", serverVethAddress))
+	Log(o)
+	AssertNil(err, o)
+	AssertContains(o, "received ack from server")
 }
