@@ -190,6 +190,212 @@ done:
   return res;
 }
 
+static int
+quicly_test_stream_reset (vlib_main_t *vm, quic_quicly_main_t *qqm,
+			  const quicly_stream_callbacks_t *callbacks,
+			  const quic_engine_vft_t *engine)
+{
+  static const struct
+  {
+    const char *name;
+    u64 stream_id;
+    u8 reset_rx;
+    u8 after_fin;
+    u8 no_reset;
+    u8 tx_shutdown;
+    u8 pending_tx;
+  } tests[] = {
+    { "bidi RESET_STREAM", 0, 1, 0 },
+    { "bidi STOP_SENDING", 0, 0, 0 },
+    { "bidi STOP_SENDING after FIN", 0, 0, 1 },
+    { "bidi RESET_STREAM after TX shutdown", 0, 1, 0, 0, 1, 0 },
+    { "bidi RESET_STREAM with TX awaiting acknowledgment", 0, 1, 0, 0, 1, 1 },
+    { "uni RESET_STREAM", 3, 1, 0 },
+    { "uni STOP_SENDING", 2, 0, 0 },
+    { "destroy before app close", 0, 0, 0, 1 },
+    { "destroy before app reset", 0, 1, 0, 1 },
+  };
+  quic_main_t *qm = qqm->qm;
+  app_worker_t *app_wrk = application_get_default_worker (application_get (qm->app_index));
+  u32 thread_index = vlib_get_thread_index ();
+  quic_worker_ctx_t *worker = &qm->wrk_ctx[thread_index];
+  session_event_t *saved_events = app_wrk->wrk_evts[thread_index];
+  u8 saved_builtin = app_wrk->app_is_builtin;
+  i64 saved_streams = qqm->worker_stats[thread_index].n_streams;
+  struct _st_quicly_conn_public_t conn = {};
+  svm_fifo_shared_t shared = { .size = 4096 };
+  svm_fifo_t fifo = { .shr = &shared };
+  quicly_stream_t stream = {};
+  session_t *session = 0;
+  quic_ctx_t *ctx;
+  u32 ctx_index = ~0;
+  session_event_t event;
+  transport_endpt_attr_t attr;
+  int res = 0;
+
+  /* As in rx-fin, the CLI barrier isolates this worker's notifications. Drain
+   * them here so no real application callback sees the synthetic sessions. */
+  app_wrk->wrk_evts[thread_index] = 0;
+  session_main.wrk[thread_index].vm = vm;
+  for (u32 builtin = 0; builtin < 2; builtin++)
+    for (u32 i = 0; i < ARRAY_LEN (tests); i++)
+      {
+	u8 auto_delete = builtin && !tests[i].no_reset;
+	u64 error_code = tests[i].no_reset ? 0 : 0xface;
+	vlib_cli_output (vm, "%s app: %s", builtin ? "builtin" : "external", tests[i].name);
+	app_wrk->app_is_builtin = builtin;
+	session = session_alloc (thread_index);
+	ctx_index = quic_ctx_alloc (qm, thread_index);
+	ctx = pool_elt_at_index (worker->ctx_pool, ctx_index);
+	ctx->c_c_index = ctx_index;
+	ctx->c_s_index = session->session_index;
+	ctx->c_proto = TRANSPORT_PROTO_QUIC;
+	ctx->c_flags = TRANSPORT_CONNECTION_F_NO_LOOKUP;
+	ctx->flags = QUIC_F_IS_STREAM;
+	if (tests[i].tx_shutdown)
+	  ctx->flags |= QUIC_F_APP_CLOSED_TX;
+	shared.head = 0;
+	shared.tail = tests[i].pending_tx ? 4 : 0;
+	ctx->udp_session_handle = 42;
+	stream =
+	  (quicly_stream_t) { .conn = (quicly_conn_t *) &conn, .stream_id = tests[i].stream_id };
+	stream.data = clib_mem_alloc (sizeof (quic_stream_data_t));
+	clib_memset (stream.data, 0, sizeof (quic_stream_data_t));
+	((quic_stream_data_t *) stream.data)->ctx_id = ctx_index;
+	((quic_stream_data_t *) stream.data)->thread_index = thread_index;
+	ctx->stream = &stream;
+	session->connection_index = ctx_index;
+	session->session_type = session_type_from_proto_and_ip (TRANSPORT_PROTO_QUIC, 1);
+	session->session_state = SESSION_STATE_READY;
+	session->app_wrk_index = app_wrk->wrk_index;
+	session->tx_fifo = &fifo;
+	qqm->worker_stats[thread_index].n_streams = 1;
+	if (tests[i].after_fin)
+	  {
+	    /* No ranges and eos == 0 represent a completed receive side. */
+	    callbacks->on_receive (&stream, 0, 0, 0);
+	    QUICLY_TEST (clib_fifo_elts (app_wrk->wrk_evts[thread_index]) == 1,
+			 "FIN queues receive EOF before the reset");
+	    clib_fifo_sub1 (app_wrk->wrk_evts[thread_index], event);
+	    QUICLY_TEST (event.event_type == SESSION_CTRL_EVT_DISCONNECTED,
+			 "FIN reports half-close");
+	  }
+	if (!tests[i].no_reset)
+	  {
+	    if (tests[i].reset_rx)
+	      callbacks->on_receive_reset (&stream,
+					   QUICLY_ERROR_FROM_APPLICATION_ERROR_CODE (error_code));
+	    else
+	      callbacks->on_send_stop (&stream,
+				       QUICLY_ERROR_FROM_APPLICATION_ERROR_CODE (error_code));
+	  }
+	QUICLY_TEST (!!(ctx->c_flags & TRANSPORT_CONNECTION_F_ERROR) == !tests[i].no_reset &&
+		       ctx->app_err_code == error_code,
+		     "only a peer reset records a terminal error, including after receive EOF");
+	callbacks->on_destroy (&stream, 0);
+	stream.data = 0;
+	QUICLY_TEST (!pool_is_free_index (worker->ctx_pool, ctx_index),
+		     "stream context survives destruction until application notifications finish");
+	QUICLY_TEST (!ctx->stream && ctx->udp_session_handle == SESSION_INVALID_HANDLE &&
+		       (ctx->flags & QUIC_F_STREAM_TX_CLOSED),
+		     "destroyed engine stream is detached from the retained context");
+	QUICLY_TEST (qqm->worker_stats[thread_index].n_streams == 0,
+		     "stream destruction decrements the engine count once");
+	QUICLY_TEST (session->session_state == (auto_delete ? SESSION_STATE_TRANSPORT_DELETED :
+							      SESSION_STATE_TRANSPORT_CLOSING),
+		     "builtin error closes fully; other destruction waits for confirmation");
+	if (!tests[i].after_fin)
+	  {
+	    QUICLY_TEST (clib_fifo_elts (app_wrk->wrk_evts[thread_index]) != 0,
+			 "stream close or reset notification is queued");
+	    clib_fifo_sub1 (app_wrk->wrk_evts[thread_index], event);
+	    QUICLY_TEST (event.event_type == (tests[i].no_reset ? SESSION_CTRL_EVT_DISCONNECTED :
+								  SESSION_CTRL_EVT_RESET),
+			 "close or reset precedes full closure and cleanup");
+	  }
+	if (auto_delete)
+	  {
+	    QUICLY_TEST (clib_fifo_elts (app_wrk->wrk_evts[thread_index]) == 2,
+			 "builtin gets full closure and deferred transport cleanup");
+	    clib_fifo_sub1 (app_wrk->wrk_evts[thread_index], event);
+	    QUICLY_TEST (event.event_type == SESSION_CTRL_EVT_TRANSPORT_CLOSED,
+			 "full closure is delivered even when FIN suppressed reset notification");
+	  }
+	else
+	  QUICLY_TEST (clib_fifo_elts (app_wrk->wrk_evts[thread_index]) == 0,
+		       "notification delivery can wait for application confirmation");
+	attr = (transport_endpt_attr_t) { .type = TRANSPORT_ENDPT_ATTR_APP_PROTO_ERR_CODE };
+	QUICLY_TEST (!session_transport_attribute (session, 1 /* is_get */, &attr) &&
+		       attr.app_proto_err_code == error_code,
+		     "application can query the peer error after notification delivery");
+	if (!auto_delete)
+	  {
+	    /* Model session-node handing the application's close confirmation to
+	     * the transport, after all error queries have completed. */
+	    session->session_state = SESSION_STATE_APP_CLOSED;
+	    if (tests[i].reset_rx)
+	      engine->proto_on_reset (ctx_index, thread_index);
+	    else
+	      engine->proto_on_close (ctx_index, thread_index);
+	    QUICLY_TEST (!pool_is_free_index (worker->ctx_pool, ctx_index),
+			 "close confirmation retains context for queued callbacks");
+	    QUICLY_TEST (
+	      clib_fifo_elts (app_wrk->wrk_evts[thread_index]) == 3,
+	      "confirmation queues full closure, transport cleanup, and session cleanup");
+	    clib_fifo_sub1 (app_wrk->wrk_evts[thread_index], event);
+	    QUICLY_TEST (event.event_type == SESSION_CTRL_EVT_TRANSPORT_CLOSED,
+			 "full-close callback precedes cleanup after confirmation");
+	  }
+	u32 pending_events = clib_fifo_elts (app_wrk->wrk_evts[thread_index]);
+	engine->proto_on_close (ctx_index, thread_index);
+	engine->proto_on_reset (ctx_index, thread_index);
+	QUICLY_TEST (!pool_is_free_index (worker->ctx_pool, ctx_index) &&
+		       clib_fifo_elts (app_wrk->wrk_evts[thread_index]) == pending_events,
+		     "repeated close/reset does not free context or queue duplicate cleanup");
+	attr = (transport_endpt_attr_t) { .type = TRANSPORT_ENDPT_ATTR_APP_PROTO_ERR_CODE };
+	QUICLY_TEST (!session_transport_attribute (session, 1 /* is_get */, &attr) &&
+		       attr.app_proto_err_code == error_code,
+		     "queued full-close callback can still read the application error");
+	clib_fifo_sub1 (app_wrk->wrk_evts[thread_index], event);
+	QUICLY_TEST (event.event_type == SESSION_CTRL_EVT_CLEANUP &&
+		       event.as_u64[0] >> 32 == SESSION_CLEANUP_TRANSPORT && event.as_u64[1],
+		     "transport cleanup carries the deferred context destructor");
+	transport_cleanup_cb ((void *) event.as_u64[1], session_get_transport (session));
+	QUICLY_TEST (pool_is_free_index (worker->ctx_pool, ctx_index),
+		     "transport cleanup releases the context after all earlier notifications");
+	if (!auto_delete)
+	  {
+	    clib_fifo_sub1 (app_wrk->wrk_evts[thread_index], event);
+	    QUICLY_TEST (event.event_type == SESSION_CTRL_EVT_CLEANUP &&
+			   event.as_u64[0] >> 32 == SESSION_CLEANUP_SESSION,
+			 "session cleanup follows transport cleanup");
+	  }
+	engine->proto_on_close (ctx_index, thread_index);
+	engine->proto_on_reset (ctx_index, thread_index);
+	QUICLY_TEST (pool_is_free_index (worker->ctx_pool, ctx_index) &&
+		       clib_fifo_elts (app_wrk->wrk_evts[thread_index]) == 0 &&
+		       qqm->worker_stats[thread_index].n_streams == 0,
+		     "late confirmations do not free again, notify again, or change stream counts");
+	ctx_index = ~0;
+	session_free (session);
+	session = 0;
+	clib_fifo_free (app_wrk->wrk_evts[thread_index]);
+      }
+
+done:
+  if (stream.data)
+    clib_mem_free (stream.data);
+  if (ctx_index != ~0 && !pool_is_free_index (worker->ctx_pool, ctx_index))
+    quic_ctx_free (qm, pool_elt_at_index (worker->ctx_pool, ctx_index));
+  if (session)
+    session_free (session);
+  clib_fifo_free (app_wrk->wrk_evts[thread_index]);
+  app_wrk->wrk_evts[thread_index] = saved_events;
+  app_wrk->app_is_builtin = saved_builtin;
+  qqm->worker_stats[thread_index].n_streams = saved_streams;
+  return res;
+}
+
 typedef struct
 {
   quicly_update_open_count_t super;
@@ -220,6 +426,118 @@ static void
 quicly_test_conn_count (quicly_update_open_count_t *self, ssize_t delta)
 {
   ((quicly_test_conn_count_t *) self)->count += delta;
+}
+
+typedef struct
+{
+  quicly_now_t super;
+  int64_t now;
+} quicly_test_clock_t;
+
+static int64_t
+quicly_test_now (quicly_now_t *self)
+{
+  return ((quicly_test_clock_t *) self)->now;
+}
+
+static int
+quicly_test_connection_close (vlib_main_t *vm, const quic_engine_vft_t *engine)
+{
+  quicly_context_t *spec, context;
+  ptls_context_t tls = {};
+  ptls_get_time_t *get_time;
+  typeof (quicly_connect) *connect;
+  typeof (quicly_close) *close_conn;
+  typeof (quicly_send) *send;
+  typeof (quicly_get_first_timeout) *first_timeout;
+  typeof (quicly_free) *free_conn;
+  typeof (quicly_amend_ptls_context) *amend;
+  quicly_test_conn_count_t count = { .super = { quicly_test_conn_count } };
+  quicly_test_credit_stream_t opened = { .super = { quicly_test_credit_open } };
+  quicly_test_clock_t clock = { .super = { quicly_test_now }, .now = 1000 };
+  quicly_cid_plaintext_t cid = {};
+  struct sockaddr_in peer = { .sin_family = AF_INET,
+			      .sin_port = 1234,
+			      .sin_addr.s_addr = clib_host_to_net_u32 (0x7f000001) };
+  quicly_conn_t *conn = NULL;
+  quicly_stream_t *stream = NULL;
+  quic_stream_data_t *data = NULL;
+  quicly_address_t dest, src;
+  struct iovec packets[10];
+  u8 buf[10 * QUIC_MAX_PACKET_SIZE];
+  size_t num_packets;
+  int res = 0;
+
+#define CLOSE_SYMBOL(symbol) vlib_get_plugin_symbol ("quic_quicly_plugin.so", #symbol)
+  spec = CLOSE_SYMBOL (quicly_spec_context);
+  connect = CLOSE_SYMBOL (quicly_connect);
+  close_conn = CLOSE_SYMBOL (quicly_close);
+  send = CLOSE_SYMBOL (quicly_send);
+  first_timeout = CLOSE_SYMBOL (quicly_get_first_timeout);
+  free_conn = CLOSE_SYMBOL (quicly_free);
+  amend = CLOSE_SYMBOL (quicly_amend_ptls_context);
+  tls.random_bytes = CLOSE_SYMBOL (ptls_openssl_random_bytes);
+  tls.key_exchanges = CLOSE_SYMBOL (ptls_openssl_key_exchanges);
+  tls.cipher_suites = CLOSE_SYMBOL (ptls_openssl_cipher_suites);
+  get_time = CLOSE_SYMBOL (ptls_get_time);
+#undef CLOSE_SYMBOL
+  QUICLY_TEST (spec && connect && close_conn && send && first_timeout && free_conn && amend &&
+		 tls.random_bytes && tls.key_exchanges && tls.cipher_suites && get_time,
+	       "connection close fixture symbols loaded");
+  tls.get_time = get_time;
+  amend (&tls);
+  context = *spec;
+  context.tls = &tls;
+  context.now = &clock.super;
+  context.update_open_count = &count.super;
+  context.stream_open = &opened.super;
+
+  for (u8 is_unidir = 0; is_unidir < 2; is_unidir++)
+    {
+      QUICLY_TEST (connect (&conn, &context, "localhost", (void *) &peer, NULL, &cid,
+			    ptls_iovec_init (NULL, 0), NULL, NULL, NULL) == 0,
+		   "real connection created before close");
+      QUICLY_TEST (engine->connect_stream (conn, (void **) &stream, &data, is_unidir) == 0 &&
+		     stream && data == &opened.data && quicly_num_streams (conn) == 1,
+		   "live connection permits stream creation");
+      QUICLY_TEST (close_conn (conn, 0, "connection close test") == 0, "connection enters closing");
+      for (u32 sent_close = 0; sent_close < 2; sent_close++)
+	{
+	  /* Model the deferred HTTP/3 accept both before and after the first
+	   * close send. It must never resurrect a stream on this connection. */
+	  stream = NULL;
+	  data = NULL;
+	  QUICLY_TEST (engine->connect_stream (conn, (void **) &stream, &data, is_unidir) ==
+			   SESSION_E_NOSESSION &&
+			 !stream && !data,
+		       "deferred accept cannot open a stream on a closing connection");
+	  QUICLY_TEST (quicly_num_streams (conn) == 1 - sent_close,
+		       "rejected stream open preserves the engine stream count");
+	  num_packets = ARRAY_LEN (packets);
+	  if (!sent_close)
+	    {
+	      QUICLY_TEST (send (conn, &dest, &src, packets, &num_packets, buf, sizeof (buf)) ==
+			       0 &&
+			     num_packets > 0 && quicly_num_streams (conn) == 0,
+			   "first close send destroys the existing stream");
+	      clock.now = first_timeout (conn);
+	      QUICLY_TEST (clock.now != INT64_MAX, "closing expiry is scheduled");
+	    }
+	  else
+	    QUICLY_TEST (send (conn, &dest, &src, packets, &num_packets, buf, sizeof (buf)) ==
+			     QUICLY_ERROR_FREE_CONNECTION &&
+			   num_packets == 0,
+			 "closing timer expires without live streams or an abort");
+	}
+      free_conn (conn);
+      conn = NULL;
+      QUICLY_TEST (count.count == 0, "closed engine connection is released once");
+    }
+
+done:
+  if (conn && free_conn)
+    free_conn (conn);
+  return res;
 }
 
 static int
@@ -638,14 +956,18 @@ quicly_test_rx_fin (vlib_main_t *vm, quic_quicly_main_t *qqm,
     u8 pending_tx;
     u8 fin_with_data;
     u8 cancel_rx;
+    u8 stop_sending;
   } tests[] = {
-    { "empty FIN with TX open", 0, 0, 0, 0, 0 },
-    { "empty FIN after TX shutdown", 0, 1, 0, 0, 0 },
-    { "DATA and FIN after TX shutdown", 4, 1, 0, 1, 0 },
-    { "FIN with a full RX FIFO", 4096, 1, 0, 0, 0 },
-    { "empty FIN with TX awaiting acknowledgment", 0, 1, 1, 0, 0 },
-    { "DATA and FIN with TX awaiting acknowledgment", 4, 1, 1, 1, 0 },
-    { "FIN after RX cancellation and TX shutdown", 0, 1, 0, 0, 1 },
+    { "empty FIN with TX open", 0, 0, 0, 0, 0, 0 },
+    { "empty FIN after TX shutdown", 0, 1, 0, 0, 0, 0 },
+    { "DATA and FIN after TX shutdown", 4, 1, 0, 1, 0, 0 },
+    { "FIN with a full RX FIFO", 4096, 1, 0, 0, 0, 0 },
+    { "empty FIN with TX awaiting acknowledgment", 0, 1, 1, 0, 0, 0 },
+    { "DATA and FIN with TX awaiting acknowledgment", 4, 1, 1, 1, 0, 0 },
+    { "FIN after RX cancellation and TX shutdown", 0, 1, 0, 0, 1, 0 },
+    { "STOP_SENDING after TX shutdown before empty FIN", 0, 1, 0, 0, 0, 1 },
+    { "STOP_SENDING with TX awaiting acknowledgment before empty FIN", 0, 1, 1, 0, 0, 1 },
+    { "STOP_SENDING with TX awaiting acknowledgment before DATA and FIN", 4, 1, 1, 1, 0, 1 },
   };
   fifo_segment_main_t fsm = {};
   fifo_segment_create_args_t args = { .segment_type = SSVM_SEGMENT_PRIVATE,
@@ -732,6 +1054,17 @@ quicly_test_rx_fin (vlib_main_t *vm, quic_quicly_main_t *qqm,
       if (tests[i].cancel_rx)
 	ctx->flags |= QUIC_F_APP_CLOSED_RX;
 
+      if (tests[i].stop_sending)
+	{
+	  ctx->app_err_code = 0x999;
+	  callbacks->on_send_stop (&stream, QUICLY_ERROR_FROM_APPLICATION_ERROR_CODE (0x100));
+	  QUICLY_TEST (session->session_state == SESSION_STATE_READY &&
+			 clib_fifo_elts (app_wrk->wrk_evts[thread_index]) == 0 &&
+			 !(ctx->c_flags & TRANSPORT_CONNECTION_F_ERROR) &&
+			 ctx->app_err_code == 0x999,
+		       "STOP_SENDING after TX shutdown preserves response RX and its error code");
+	}
+
       callbacks->on_receive (&stream, 0, 0, 0);
       QUICLY_TEST (session->session_state == SESSION_STATE_READY &&
 		     clib_fifo_elts (app_wrk->wrk_evts[thread_index]) == 0,
@@ -772,11 +1105,16 @@ quicly_test_rx_fin (vlib_main_t *vm, quic_quicly_main_t *qqm,
       callbacks->on_receive (&stream, 0, 0, 0);
       QUICLY_TEST (clib_fifo_elts (app_wrk->wrk_evts[thread_index]) == 0,
 		   "repeated FIN does not duplicate disconnect");
-      if (!tests[i].pending_tx && !tests[i].cancel_rx)
+      if ((!tests[i].pending_tx && !tests[i].cancel_rx) || tests[i].stop_sending)
 	{
 	  callbacks->on_destroy (&stream, 0);
 	  data = 0;
 	  stream.data = 0;
+	  ctx = pool_is_free_index (qm->wrk_ctx[thread_index].ctx_pool, ctx_index) ?
+		  0 :
+		  pool_elt_at_index (qm->wrk_ctx[thread_index].ctx_pool, ctx_index);
+	  QUICLY_TEST (ctx != 0,
+		       "stream destruction preserves application ownership until RX is read");
 	  QUICLY_TEST (clib_fifo_elts (app_wrk->wrk_evts[thread_index]) == 0,
 		       "later stream destruction does not duplicate disconnect");
 	}
@@ -784,6 +1122,31 @@ quicly_test_rx_fin (vlib_main_t *vm, quic_quicly_main_t *qqm,
 	QUICLY_TEST (svm_fifo_dequeue (rxf, tests[i].body_len, received) == tests[i].body_len &&
 		       !memcmp (body, received, tests[i].body_len),
 		     "all body bytes remain readable after EOF");
+      if (tests[i].stop_sending && tests[i].fin_with_data)
+	{
+	  /* Reading the preserved response must still allow the application to
+	   * confirm close and retire the detached stream through queued cleanup. */
+	  session->session_state = SESSION_STATE_APP_CLOSED;
+	  engine->proto_on_close (ctx_index, thread_index);
+	  QUICLY_TEST (!pool_is_free_index (qm->wrk_ctx[thread_index].ctx_pool, ctx_index) &&
+			 clib_fifo_elts (app_wrk->wrk_evts[thread_index]) == 3,
+		       "half-closed app confirmation retains context for queued cleanup");
+	  clib_fifo_sub1 (app_wrk->wrk_evts[thread_index], event);
+	  QUICLY_TEST (event.event_type == SESSION_CTRL_EVT_TRANSPORT_CLOSED,
+		       "half-closed app confirmation reports full closure before cleanup");
+	  clib_fifo_sub1 (app_wrk->wrk_evts[thread_index], event);
+	  QUICLY_TEST (event.event_type == SESSION_CTRL_EVT_CLEANUP &&
+			 event.as_u64[0] >> 32 == SESSION_CLEANUP_TRANSPORT && event.as_u64[1],
+		       "half-closed stream queues its transport destructor");
+	  transport_cleanup_cb ((void *) event.as_u64[1], session_get_transport (session));
+	  ctx = 0;
+	  clib_fifo_sub1 (app_wrk->wrk_evts[thread_index], event);
+	  QUICLY_TEST (pool_is_free_index (qm->wrk_ctx[thread_index].ctx_pool, ctx_index) &&
+			 event.event_type == SESSION_CTRL_EVT_CLEANUP &&
+			 event.as_u64[0] >> 32 == SESSION_CLEANUP_SESSION &&
+			 !clib_fifo_elts (app_wrk->wrk_evts[thread_index]),
+		       "half-closed stream releases transport before application session cleanup");
+	}
       svm_fifo_dequeue_drop_all (txf);
       clib_fifo_free (app_wrk->wrk_evts[thread_index]);
       if (data)
@@ -836,6 +1199,8 @@ quicly_test (vlib_main_t *vm, unformat_input_t *input, vlib_cli_command_t *cmd)
   {
     TEST_NONE,
     TEST_STREAM_CLOSE,
+    TEST_STREAM_RESET,
+    TEST_CONNECTION_CLOSE,
     TEST_RX,
     TEST_CANCEL_RX,
     TEST_RX_FIN,
@@ -846,6 +1211,10 @@ quicly_test (vlib_main_t *vm, unformat_input_t *input, vlib_cli_command_t *cmd)
 
   if (unformat (input, "stream-close"))
     test = TEST_STREAM_CLOSE;
+  else if (unformat (input, "stream-reset"))
+    test = TEST_STREAM_RESET;
+  else if (unformat (input, "connection-close"))
+    test = TEST_CONNECTION_CLOSE;
   else if (unformat (input, "rx-fin"))
     test = TEST_RX_FIN;
   else if (unformat (input, "rx-credit"))
@@ -859,7 +1228,8 @@ quicly_test (vlib_main_t *vm, unformat_input_t *input, vlib_cli_command_t *cmd)
   else if (unformat (input, "all"))
     test = TEST_ALL;
   if (test == TEST_NONE || unformat_check_input (input) != UNFORMAT_END_OF_INPUT)
-    return clib_error_return (0, "expected exactly one of stream-close, rx, cancel-rx, rx-fin, "
+    return clib_error_return (0, "expected exactly one of stream-close, stream-reset, "
+				 "connection-close, rx, cancel-rx, rx-fin, "
 				 "rx-credit, certificates or all");
   if (test == TEST_CERTIFICATES || test == TEST_ALL)
     {
@@ -876,7 +1246,8 @@ quicly_test (vlib_main_t *vm, unformat_input_t *input, vlib_cli_command_t *cmd)
   QUIC_LOAD_SYMBOL_FROM_PLUGIN_TO ("quic_quicly_plugin.so", quic_quicly_main, qqm);
   QUIC_LOAD_SYMBOL_FROM_PLUGIN_TO ("quic_quicly_plugin.so", quic_quicly_stream_callbacks,
 				   callbacks);
-  if ((test == TEST_RX || test == TEST_RX_FIN || test == TEST_RX_CREDIT || test == TEST_ALL) &&
+  if ((test == TEST_RX || test == TEST_RX_FIN || test == TEST_RX_CREDIT ||
+       test == TEST_STREAM_RESET || test == TEST_ALL) &&
       (qm->app_index == APP_INVALID_INDEX || !qm->engine_is_initialized[QUIC_ENGINE_QUICLY]))
     return clib_error_return (0, "QUIC RX tests require an enabled quicly engine (session enable)");
   quic_node = vlib_get_node_by_name (vm, (u8 *) "quic-input");
@@ -909,7 +1280,9 @@ quicly_test (vlib_main_t *vm, unformat_input_t *input, vlib_cli_command_t *cmd)
   session_main.wrk = sessions;
   qqm->qm = qm;
   qqm->worker_stats = stats;
-  if (test == TEST_STREAM_CLOSE || test == TEST_ALL)
+  if (test == TEST_CONNECTION_CLOSE || test == TEST_ALL)
+    res = quicly_test_connection_close (vm, &(*engines)[QUIC_ENGINE_QUICLY]);
+  if (!res && (test == TEST_STREAM_CLOSE || test == TEST_ALL))
     for (u32 thread_index = 0; thread_index < 2 && !res; thread_index++)
       for (u32 i = 0; i < ARRAY_LEN (stream_ids) && !res; i++)
 	for (u32 order = 0; order < 3 && !res; order++)
@@ -917,6 +1290,8 @@ quicly_test (vlib_main_t *vm, unformat_input_t *input, vlib_cli_command_t *cmd)
 					  thread_index, stream_ids[i], order);
   if (!res && (test == TEST_RX || test == TEST_ALL))
     res = quicly_test_retired_rx (vm, qqm, &(*engines)[QUIC_ENGINE_QUICLY]);
+  if (!res && (test == TEST_STREAM_RESET || test == TEST_ALL))
+    res = quicly_test_stream_reset (vm, qqm, callbacks, &(*engines)[QUIC_ENGINE_QUICLY]);
   if (test == TEST_CANCEL_RX || test == TEST_ALL)
     for (u32 thread_index = 0; thread_index < 2 && !res; thread_index++)
       {
@@ -956,7 +1331,9 @@ quicly_test (vlib_main_t *vm, unformat_input_t *input, vlib_cli_command_t *cmd)
 
 VLIB_CLI_COMMAND (quicly_test_command, static) = {
   .path = "test quicly",
-  .short_help = "test quicly [stream-close|rx|cancel-rx|rx-fin|rx-credit|certificates|all]",
+  .short_help =
+    "test quicly "
+    "[stream-close|stream-reset|connection-close|rx|cancel-rx|rx-fin|rx-credit|certificates|all]",
   .function = quicly_test,
 };
 

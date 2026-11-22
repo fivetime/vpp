@@ -100,8 +100,8 @@ http_test_parse_ip6 (vlib_main_t *vm)
 	}
 
       u8 *authority = format (0, "[%s]:443", cases[i].text);
-      hpack_authority_t parsed;
-      u8 valid = hpack_authority_parse (authority, vec_len (authority), 1, 0, &parsed);
+      http_target_authority_t parsed;
+      u8 valid = http_target_authority_parse (authority, vec_len (authority), 1, 0, &parsed);
       HTTP_TEST (valid == cases[i].valid, "pseudo-header authority '%v' syntax", authority);
       if (valid)
 	HTTP_TEST (parsed.is_ip6 && !memcmp (&parsed.ip6, &ip6, sizeof (ip6)),
@@ -269,8 +269,22 @@ http_test_parse_authority (vlib_main_t *vm)
   HTTP_TEST ((rv == -1), "'%v' should be invalid", authority);
   vec_free (authority);
 
-  /* no port after colon */
-  authority = format (0, "example.com:");
+  /* An empty port is equivalent to an omitted port in a URI. */
+  const char *hosts[] = { "example.com", "10.255.2.1", "[dead:beef::1234]" };
+  for (u32 i = 0; i < ARRAY_LEN (hosts); i++)
+    {
+      authority = format (0, "%s:", hosts[i]);
+      rv = http_parse_authority (authority, vec_len (authority), &parsed);
+      HTTP_TEST (rv == 0 && parsed.port == 0, "'%v' should have an unspecified port", authority);
+      formated = http_serialize_authority (&parsed);
+      HTTP_TEST (http_token_is ((char *) formated, vec_len (formated), hosts[i], strlen (hosts[i])),
+		 "'%v' should serialize as '%s'", authority, hosts[i]);
+      vec_free (authority);
+      vec_free (formated);
+    }
+
+  /* An empty port still requires a host. */
+  authority = format (0, ":");
   rv = http_parse_authority (authority, vec_len (authority), &parsed);
   HTTP_TEST ((rv == -1), "'%v' should be invalid", authority);
   vec_free (authority);
@@ -523,6 +537,8 @@ http_test_http_token_is_case (vlib_main_t *vm)
   static const char ne_4[] = "content-len";
   static const char ne_5[] = "comtent-length";
   static const char ne_6[] = "content-lengtR";
+  _Alignas (uword) static const char actual[] = "xHTTPS://";
+  _Alignas (uword) static const char expected[] = "xxhttps://";
   u8 rv;
 
   rv = http_token_is_case (
@@ -576,6 +592,22 @@ http_test_http_token_is_case (vlib_main_t *vm)
     ne_6, strlen (ne_6), http_header_name_token (HTTP_HEADER_CONTENT_LENGTH));
   HTTP_TEST ((rv == 0), "'%s' and '%s' are not equal", ne_6,
 	     http_header_name_str (HTTP_HEADER_CONTENT_LENGTH))
+
+  rv = http_token_is_case (actual + 1, sizeof (actual) - 2, expected + 2, sizeof (expected) - 3);
+  HTTP_TEST (rv == 1, "case comparison accepts unaligned tokens");
+
+  const char long_expected[] = "ab12CdEf[gHiJkLmNoPqRsTuVwXyZ12345";
+  char long_actual[] = "AB12cDeF[GhIjKlMnOpQrStUvWxYz12345";
+  uword len = sizeof (long_actual) - 1;
+  HTTP_TEST (http_token_is_case (long_actual, len, long_expected, len),
+	     "case comparison matches mixed-case tokens across blocks and tail");
+  long_actual[8] = '{';
+  HTTP_TEST (!http_token_is_case (long_actual, len, long_expected, len),
+	     "case comparison preserves punctuation within a block");
+  long_actual[8] = '[';
+  long_actual[len - 1] = '6';
+  HTTP_TEST (!http_token_is_case (long_actual, len, long_expected, len),
+	     "case comparison detects a mismatch in the tail");
 
   return 0;
 }
@@ -1108,18 +1140,24 @@ http_test_validation (vlib_main_t *vm)
   HTTP_TEST (!http_token_is_valid (value, 0) && !hpack_header_name_is_valid (value, 0),
 	     "empty tokens and field names are invalid");
 
+  u8 long_value[33];
+  memset (long_value, 'x', sizeof (long_value));
   for (u32 component = 0; component < ARRAY_LEN (component_chars); component++)
     {
       u32 failed_byte = ~0U;
       for (u32 byte = 0; byte < 256; byte++)
 	{
 	  value[1] = byte;
+	  long_value[15] = byte;
 	  u8 expected =
 	    memchr (reg_name_chars, byte, sizeof (reg_name_chars) - 1) ||
 	    memchr (component_chars[component], byte, strlen (component_chars[component]));
-	  int encoded = -1;
+	  int encoded = -1, long_encoded = -1;
 	  int rv = http_validate_uri_component (value, sizeof (value), component, &encoded);
-	  if ((rv == 0) != expected || (rv == 0 && encoded != 0))
+	  int long_rv =
+	    http_validate_uri_component (long_value, sizeof (long_value), component, &long_encoded);
+	  if ((rv == 0) != expected || long_rv != rv || long_encoded != encoded ||
+	      (rv == 0 && encoded != 0))
 	    failed_byte = byte;
 	}
       HTTP_TEST (failed_byte == ~0U, "all 256 URI component %u bytes (failure 0x%x)", component,
@@ -1150,6 +1188,36 @@ http_test_validation (vlib_main_t *vm)
 	       !http_validate_target_syntax (target, sizeof (target) - 1, 1, &encoded) && encoded,
 	     "path and combined path/query delimiters remain distinct");
 
+  for (u32 pos = 14; pos <= 16; pos++)
+    {
+      u8 target[37];
+      u32 query;
+      memset (target, 'x', sizeof (target));
+      target[0] = '/';
+      clib_memcpy_fast (target + pos, "%3F??%2F", 8);
+      HTTP_TEST (!_http_validate_uri_component (target, sizeof (target), HTTP_URI_COMPONENT_QUERY,
+						&encoded, &query) &&
+		   encoded && query == pos + 3,
+		 "find first literal query delimiter after escape at offset %u", pos);
+      http_ctx_t req;
+      http_set_target_path (&req, target, target, sizeof (target), query);
+      HTTP_TEST (req.target_path_offset == 1 && req.target_path_len == query - 1 &&
+		   req.target_query_offset == query + 1 &&
+		   req.target_query_len == sizeof (target) - query - 1,
+		 "split target with escape at offset %u", pos);
+      target[pos + 2] = 'G';
+      HTTP_TEST (_http_validate_uri_component (target, sizeof (target), HTTP_URI_COMPONENT_QUERY, 0,
+					       &query) == -1,
+		 "reject invalid escape at offset %u", pos);
+    }
+
+  const u8 empty_query[] = "/?";
+  http_ctx_t req;
+  http_set_target_path (&req, empty_query, empty_query, 2, 1);
+  HTTP_TEST (req.target_path_offset == 1 && req.target_path_len == 0 &&
+	       req.target_query_offset == 2 && req.target_query_len == 0,
+	     "retain the offset of an empty query");
+
   const struct
   {
     const char *text;
@@ -1175,15 +1243,61 @@ http_test_validation (vlib_main_t *vm)
       u8 *authority = format (0, "example.com:%s", ports[i].text);
       for (u32 required = 0; required < 2; required++)
 	{
-	  hpack_authority_t parsed;
+	  http_target_authority_t parsed;
 	  u8 expected = len ? ports[i].valid && ports[i].consumed == len : !required;
-	  u8 valid = hpack_authority_parse (authority, vec_len (authority), required, 0, &parsed);
+	  u8 valid =
+	    http_target_authority_parse (authority, vec_len (authority), required, 0, &parsed);
 	  HTTP_TEST (valid == expected &&
 		       (!valid || (parsed.has_port == (len != 0) && parsed.port == ports[i].port)),
 		     "authority '%v' port policy %u", authority, required);
 	}
       vec_free (authority);
     }
+  return 0;
+}
+
+static int
+http_test_path_iter (vlib_main_t *vm)
+{
+  const struct
+  {
+    const char *path;
+    const char *segments[8];
+    u8 encoded;
+  } cases[] = {
+    { "", { 0 }, 0 },
+    { "/a//", { "", "a", "", "" }, 0 },
+    { "0123456789abcde/", { "0123456789abcde", "" }, 0 },
+    { "/%20/ab//12345678901%2F/yz/",
+      { "", "%20", "ab", "", "12345678901%2F", "yz", "" },
+      (1 << 1) | (1 << 4) },
+    { "12345678901234%2F/a/bcdefghijklmnop/%25",
+      { "12345678901234%2F", "a", "bcdefghijklmnop", "%25" },
+      (1 << 0) | (1 << 3) },
+  };
+
+  for (u32 i = 0; i < ARRAY_LEN (cases); i++)
+    {
+      const char *path = cases[i].path;
+      http_path_iter_t iter = http_path_iter_init ((const u8 *) path, strlen (path));
+      http_path_segment_t segment;
+
+      for (u32 j = 0; j < ARRAY_LEN (cases[i].segments) && cases[i].segments[j]; j++)
+	{
+	  const char *expected = cases[i].segments[j];
+	  HTTP_TEST (http_path_iter_next (&iter, &segment) && segment.len == strlen (expected) &&
+		       !memcmp (segment.data, expected, segment.len) &&
+		       segment.is_encoded == ((cases[i].encoded >> j) & 1),
+		     "path '%s' segment %u and encoding flag", path, j);
+	}
+      HTTP_TEST (!http_path_iter_next (&iter, &segment), "path '%s' iteration ends", path);
+    }
+
+  u8 data[] = "prea%2Fb%252F%00%ff";
+  const u8 expected[] = { 'a', '/', 'b', '%', '2', 'F', 0, 0xff };
+  u32 len = http_percent_decode_to (data, data + 3, sizeof (data) - 4);
+  HTTP_TEST (len == sizeof (expected) && !memcmp (data, expected, len),
+	     "decode overlapping buffers and preserve decoded bytes");
   return 0;
 }
 
@@ -1342,6 +1456,41 @@ http_test_pseudo_headers (vlib_main_t *vm)
 	rv = hpack_validate_request_pseudo_headers (&cd, requests[i].enable_connect);
       HTTP_TEST ((rv == HPACK_ERROR_NONE) == requests[i].valid,
 		 "request pseudo-header presence/value rules, case %u", i);
+    }
+
+  const struct
+  {
+    u32 path_len, query_len;
+    hpack_error_t expected;
+  } target_lengths[] = {
+    { UINT16_MAX, 0, HPACK_ERROR_NONE },
+    { UINT16_MAX, UINT16_MAX, HPACK_ERROR_NONE },
+    { UINT16_MAX + 1, 0, HPACK_ERROR_PROTOCOL },
+    { 1, UINT16_MAX + 1, HPACK_ERROR_PROTOCOL },
+  };
+  for (u32 i = 0; i < ARRAY_LEN (target_lengths); i++)
+    {
+      u32 path_len = target_lengths[i].path_len, query_len = target_lengths[i].query_len;
+      u32 len = 1 + path_len + (query_len ? 1 + query_len : 0);
+      u8 *target = 0;
+      vec_validate_init_empty (target, len - 1, 'a');
+      target[0] = '/';
+      if (query_len)
+	target[1 + path_len] = '?';
+      hpack_request_control_data_t cd = {
+	.parsed_bitmap = HPACK_PSEUDO_HEADER_METHOD_PARSED | HPACK_PSEUDO_HEADER_SCHEME_PARSED |
+			 HPACK_PSEUDO_HEADER_AUTHORITY_PARSED | HPACK_PSEUDO_HEADER_PATH_PARSED,
+	.method = HTTP_REQ_GET,
+	.scheme = HTTP_URL_SCHEME_HTTPS,
+	.authority = (u8 *) "example.com",
+	.authority_len = sizeof ("example.com") - 1,
+	.path = target,
+	.path_len = len,
+      };
+      hpack_error_t rv = hpack_validate_request_pseudo_headers (&cd, 0);
+      vec_free (target);
+      HTTP_TEST (rv == target_lengths[i].expected, "target with path length %u and query length %u",
+		 path_len, query_len);
     }
 
   static http2_error_t (*parse_h2) (u8 *, u32, u8 *, u32, hpack_response_control_data_t *,
@@ -1663,9 +1812,7 @@ http_test_hpack (vlib_main_t *vm)
 
   vlib_cli_output (vm, "hpack_decode_header");
 
-  static hpack_error_t (*_hpack_decode_header) (u8 * *src, u8 * end, u8 * *buf, uword * buf_len,
-						u32 * name_len, u32 * value_len,
-						hpack_dynamic_table_t * dt, u8 * never_index);
+  static hpack_header_decoder_fn *_hpack_decode_header;
 
   _hpack_decode_header =
     vlib_get_plugin_symbol ("http_plugin.so", "hpack_decode_header");
@@ -1845,7 +1992,6 @@ http_test_hpack (vlib_main_t *vm)
   vec_validate (buf, 127);
   vec_reset_length (buf);
   resp_cd.sc = HTTP_STATUS_GATEWAY_TIMEOUT;
-  resp_cd.content_len = HPACK_ENCODER_SKIP_CONTENT_LEN;
   resp_cd.server_name = server_name;
   resp_cd.server_name_len = vec_len (server_name);
   resp_cd.date = date;
@@ -1862,6 +2008,7 @@ http_test_hpack (vlib_main_t *vm)
 
   resp_cd.sc = HTTP_STATUS_OK;
   resp_cd.content_len = 1024;
+  resp_cd.send_content_length = 1;
   http_headers_ctx_t headers;
   u8 *headers_buf = 0;
   vec_validate (headers_buf, 127);
@@ -2099,8 +2246,7 @@ http_test_h2_frame (vlib_main_t *vm)
 
   vlib_cli_output (vm, "http2_frame_write_rst_stream");
 
-  static void (*_http2_frame_write_rst_stream) (u32 increment, u32 stream_id,
-						u8 * *dst);
+  static typeof (http2_frame_write_rst_stream) *_http2_frame_write_rst_stream;
 
   _http2_frame_write_rst_stream =
     vlib_get_plugin_symbol ("http_plugin.so", "http2_frame_write_rst_stream");
@@ -2577,6 +2723,7 @@ http_test_qpack (vlib_main_t *vm)
   vec_validate_init_empty (buf, 127, 0xFF);
   vec_reset_length (buf);
   resp_control_data.sc = HTTP_STATUS_GATEWAY_TIMEOUT;
+  resp_control_data.send_content_length = 1;
   resp_control_data.server_name = server_name;
   resp_control_data.server_name_len = vec_len (server_name);
   resp_control_data.date = date;
@@ -2719,6 +2866,31 @@ http_test_h3_frame (vlib_main_t *vm)
   HTTP_TEST ((rv == HTTP3_ERROR_FRAME_UNEXPECTED),
 	     "frame is on wrong stream (rv=0x%04x)", rv);
 
+  u8 short_headers[][3] = { { 0x01, 0x00 }, { 0x01, 0x01, 0x00 } };
+  for (u32 i = 0; i < ARRAY_LEN (short_headers); i++)
+    {
+      rv = _http3_frame_header_read (short_headers[i], i + 2, HTTP3_STREAM_TYPE_REQUEST, &fh);
+      HTTP_TEST (rv == HTTP3_ERROR_FRAME_ERROR, "HEADERS with %u prefix bytes rejected (rv=0x%04x)",
+		 i, rv);
+      rv = _http3_frame_header_read (short_headers[i], i + 2, HTTP3_STREAM_TYPE_PUSH, &fh);
+      HTTP_TEST (rv == HTTP3_ERROR_FRAME_ERROR,
+		 "pushed HEADERS with %u prefix bytes rejected (rv=0x%04x)", i, rv);
+      rv = _http3_frame_header_read (short_headers[i], i + 2, HTTP3_STREAM_TYPE_CONTROL, &fh);
+      HTTP_TEST (rv == HTTP3_ERROR_FRAME_UNEXPECTED,
+		 "short HEADERS on control stream rejected as unexpected (rv=0x%04x)", rv);
+    }
+
+  u8 empty_section[] = { 0x01, 0x02, 0x00, 0x00 };
+  rv = _http3_frame_header_read (empty_section, sizeof (empty_section), HTTP3_STREAM_TYPE_REQUEST,
+				 &fh);
+  HTTP_TEST (rv == HTTP3_ERROR_NO_ERROR && fh.length == 2,
+	     "complete QPACK prefix reaches HTTP field validation (rv=0x%04x)", rv);
+
+  u8 empty_data[] = { 0x00, 0x00 };
+  rv = _http3_frame_header_read (empty_data, sizeof (empty_data), HTTP3_STREAM_TYPE_REQUEST, &fh);
+  HTTP_TEST (rv == HTTP3_ERROR_NO_ERROR && fh.length == 0, "empty DATA remains valid (rv=0x%04x)",
+	     rv);
+
   vlib_cli_output (vm, "http3_frame_header_write");
 
   u8 header_buf[HTTP3_FRAME_HEADER_MAX_LEN] = {};
@@ -2816,6 +2988,61 @@ static int
 http_test_http_lookup_header_name (vlib_main_t *vm)
 {
   http_header_name_t name;
+  char actual[80], expected[80];
+
+  /* Exercise short loads, vector boundaries and unaligned input. Different
+   * padding also checks that bytes outside the token do not affect equality. */
+  for (u32 len = 0; len <= 64; len++)
+    for (u32 offset = 0; offset < 16; offset++)
+      {
+	clib_memset (actual, '!', sizeof (actual));
+	clib_memset (expected, '?', sizeof (expected));
+	for (u32 i = 0; i < len; i++)
+	  {
+	    actual[offset + i] = (i & 1 ? 'a' : 'A') + i % 26;
+	    expected[offset + i] = 'a' + i % 26;
+	  }
+	if (_http_memcmp_case (actual + offset, expected + offset, len))
+	  HTTP_TEST (0, "case-insensitive comparison len %u offset %u", len, offset);
+	for (u32 i = 0; i < len; i++)
+	  {
+	    expected[offset + i] ^= 1;
+	    if (!_http_memcmp_case (actual + offset, expected + offset, len))
+	      HTTP_TEST (0, "mismatch at byte %u len %u offset %u", i, len, offset);
+	    expected[offset + i] ^= 1;
+	  }
+      }
+
+  /* Folding must preserve punctuation and bytes outside ASCII A..Z. */
+  for (u32 a = 0; a < 256; a++)
+    for (u32 e = 0; e < 256; e++)
+      {
+	u8 folded = a >= 'A' && a <= 'Z' ? a + ('a' - 'A') : a;
+	actual[0] = a;
+	expected[0] = e;
+	if (_http_memcmp_case (actual, expected, 1) != (folded != e))
+	  HTTP_TEST (0, "case folding byte 0x%02x compared with 0x%02x", a, e);
+      }
+
+  for (u32 h = 0; h < ARRAY_LEN (http_header_names); h++)
+    {
+      uword len = http_header_names[h].buf.len;
+      HTTP_TEST (len <= sizeof (actual), "header name %u fits test buffer", h);
+      for (u32 upper = 0; upper < 2; upper++)
+	{
+	  for (u32 i = 0; i < len; i++)
+	    {
+	      u8 c = http_header_names[h].buf.base[i];
+	      if (upper && c >= 'a' && c <= 'z')
+		c -= 'a' - 'A';
+	      else if (!upper && c >= 'A' && c <= 'Z')
+		c += 'a' - 'A';
+	      actual[i] = c;
+	    }
+	  if (http_lookup_header_name (actual, len) != h)
+	    HTTP_TEST (0, "%s header name %u lookup", upper ? "uppercase" : "lowercase", h);
+	}
+    }
 
 #define _(sym, str_canonical, str_lower, hpack_index, flags)                                       \
   name = http_lookup_header_name (http_token_lit (str_canonical));                                 \
@@ -2893,16 +3120,16 @@ http_test_http_headers_rx_to_tx (vlib_main_t *vm)
   msg.data.headers_ctx = pointer_to_uword (headers);
   msg.data.headers_len = strlen (buf);
 
-  vec_validate (headers_buf, 255);
+  vec_validate (headers_buf, 511);
   http_init_headers_ctx (&headers_ctx, headers_buf, vec_len (headers_buf));
 
-  vec_validate (expected_buf, 255);
+  vec_validate (expected_buf, 511);
   http_init_headers_ctx (&expected_ctx, expected_buf, vec_len (expected_buf));
   http_add_header (&expected_ctx, HTTP_HEADER_CONTENT_TYPE,
 		   http_token_lit ("text/html; charset=utf-8"));
   http_add_header (&expected_ctx, HTTP_HEADER_STRICT_TRANSPORT_SECURITY,
 		   http_token_lit ("max-age=31536000"));
-  http_add_custom_header (&expected_ctx, http_token_lit ("Sandwich"), http_token_lit ("Eggs"));
+  http_add_custom_header (&expected_ctx, http_token_lit ("sandwich"), http_token_lit ("Eggs"));
   http_add_header (&expected_ctx, HTTP_HEADER_CONTENT_ENCODING, http_token_lit ("GZIP"));
 
   rv = http_headers_rx_to_tx (msg, (const u8 *) buf, &headers_ctx);
@@ -2911,6 +3138,155 @@ http_test_http_headers_rx_to_tx (vlib_main_t *vm)
 	     "rx headers converted to tx headers as: %U", format_hex_bytes, headers_buf,
 	     headers_ctx.tail_offset);
 
+  vec_free (headers);
+
+  const struct
+  {
+    http_token_t name, value;
+    u8 never_index;
+  } fields[] = {
+    { { http_token_lit ("conTent-tYpE") }, { http_token_lit ("text/html") }, 0 },
+    { { http_token_lit ("X-Private") }, { http_token_lit ("first private value") }, 0 },
+    { { http_token_lit ("x-pRIVATE") }, { http_token_lit ("second private value") }, 1 },
+    { { http_token_lit ("Content-Type") }, { http_token_lit ("text/plain") }, 1 },
+    { { http_token_lit ("CONTENT-ENCODING") }, { http_token_lit ("gzip") }, 0 },
+    { { http_token_lit ("X-XSS-Protection") }, { http_token_lit ("1; mode=block") }, 0 },
+    { { http_token_lit ("Close") }, { http_token_lit ("private") }, 0 },
+    { { http_token_lit ("X-Second") }, { http_token_lit ("also private") }, 0 },
+    { { http_token_lit ("X-Privat") }, { http_token_lit ("shorter name") }, 0 },
+    { { http_token_lit ("X-Private-Extra") }, { http_token_lit ("longer name") }, 0 },
+    { { http_token_lit ("X-Keep") }, { http_token_lit ("First") }, 0 },
+    { { http_token_lit ("x-kEeP") }, { http_token_lit ("sEcOnD, Third") }, 1 },
+    { { http_token_lit ("Set-Cookie") }, { http_token_lit ("a=1") }, 0 },
+    { { http_token_lit ("Set-Cookie") }, { http_token_lit ("b=2") }, 1 },
+    { { http_token_lit ("X-Request-Id") }, { http_token_lit ("AbC123-XyZ") }, 0 },
+    { { http_token_lit ("x-request-id") }, { http_token_lit ("Second-ID") }, 1 },
+    { { http_token_lit ("X-MTP-PROBE") }, { http_token_lit ("MiXeD-Value") }, 1 },
+    { { http_token_lit ("X^Tag_9-With-A-Long-Custom-Name") },
+      { http_token_lit ("Keep^Value_9") },
+      0 },
+    { { http_token_lit ("X-Name-123456789") }, { http_token_lit ("Sixteen-Bytes") }, 0 },
+    { { http_token_lit ("X-Name-1234567890") }, { http_token_lit ("Seventeen-Bytes") }, 1 },
+    { { http_token_lit ("Keep-Alive") }, { http_token_lit ("timeout=5") }, 0 },
+    { { http_token_lit ("Transfer-Encoding") }, { http_token_lit ("chunked") }, 0 },
+    { { http_token_lit ("Host") }, { http_token_lit ("example.com") }, 0 },
+  };
+  const struct
+  {
+    const char *description;
+    http_token_t connection[3];
+  } cases[] = {
+    { "comma-separated options",
+      { { http_token_lit ("keep-alive, X-Private, Content-Type, X-Second, Content-Encoding, "
+			  "X-XSS-Protection, close") },
+	{ http_token_lit ("") },
+	{ http_token_lit (" \t ") } } },
+    { "whitespace and case-insensitive options",
+      { { http_token_lit (" \tKeEp-AlIvE\t, \tx-pRIVATE \t,\tCONTENT-type, x-SECOND\t, "
+			  "CoNtEnT-EnCoDiNg \t, X-Xss-Protection, CLOSE") },
+	{ http_token_lit ("") },
+	{ http_token_lit ("") } } },
+    { "repeated Connection fields",
+      { { http_token_lit ("keep-alive, X-Private") },
+	{ http_token_lit ("\tcontent-TYPE, X-Second\t") },
+	{ http_token_lit ("CONTENT-encoding, X-XSS-Protection, close") } } },
+    { "empty list elements",
+      { { http_token_lit (", ,\t,X-Private,, Content-Type, ") },
+	{ http_token_lit (", X-Second, ,") },
+	{ http_token_lit (" ,Content-Encoding, X-XSS-Protection, close, \t") } } },
+    { "names and whitespace split across vector chunks",
+      { { http_token_lit ("               X-Private, Content-Type") },
+	{ http_token_lit (
+	  "    X-Second                 ,CONTENT-encoding, X-XSS-Protection, close") },
+	{ http_token_lit (
+	  "                                \t                                ") } } },
+    { "commas at vector boundaries",
+      { { http_token_lit ("       X-Private,Content-Type") },
+	{ http_token_lit ("       X-Second,Content-Encoding") },
+	{ http_token_lit ("               X-XSS-Protection,close,   ") } } },
+    { "embedded whitespace does not split names",
+      { { http_token_lit ("X-Keep \t X-Private, keep-alive, X-Private") },
+	{ http_token_lit ("Content-Type, X-Second") },
+	{ http_token_lit ("Content-Encoding, X-XSS-Protection, close") } } },
+    { "chunks containing only empty elements",
+      { { http_token_lit (" ,\t, , ,\t, , ,\t, , ,\t, , ,\t, , ,\t, , ,\t, , ,\t, ") },
+	{ http_token_lit ("X-Private, Content-Type, X-Second") },
+	{ http_token_lit ("Content-Encoding, X-XSS-Protection, close") } } },
+  };
+  const char *connection_names[] = { "cOnNeCtIoN", "CONNECTION", "connection" };
+  u8 *rx_buf = 0, *rx_copy = 0;
+
+  for (u32 i = 0; i < ARRAY_LEN (fields); i++)
+    {
+      vec_add2 (headers, field_line, 1);
+      *field_line = (http_field_line_t) {
+	.name_offset = vec_len (rx_buf),
+	.name_len = fields[i].name.len,
+	.value_offset = vec_len (rx_buf) + fields[i].name.len,
+	.value_len = fields[i].value.len,
+	.flags = fields[i].never_index ? HTTP_FIELD_LINE_F_NEVER_INDEX : 0,
+      };
+      vec_add (rx_buf, fields[i].name.base, fields[i].name.len);
+      vec_add (rx_buf, fields[i].value.base, fields[i].value.len);
+    }
+
+  http_init_headers_ctx (&expected_ctx, expected_buf, vec_len (expected_buf));
+  http_add_custom_header (&expected_ctx, http_token_lit ("x-privat"),
+			  http_token_lit ("shorter name"));
+  http_add_custom_header (&expected_ctx, http_token_lit ("x-private-extra"),
+			  http_token_lit ("longer name"));
+  http_add_custom_header (&expected_ctx, http_token_lit ("x-keep"), http_token_lit ("First"));
+  http_add_custom_header2 (&expected_ctx, http_token_lit ("x-keep"),
+			   http_token_lit ("sEcOnD, Third"), 1);
+  http_add_header (&expected_ctx, HTTP_HEADER_SET_COOKIE, http_token_lit ("a=1"));
+  http_add_header2 (&expected_ctx, HTTP_HEADER_SET_COOKIE, http_token_lit ("b=2"), 1);
+  http_add_custom_header (&expected_ctx, http_token_lit ("x-request-id"),
+			  http_token_lit ("AbC123-XyZ"));
+  http_add_custom_header2 (&expected_ctx, http_token_lit ("x-request-id"),
+			   http_token_lit ("Second-ID"), 1);
+  http_add_custom_header2 (&expected_ctx, http_token_lit ("x-mtp-probe"),
+			   http_token_lit ("MiXeD-Value"), 1);
+  http_add_custom_header (&expected_ctx, http_token_lit ("x^tag_9-with-a-long-custom-name"),
+			  http_token_lit ("Keep^Value_9"));
+  http_add_custom_header (&expected_ctx, http_token_lit ("x-name-123456789"),
+			  http_token_lit ("Sixteen-Bytes"));
+  http_add_custom_header2 (&expected_ctx, http_token_lit ("x-name-1234567890"),
+			   http_token_lit ("Seventeen-Bytes"), 1);
+
+  u32 fields_len = vec_len (headers), rx_len = vec_len (rx_buf);
+  for (u32 i = 0; i < ARRAY_LEN (cases); i++)
+    {
+      vec_set_len (headers, fields_len);
+      vec_set_len (rx_buf, rx_len);
+      for (u32 j = 0; j < ARRAY_LEN (connection_names); j++)
+	{
+	  vec_add2 (headers, field_line, 1);
+	  *field_line = (http_field_line_t) {
+	    .name_offset = vec_len (rx_buf),
+	    .name_len = strlen (connection_names[j]),
+	    .value_offset = vec_len (rx_buf) + strlen (connection_names[j]),
+	    .value_len = cases[i].connection[j].len,
+	  };
+	  vec_add (rx_buf, connection_names[j], strlen (connection_names[j]));
+	  vec_add (rx_buf, cases[i].connection[j].base, cases[i].connection[j].len);
+	}
+
+      http_init_headers_ctx (&headers_ctx, headers_buf, vec_len (headers_buf));
+      msg.data.headers_ctx = pointer_to_uword (headers);
+      msg.data.headers_len = vec_len (rx_buf);
+      rx_copy = vec_dup (rx_buf);
+      rv = http_headers_rx_to_tx (msg, rx_buf, &headers_ctx);
+      HTTP_TEST ((rv == 0 && headers_ctx.tail_offset == expected_ctx.tail_offset &&
+		  !memcmp (headers_buf, expected_buf, headers_ctx.tail_offset)),
+		 "Connection filtering with %s preserves unrelated repeated values and flags",
+		 cases[i].description);
+      HTTP_TEST (!memcmp (rx_buf, rx_copy, vec_len (rx_buf)),
+		 "custom name normalization preserves RX bytes with %s", cases[i].description);
+      vec_free (rx_copy);
+    }
+
+  vec_free (rx_buf);
+  vec_free (headers);
   vec_free (headers_buf);
   vec_free (expected_buf);
   return 0;
@@ -4075,6 +4451,10 @@ typedef struct
   transport_connection_t connection;
   u32 app_session_index, old_stream_index, new_session_index;
   u32 rx_cancellations;
+  u32 failed_connects;
+  u64 peer_error_code;
+  u8 initializing;
+  u8 fail_connect;
 } http_test_h3_lifecycle_t;
 
 static http_test_h3_lifecycle_t *http_test_h3_lifecycle;
@@ -4087,6 +4467,11 @@ http_test_h3_connect_stream (transport_endpoint_cfg_t *tep, session_t *s, u32 *c
   http_worker_t *wrk = &test->hm->wrk[ti];
   session_worker_t *swrk = &session_main.wrk[ti];
 
+  if (test->fail_connect)
+    {
+      test->failed_connects++;
+      return SESSION_E_ALLOC;
+    }
   test->new_session_index = s->session_index;
   test->connection = (transport_connection_t) {
     .c_index = 0,
@@ -4097,6 +4482,11 @@ http_test_h3_connect_stream (transport_endpoint_cfg_t *tep, session_t *s, u32 *c
   };
   /* The stream-opening caller has not attached the transport connection yet. */
   s->session_state = SESSION_STATE_CREATED;
+  if (test->initializing)
+    {
+      *conn_index = 0;
+      return 0;
+    }
   test->retired_contexts = wrk->ctx_pool;
   wrk->ctx_pool = pool_dup_aligned (wrk->ctx_pool, CLIB_CACHE_LINE_BYTES);
   test->retired_sessions = swrk->sessions;
@@ -4121,6 +4511,11 @@ static int
 http_test_h3_attribute (u32 index, clib_thread_index_t thread_index, u8 is_get,
 			transport_endpt_attr_t *attr)
 {
+  if (is_get && attr->type == TRANSPORT_ENDPT_ATTR_APP_PROTO_ERR_CODE)
+    {
+      attr->app_proto_err_code = http_test_h3_lifecycle->peer_error_code;
+      return 0;
+    }
   if (is_get || attr->type != TRANSPORT_ENDPT_ATTR_APP_PROTO_ERR_CODE_RX ||
       attr->app_proto_err_code_rx != HTTP3_ERROR_NO_ERROR)
     return -1;
@@ -4166,7 +4561,231 @@ http_test_h3_take_reuse_rpc (session_worker_t *wrk, u32 session_index, session_e
 }
 
 static int
-http_test_h3_streaming_lifecycle_case (vlib_main_t *vm, u8 queue_data)
+http_test_h3_stream_closed (vlib_main_t *vm, http_test_h3_lifecycle_t *test, http_ctx_t *req,
+			    http_ctx_t *stream, session_t *as, session_t *ts, u8 cleanup_first)
+{
+  static const struct
+  {
+    const char *name;
+    http_req_state_t state;
+    u64 error_code;
+    u8 ignored;
+    u8 after_fin;
+    u8 tx_pending;
+    http_req_flags_t flags;
+  } tests[] = {
+    { "idle NO_ERROR", HTTP_REQ_STATE_WAIT_APP_METHOD, HTTP3_ERROR_NO_ERROR, 1 },
+    { "idle REQUEST_REJECTED", HTTP_REQ_STATE_WAIT_APP_METHOD, HTTP3_ERROR_REQUEST_REJECTED, 1 },
+    { "idle INTERNAL_ERROR", HTTP_REQ_STATE_WAIT_APP_METHOD, HTTP3_ERROR_INTERNAL_ERROR },
+    { "active NO_ERROR", HTTP_REQ_STATE_WAIT_TRANSPORT_REPLY, HTTP3_ERROR_NO_ERROR },
+    { "active REQUEST_REJECTED", HTTP_REQ_STATE_WAIT_TRANSPORT_REPLY,
+      HTTP3_ERROR_REQUEST_REJECTED },
+    { "active cancellation after FIN", HTTP_REQ_STATE_TRANSPORT_IO_MORE_STREAMING_DATA,
+      HTTP3_ERROR_NO_ERROR, 0, 1 },
+    { "idle NO_ERROR after upload", HTTP_REQ_STATE_WAIT_APP_METHOD, HTTP3_ERROR_NO_ERROR, 1, 0, 0,
+      HTTP_REQ_F_TX_STREAMING | HTTP_REQ_F_TX_EOF },
+    { "idle REQUEST_REJECTED after upload", HTTP_REQ_STATE_WAIT_APP_METHOD,
+      HTTP3_ERROR_REQUEST_REJECTED, 1, 0, 0, HTTP_REQ_F_TX_STREAMING | HTTP_REQ_F_TX_EOF },
+    { "upload NO_ERROR after known-length response", HTTP_REQ_STATE_WAIT_APP_METHOD,
+      HTTP3_ERROR_NO_ERROR, 0, 0, 1 },
+    { "upload REQUEST_REJECTED after known-length response", HTTP_REQ_STATE_WAIT_APP_METHOD,
+      HTTP3_ERROR_REQUEST_REJECTED, 0, 0, 1 },
+    { "upload REQUEST_REJECTED after known-length response FIN", HTTP_REQ_STATE_WAIT_APP_METHOD,
+      HTTP3_ERROR_REQUEST_REJECTED, 0, 1, 1 },
+    { "upload NO_ERROR after known-length response FIN", HTTP_REQ_STATE_WAIT_APP_METHOD,
+      HTTP3_ERROR_NO_ERROR, 0, 1, 1 },
+  };
+  application_t *app = application_get (test->hm->app_index);
+  app_worker_t *app_wrk = application_get_default_worker (app);
+  session_event_t *saved_events = app_wrk->wrk_evts[vm->thread_index];
+  u32 saved_app_wrk = as->app_wrk_index;
+  http_ctx_t *parent =
+    pool_elt_at_index (test->hm->wrk[vm->thread_index].ctx_pool, stream->hc_http_conn_index);
+  http_worker_t *wrk = &test->hm->wrk[vm->thread_index];
+  session_worker_t *swrk = &session_main.wrk[vm->thread_index];
+  u32 as_index = as->session_index, stream_index = stream->hc_hc_index;
+  u32 req_index = ((http_req_handle_t) req->hr_req_handle).req_index;
+  u32 parent_index = parent->hc_hc_index;
+  u32 saved_heads[3] = {}, heads[3] = {};
+  u8 isolated_queues = 0;
+  session_evt_elt_t *head, *elt;
+  session_t *parent_ts;
+  vlib_node_t *node;
+  void (*init_tx_buffer) (http_ctx_t *, const http_msg_t *) =
+    vlib_get_plugin_symbol ("http_plugin.so", "http_req_tx_buffer_init");
+  http_msg_t msg = { .data.type = HTTP_MSG_DATA_STREAMING };
+  session_event_t event;
+  int result = 1;
+
+#define CLOSED_TEST(_cond, _comment)                                                               \
+  do                                                                                               \
+    {                                                                                              \
+      if (!HTTP_TEST_I ((_cond), _comment))                                                        \
+	goto done;                                                                                 \
+    }                                                                                              \
+  while (0)
+
+  /* The lifecycle fixture holds the worker barrier. Capture notifications so
+   * the real HTTP app never receives events for these synthetic sessions. */
+  app_wrk->wrk_evts[vm->thread_index] = 0;
+  as->app_wrk_index = app_wrk->wrk_index;
+  CLOSED_TEST (init_tx_buffer != 0, "stream-reset TX buffer initialization resolved");
+  for (u32 is_parent = 0; is_parent < 2; is_parent++)
+    for (u32 i = 0; i < ARRAY_LEN (tests); i++)
+      {
+	session_state_t initial_state = tests[i].after_fin && !tests[i].tx_pending ?
+					  SESSION_STATE_TRANSPORT_CLOSING :
+					  SESSION_STATE_READY;
+	vlib_cli_output (vm, "%s request: %s", is_parent ? "parent" : "child", tests[i].name);
+	http_buffer_free (&req->tx_buf);
+	req->tx_buf.vft = 0;
+	stream->state = HTTP_CONN_STATE_ESTABLISHED;
+	req->req_state = tests[i].state;
+	req->req_flags = tests[i].flags | (is_parent ? HTTP_REQ_F_IS_PARENT : 0) |
+			 (tests[i].after_fin ?
+			    HTTP_REQ_F_PEER_CLOSED | HTTP_REQ_F_RX_EOF | HTTP_REQ_F_TX_STREAMING :
+			    0);
+	if (tests[i].tx_pending)
+	  {
+	    req->req_flags |= HTTP_REQ_F_RX_HEADERS_RECEIVED | HTTP_REQ_F_RX_EOF;
+	    init_tx_buffer (req, &msg);
+	    CLOSED_TEST (req->tx_buf.vft && !svm_fifo_max_dequeue (as->tx_fifo) &&
+			   !svm_fifo_max_dequeue (ts->tx_fifo) &&
+			   !(req->req_flags & HTTP_REQ_F_TX_EOF),
+			 "upload awaits producer EOF with empty application and QUIC TX FIFOs");
+	  }
+	req->c_flags &= ~TRANSPORT_CONNECTION_F_ERROR;
+	as->session_state = initial_state;
+	ts->flags = SESSION_F_APP_CLOSED;
+	test->peer_error_code = tests[i].error_code;
+	/* QUIC suppresses reset_notify after FIN, so exercise full-close
+	 * delivery alone in that case. Other cases receive reset then closed. */
+	if (!tests[i].after_fin)
+	  app->cb_fns.session_reset_callback (ts);
+	CLOSED_TEST (as->session_state == (tests[i].ignored || tests[i].after_fin ?
+					     initial_state :
+					     SESSION_STATE_TRANSPORT_CLOSED),
+		     "reset notification preserves idle sessions and fails active requests");
+	app->cb_fns.session_transport_closed_callback (ts);
+	CLOSED_TEST (as->session_state ==
+		       (tests[i].ignored ? SESSION_STATE_READY : SESSION_STATE_TRANSPORT_CLOSED),
+		     "full closure preserves ignored idle resets but reaches active requests");
+	CLOSED_TEST (
+	  !!(req->req_flags & HTTP_REQ_F_APP_CLOSED) == (is_parent && !tests[i].ignored),
+	  "terminal parent ownership is finalized without closing idle or child requests");
+	CLOSED_TEST (parent->state == HTTP_CONN_STATE_ESTABLISHED &&
+		       stream->http_req_index ==
+			 ((http_req_handle_t) req->hr_req_handle).req_index &&
+		       req->hr_hc_index == stream->hc_hc_index,
+		     "stream closure preserves the parent connection and request association");
+	if (tests[i].ignored)
+	  CLOSED_TEST (clib_fifo_elts (app_wrk->wrk_evts[vm->thread_index]) == 0,
+		       "idle stream reset queues no application close or reset notification");
+	else
+	  {
+	    u8 closing_notification = !tests[i].after_fin || tests[i].tx_pending;
+	    CLOSED_TEST (
+	      clib_fifo_elts (app_wrk->wrk_evts[vm->thread_index]) ==
+		(closing_notification ? 2 : 1),
+	      "active stream cancellation queues the expected application notifications");
+	    if (closing_notification)
+	      {
+		clib_fifo_sub1 (app_wrk->wrk_evts[vm->thread_index], event);
+		CLOSED_TEST (
+		  event.event_type ==
+		    (tests[i].tx_pending ? SESSION_CTRL_EVT_DISCONNECTED : SESSION_CTRL_EVT_RESET),
+		  "completed response is preserved while upload cancellation reaches app");
+	      }
+	    clib_fifo_sub1 (app_wrk->wrk_evts[vm->thread_index], event);
+	    CLOSED_TEST (event.event_type == SESSION_CTRL_EVT_TRANSPORT_CLOSED,
+			 "active request receives full closure even after receive EOF");
+	  }
+      }
+
+  /* The last case is a streaming parent cancelled after response FIN. Drive
+   * its real session-node close confirmation in both cleanup orderings. */
+  parent->hc_parent_req_index = req_index;
+  parent->hc_http_conn_index = parent_index;
+  parent->timer_handle = ~0; /* No timer was allocated for this mock connection. */
+  parent_ts = session_get_from_handle (parent->hc_tc_session_handle);
+  parent_ts->opaque =
+    ((http_conn_handle_t) { .version = HTTP_VERSION_3, .conn_index = parent_index }).as_u32;
+  saved_heads[0] = swrk->ctrl_head;
+  saved_heads[1] = swrk->new_head;
+  saved_heads[2] = swrk->old_head;
+  for (u32 i = 0; i < ARRAY_LEN (heads); i++)
+    heads[i] = clib_llist_make_head (swrk->event_elts, evt_list);
+  swrk->ctrl_head = heads[0];
+  swrk->new_head = heads[1];
+  swrk->old_head = heads[2];
+  isolated_queues = 1;
+  if (cleanup_first)
+    app->cb_fns.session_cleanup_callback (ts, SESSION_CLEANUP_SESSION);
+  node = vlib_get_node (vm, session_queue_node.index);
+  session_half_close (as, 0 /* is_rx */);
+  node->function (vm, vlib_node_get_runtime (vm, node->index), 0);
+  CLOSED_TEST (as->session_state == SESSION_STATE_TRANSPORT_CLOSED && req->tx_buf.vft &&
+		 !(as->flags & SESSION_F_APP_CLOSED),
+	       "late producer EOF is ignored after upload cancellation, even after stream cleanup");
+  session_close (as);
+  node->function (vm, vlib_node_get_runtime (vm, node->index), 0);
+  CLOSED_TEST (as->session_state == SESSION_STATE_CLOSED && (as->flags & SESSION_F_APP_CLOSED),
+	       "session node confirms application close after full transport closure");
+  if (!cleanup_first)
+    app->cb_fns.session_cleanup_callback (ts, SESSION_CLEANUP_SESSION);
+  CLOSED_TEST (pool_is_free_index (wrk->ctx_pool, stream_index) &&
+		 req->hr_hc_index == parent_index && parent->state == HTTP_CONN_STATE_CLOSED,
+	       "stream cleanup retires the stream and disconnects the terminal parent");
+  app->cb_fns.session_cleanup_callback (parent_ts, SESSION_CLEANUP_SESSION);
+  CLOSED_TEST (pool_is_free_index (wrk->ctx_pool, req_index) &&
+		 pool_is_free_index (wrk->ctx_pool, parent_index),
+	       "connection cleanup releases the parent request and connection contexts");
+  CLOSED_TEST (as->session_state == SESSION_STATE_TRANSPORT_DELETED &&
+		 clib_fifo_elts (app_wrk->wrk_evts[vm->thread_index]) == 2,
+	       "parent deletion queues transport and session cleanup after application close");
+  clib_fifo_sub1 (app_wrk->wrk_evts[vm->thread_index], event);
+  CLOSED_TEST (event.event_type == SESSION_CTRL_EVT_CLEANUP &&
+		 event.as_u64[0] >> 32 == SESSION_CLEANUP_TRANSPORT,
+	       "application transport cleanup precedes session cleanup");
+  clib_fifo_sub1 (app_wrk->wrk_evts[vm->thread_index], event);
+  CLOSED_TEST (event.event_type == SESSION_CTRL_EVT_CLEANUP &&
+		 event.as_u64[0] >> 32 == SESSION_CLEANUP_SESSION && event.as_u64[1],
+	       "application session cleanup carries the session destructor");
+  /* The fixture owns its private FIFO segment; as->rx_fifo is null. */
+  uword_to_pointer (event.as_u64[1], void (*) (session_t *)) (as);
+  CLOSED_TEST (pool_is_free_index (swrk->sessions, as_index),
+	       "application session is released after parent cancellation");
+  result = 0;
+
+done:
+  if (isolated_queues)
+    {
+      for (u32 i = 0; i < ARRAY_LEN (heads); i++)
+	{
+	  head = clib_llist_elt (swrk->event_elts, heads[i]);
+	  while (!clib_llist_is_empty (swrk->event_elts, evt_list, head))
+	    {
+	      elt = clib_llist_next (swrk->event_elts, evt_list, head);
+	      clib_llist_remove (swrk->event_elts, evt_list, elt);
+	      clib_llist_put (swrk->event_elts, elt);
+	    }
+	  clib_llist_put (swrk->event_elts, head);
+	}
+      swrk->ctrl_head = saved_heads[0];
+      swrk->new_head = saved_heads[1];
+      swrk->old_head = saved_heads[2];
+    }
+  clib_fifo_free (app_wrk->wrk_evts[vm->thread_index]);
+  app_wrk->wrk_evts[vm->thread_index] = saved_events;
+  if (!pool_is_free_index (swrk->sessions, as_index))
+    session_get (as_index, vm->thread_index)->app_wrk_index = saved_app_wrk;
+  return result;
+#undef CLOSED_TEST
+}
+
+static int
+http_test_h3_streaming_lifecycle_case (vlib_main_t *vm, u8 queue_data, u8 cleanup_first, u8 head,
+				       u8 fail_reuse)
 {
   http_test_h3_lifecycle_t test = { .new_session_index = ~0 };
   session_enable_disable_args_t session_args = { .is_en = 1 };
@@ -4179,7 +4798,9 @@ http_test_h3_streaming_lifecycle_case (vlib_main_t *vm, u8 queue_data)
   transport_proto_vft_t saved_quic;
   const transport_proto_vft_t *vft;
   fifo_segment_t *fs = 0;
-  svm_fifo_t *app_fifo = 0, *transport_fifo = 0;
+  svm_fifo_t *app_fifo = 0, *app_rx_fifo = 0, *transport_fifo = 0, *transport_rx_fifo = 0;
+  app_worker_t *app_wrk = 0;
+  session_event_t *saved_events = 0;
   http_worker_t *wrk = 0;
   session_worker_t *swrk = 0;
   session_tx_context_t saved_tx_ctx = {};
@@ -4195,6 +4816,7 @@ http_test_h3_streaming_lifecycle_case (vlib_main_t *vm, u8 queue_data)
   http_msg_t msg = { .data.type = HTTP_MSG_DATA_STREAMING };
   clib_error_t *error;
   u32 parent_index = ~0, stream_index = ~0, req_index = ~0, as_index = ~0, ts_index = ~0;
+  u32 parent_session_index = ~0;
   u8 body[] = { 'b', 'o', 'd', 'y' }, frame[6], mocked = 0, tx_scheduled = 0;
   int result = 1, n_tx_packets = 0;
 
@@ -4222,6 +4844,12 @@ http_test_h3_streaming_lifecycle_case (vlib_main_t *vm, u8 queue_data)
   app_fifo = fifo_segment_alloc_fifo_w_slice (fs, 0, 4096, FIFO_SEGMENT_TX_FIFO);
   transport_fifo = fifo_segment_alloc_fifo_w_slice (fs, 0, 4096, FIFO_SEGMENT_TX_FIFO);
   H3_TEST (app_fifo && transport_fifo, "HTTP/3 lifecycle FIFOs allocated");
+  if (head)
+    {
+      app_rx_fifo = fifo_segment_alloc_fifo_w_slice (fs, 0, 4096, FIFO_SEGMENT_RX_FIFO);
+      transport_rx_fifo = fifo_segment_alloc_fifo_w_slice (fs, 0, 4096, FIFO_SEGMENT_RX_FIFO);
+      H3_TEST (app_rx_fifo && transport_rx_fifo, "HTTP/3 HEAD receive FIFOs allocated");
+    }
   as = session_alloc (vm->thread_index);
   as_index = as->session_index;
   ts = session_alloc (vm->thread_index);
@@ -4235,6 +4863,7 @@ http_test_h3_streaming_lifecycle_case (vlib_main_t *vm, u8 queue_data)
   as->session_type = session_type_from_proto_and_ip (TRANSPORT_PROTO_HTTP, 1 /* is_ip4 */);
   as->app_wrk_index = APP_INVALID_INDEX;
   as->tx_fifo = app_fifo;
+  as->rx_fifo = app_rx_fifo;
   ts->session_state = SESSION_STATE_TRANSPORT_DELETED;
   ts->session_type = session_type_from_proto_and_ip (TRANSPORT_PROTO_QUIC, 1);
   ts->app_wrk_index =
@@ -4271,14 +4900,9 @@ http_test_h3_streaming_lifecycle_case (vlib_main_t *vm, u8 queue_data)
   handle.req_index = req_index;
   as->connection_index = req->hr_req_handle = handle.as_u32;
   req->hr_hc_index = stream_index;
+  req->c_flags = TRANSPORT_CONNECTION_F_NO_LOOKUP;
   req->c_s_index = as_index;
   req->c_thread_index = vm->thread_index;
-  req->req_state = HTTP_REQ_STATE_WAIT_APP_METHOD;
-  req->req_flags = HTTP_REQ_F_RX_HEADERS_RECEIVED | HTTP_REQ_F_RX_EOF | HTTP_REQ_F_PEER_CLOSED |
-		   (queue_data ? HTTP_REQ_F_TX_EOF : 0);
-  init_tx_buffer (req, &msg);
-  H3_TEST (svm_fifo_enqueue (app_fifo, sizeof (body), body) == sizeof (body),
-	   "final upload bytes queued after a completed known-length response");
   test.app_session_index = as_index;
   test.old_stream_index = stream_index;
   vft = &tp_vfts[TRANSPORT_PROTO_HTTP];
@@ -4289,6 +4913,110 @@ http_test_h3_streaming_lifecycle_case (vlib_main_t *vm, u8 queue_data)
   tp_vfts[TRANSPORT_PROTO_QUIC].attribute = http_test_h3_attribute;
   http_test_h3_lifecycle = &test;
   mocked = 1;
+  if (head)
+    {
+      session_endpoint_cfg_t sep = { .parent_handle = session_handle (as) };
+      http_conn_handle_t stream_handle = { .version = HTTP_VERSION_3 };
+      /* Initialize the real client RX handler without relocating the pools yet. */
+      test.initializing = 1;
+      H3_TEST (!vft->connect_stream ((transport_endpoint_cfg_t *) &sep, 0, &handle.as_u32),
+	       "HTTP/3 HEAD client stream initialized");
+      test.initializing = 0;
+      pool_put_index (wrk->ctx_pool, req_index);
+      pool_put_index (wrk->ctx_pool, stream_index);
+      req_index = handle.req_index;
+      req = pool_elt_at_index (wrk->ctx_pool, req_index);
+      stream_index = req->hr_hc_index;
+      stream = pool_elt_at_index (wrk->ctx_pool, stream_index);
+      parent_session_index = ts_index;
+      ts_index = test.new_session_index;
+      test.new_session_index = ~0;
+      test.old_stream_index = stream_index;
+      ts = session_get (ts_index, vm->thread_index);
+      segment_manager_dealloc_fifos (ts->rx_fifo, ts->tx_fifo);
+      ts->rx_fifo = transport_rx_fifo;
+      ts->tx_fifo = transport_fifo;
+      ts->session_state = SESSION_STATE_TRANSPORT_DELETED;
+      ts->flags = SESSION_F_APP_CLOSED;
+      stream_handle.conn_index = stream_index;
+      ts->opaque = stream_handle.as_u32;
+    }
+  as = pool_elt_at_index (session_main.wrk[vm->thread_index].sessions, as_index);
+  handle.req_index = req_index;
+  as->connection_index = req->hr_req_handle = handle.as_u32;
+  req->hr_hc_index = stream_index;
+  req->c_flags = TRANSPORT_CONNECTION_F_NO_LOOKUP;
+  req->c_s_index = as_index;
+  req->c_thread_index = vm->thread_index;
+  req->req_state = HTTP_REQ_STATE_WAIT_APP_METHOD;
+  req->req_flags = HTTP_REQ_F_RX_HEADERS_RECEIVED | HTTP_REQ_F_RX_EOF | HTTP_REQ_F_PEER_CLOSED |
+		   (queue_data ? HTTP_REQ_F_TX_EOF : 0);
+  if (!fail_reuse)
+    {
+      init_tx_buffer (req, &msg);
+      H3_TEST (svm_fifo_enqueue (app_fifo, sizeof (body), body) == sizeof (body),
+	       "final upload bytes queued after a completed known-length response");
+    }
+  if (head)
+    {
+      const u8 headers[] = "content-length42";
+      http_msg_t reply;
+      session_event_t event;
+
+      app_wrk = application_get_default_worker (application_get (test.hm->app_index));
+      saved_events = app_wrk->wrk_evts[vm->thread_index];
+      app_wrk->wrk_evts[vm->thread_index] = 0;
+      as->app_wrk_index = app_wrk->wrk_index;
+      req->method = HTTP_REQ_HEAD;
+      req->status_code = HTTP_STATUS_OK;
+      req->body_len = 42;
+      req->control_data_len = req->headers_len = sizeof (headers) - 1;
+      H3_TEST (!http_stage_bodyless_reply (req, headers) && !svm_fifo_max_dequeue (app_rx_fifo),
+	       "completed HEAD headers remain unpublished before FIN");
+      req->req_state = HTTP_REQ_STATE_TRANSPORT_IO_MORE_DATA;
+      req->req_flags &= ~(HTTP_REQ_F_RX_EOF | HTTP_REQ_F_PEER_CLOSED);
+      test.fail_connect = fail_reuse;
+      application_get (test.hm->app_index)->cb_fns.session_disconnect_callback (ts);
+      req = pool_elt_at_index (wrk->ctx_pool, req_index);
+      stream = pool_elt_at_index (wrk->ctx_pool, stream_index);
+      as = session_get (as_index, vm->thread_index);
+      H3_TEST (!(req->req_flags & HTTP_REQ_F_RX_REPLY_PENDING) &&
+		 svm_fifo_dequeue (app_rx_fifo, sizeof (reply), (u8 *) &reply) == sizeof (reply) &&
+		 reply.type == HTTP_MSG_REPLY && reply.code == HTTP_STATUS_OK &&
+		 reply.data.body_len == 42 && reply.data.len == sizeof (headers) - 1,
+	       "HEAD FIN publishes the valid response even when replacement stream opening fails");
+      u8 received[sizeof (headers) - 1];
+      H3_TEST (svm_fifo_dequeue (app_rx_fifo, sizeof (received), received) == sizeof (received) &&
+		 !memcmp (received, headers, sizeof (received)) &&
+		 !svm_fifo_max_dequeue (app_rx_fifo),
+	       "published HEAD response contains exact headers and no body bytes");
+      H3_TEST (clib_fifo_elts (app_wrk->wrk_evts[vm->thread_index]) == (fail_reuse ? 3 : 1),
+	       "HEAD completion queues RX before any reuse failure notifications");
+      clib_fifo_sub1 (app_wrk->wrk_evts[vm->thread_index], event);
+      H3_TEST (event.event_type == SESSION_IO_EVT_RX && event.session_index == as_index,
+	       "application receives the completed HEAD reply first");
+      as->rx_fifo = 0;
+      if (fail_reuse)
+	{
+	  clib_fifo_sub1 (app_wrk->wrk_evts[vm->thread_index], event);
+	  H3_TEST (event.event_type == SESSION_CTRL_EVT_RESET,
+		   "replacement failure follows RX with session reset");
+	  clib_fifo_sub1 (app_wrk->wrk_evts[vm->thread_index], event);
+	  H3_TEST (
+	    event.event_type == SESSION_CTRL_EVT_TRANSPORT_CLOSED &&
+	      as->session_state == SESSION_STATE_TRANSPORT_CLOSED && test.failed_connects == 1 &&
+	      !req->tx_buf.vft && stream->http_req_index == SESSION_INVALID_INDEX,
+	    "failed replacement leaves the completed session closed and its old stream detached");
+	  result = 0;
+	  goto done;
+	}
+      H3_TEST (
+	!test.retired_contexts && !test.retired_sessions && req->hr_hc_index == stream_index &&
+	  req->tx_buf.vft && (req->req_flags & HTTP_REQ_F_RX_EOF) &&
+	  req->req_state == HTTP_REQ_STATE_WAIT_APP_METHOD &&
+	  svm_fifo_max_dequeue (app_fifo) == sizeof (body),
+	"HEAD response FIN preserves the original stream and pending upload, marking RX EOF");
+    }
   swrk = &session_main.wrk[vm->thread_index];
   saved_tx_ctx = swrk->ctx;
   clib_llist_get (swrk->event_elts, elt);
@@ -4364,7 +5092,7 @@ http_test_h3_streaming_lifecycle_case (vlib_main_t *vm, u8 queue_data)
 	   "replacement stream retains its own transport after pool relocation");
   if (!queue_data)
     {
-      result = 0;
+      result = http_test_h3_stream_closed (vm, &test, req, stream, as, ts, cleanup_first);
       goto done;
     }
   as->session_state = SESSION_STATE_TRANSPORT_DELETED;
@@ -4391,6 +5119,11 @@ http_test_h3_streaming_lifecycle_case (vlib_main_t *vm, u8 queue_data)
   result = 0;
 
 done:
+  if (app_wrk)
+    {
+      clib_fifo_free (app_wrk->wrk_evts[vm->thread_index]);
+      app_wrk->wrk_evts[vm->thread_index] = saved_events;
+    }
   if (swrk)
     {
       http_test_h3_take_reuse_rpc (swrk, as_index, 0);
@@ -4427,20 +5160,21 @@ done:
 	    }
 	}));
     }
-  if (as_index != ~0)
+  if (as_index != ~0 && !pool_is_free_index (session_main.wrk[vm->thread_index].sessions, as_index))
     session_get_from_handle (session_make_handle (as_index, vm->thread_index))->session_state =
       SESSION_STATE_TRANSPORT_DELETED;
-  if (req_index != ~0)
+  if (req_index != ~0 && !pool_is_free_index (wrk->ctx_pool, req_index))
     {
       req = pool_elt_at_index (wrk->ctx_pool, req_index);
       http_buffer_free (&req->tx_buf);
-      if (req->hr_hc_index != stream_index)
+      if (req->hr_hc_index != stream_index && req->hr_hc_index != parent_index &&
+	  !pool_is_free_index (wrk->ctx_pool, req->hr_hc_index))
 	pool_put_index (wrk->ctx_pool, req->hr_hc_index);
       pool_put_index (wrk->ctx_pool, req_index);
     }
-  if (stream_index != ~0)
+  if (stream_index != ~0 && !pool_is_free_index (wrk->ctx_pool, stream_index))
     pool_put_index (wrk->ctx_pool, stream_index);
-  if (parent_index != ~0)
+  if (parent_index != ~0 && !pool_is_free_index (wrk->ctx_pool, parent_index))
     pool_put_index (wrk->ctx_pool, parent_index);
   if (wrk)
     wrk->stats = saved_stats;
@@ -4450,10 +5184,12 @@ done:
       segment_manager_dealloc_fifos (ts->rx_fifo, ts->tx_fifo);
       session_free (ts);
     }
-  if (as_index != ~0)
+  if (as_index != ~0 && !pool_is_free_index (session_main.wrk[vm->thread_index].sessions, as_index))
     session_free (session_get (as_index, vm->thread_index));
   if (ts_index != ~0)
     session_free (session_get (ts_index, vm->thread_index));
+  if (parent_session_index != ~0)
+    session_free (session_get (parent_session_index, vm->thread_index));
   if (mocked)
     {
       tp_vfts[TRANSPORT_PROTO_QUIC] = saved_quic;
@@ -4464,8 +5200,12 @@ done:
   pool_free (test.retired_sessions);
   if (app_fifo)
     fifo_segment_free_fifo (fs, app_fifo);
+  if (app_rx_fifo)
+    fifo_segment_free_fifo (fs, app_rx_fifo);
   if (transport_fifo)
     fifo_segment_free_fifo (fs, transport_fifo);
+  if (transport_rx_fifo)
+    fifo_segment_free_fifo (fs, transport_rx_fifo);
   if (fs)
     fifo_segment_delete (&fsm, fs);
   vec_free (args.new_segment_indices);
@@ -4476,8 +5216,12 @@ done:
 static int
 http_test_h3_streaming_lifecycle (vlib_main_t *vm)
 {
-  return http_test_h3_streaming_lifecycle_case (vm, 0) ||
-	 http_test_h3_streaming_lifecycle_case (vm, 1);
+  return http_test_h3_streaming_lifecycle_case (vm, 0, 0, 0, 0) ||
+	 http_test_h3_streaming_lifecycle_case (vm, 0, 1, 0, 0) ||
+	 http_test_h3_streaming_lifecycle_case (vm, 1, 0, 0, 0) ||
+	 http_test_h3_streaming_lifecycle_case (vm, 0, 0, 1, 0) ||
+	 http_test_h3_streaming_lifecycle_case (vm, 1, 0, 1, 0) ||
+	 http_test_h3_streaming_lifecycle_case (vm, 0, 0, 1, 1);
 }
 
 static int
@@ -4715,6 +5459,512 @@ http_test_decode_varint (vlib_main_t *vm)
   return 0;
 }
 
+static int
+http_test_listener_metadata (vlib_main_t *vm)
+{
+  session_enable_disable_args_t session_args = { .is_en = 1 };
+  session_endpoint_cfg_t sep = SESSION_ENDPOINT_CFG_NULL;
+  fifo_segment_main_t fsm = {};
+  fifo_segment_create_args_t args = {
+    .segment_type = SSVM_SEGMENT_PRIVATE,
+    .segment_size = 1 << 20,
+    .segment_name = "http-listener-metadata",
+  };
+  const transport_proto_vft_t *vft = &tp_vfts[TRANSPORT_PROTO_HTTP];
+  http_listener_metadata_t **metadata = 0;
+  session_handle_t *connections = 0,
+		   streams[2] = { SESSION_INVALID_HANDLE, SESSION_INVALID_HANDLE };
+  session_handle_t listener = SESSION_INVALID_HANDLE, tcp_listener, parent_handle;
+  session_cb_vft_t callbacks = {};
+  http_main_t *hm;
+  http_ctx_t *lhc, *hc;
+  session_t *s;
+  fifo_segment_t *fs = 0;
+  svm_fifo_t *fifo = 0;
+  transport_endpt_ext_cfg_t *ext_cfg;
+  transport_endpt_cfg_http_t http_cfg = { .timeout = 60, .h3_alt_svc_port = 8443 };
+  http_wrk_stats_t saved_stats = {};
+  clib_error_t *error;
+  u32 lhc_index = SESSION_INVALID_INDEX;
+  clib_thread_index_t ti = 0;
+  int result = 1;
+  u8 barrier = 0, stats_saved = 0;
+
+#define METADATA_TEST(_cond, _comment)                                                             \
+  do                                                                                               \
+    {                                                                                              \
+      if (!HTTP_TEST_I ((_cond), _comment))                                                        \
+	goto done;                                                                                 \
+    }                                                                                              \
+  while (0)
+
+  hm = vlib_get_plugin_symbol ("http_plugin.so", "http_main");
+  METADATA_TEST (hm != 0, "HTTP main resolved for listener metadata");
+  error = vnet_session_enable_disable (vm, &session_args);
+  if (error)
+    {
+      clib_error_report (error);
+      return 1;
+    }
+  callbacks = application_get (hm->app_index)->cb_fns;
+  sep.is_ip4 = 1;
+  sep.transport_proto = TRANSPORT_PROTO_HTTP;
+  sep.app_wrk_index = application_get_default_worker (application_get (hm->app_index))->wrk_index;
+  ext_cfg = session_endpoint_add_ext_cfg (&sep, TRANSPORT_ENDPT_EXT_CFG_HTTP, sizeof (http_cfg));
+  clib_memcpy (ext_cfg->data, &http_cfg, sizeof (http_cfg));
+  fifo_segment_main_init (&fsm, 0, 5);
+  METADATA_TEST (!fifo_segment_create (&fsm, &args), "listener metadata test segment allocated");
+  fs = fifo_segment_get_segment (&fsm, args.new_segment_indices[0]);
+  fifo = fifo_segment_alloc_fifo_w_slice (fs, 0, 4096, FIFO_SEGMENT_TX_FIFO);
+  METADATA_TEST (fifo != 0, "listener metadata test FIFO allocated");
+
+  /* Exercise worker pools while their owners are stopped. The fixture uses
+   * real HTTP callbacks without attaching its synthetic transport sessions. */
+  vlib_worker_thread_barrier_sync (vm);
+  barrier = 1;
+  s = listen_session_alloc (0, session_type_from_proto_and_ip (TRANSPORT_PROTO_HTTP, 1));
+  listener = session_handle (s);
+  lhc_index = vft->start_listen (s->session_index, (transport_endpoint_cfg_t *) &sep);
+  METADATA_TEST (lhc_index != SESSION_INVALID_INDEX, "HTTP listener created");
+  lhc = (http_ctx_t *) vft->get_listener (lhc_index);
+  metadata = vec_dup (lhc->hl_metadata_by_thread);
+  METADATA_TEST (vec_len (metadata) == vec_len (hm->wrk), "each HTTP worker has listener metadata");
+  tcp_listener =
+    session_handle (app_listener_get_session (app_listener_get_w_handle (lhc->hc_tl_handle_tcp)));
+  for (u32 i = 0; i < vec_len (metadata); i++)
+    {
+      METADATA_TEST (metadata[i]->refcnt == 1 && !((uword) metadata[i] % CLIB_CACHE_LINE_BYTES) &&
+		       (!i || (metadata[i]->app_name != metadata[0]->app_name &&
+			       metadata[i]->h3_alt_svc_port != metadata[0]->h3_alt_svc_port)),
+		     "worker metadata has a listener reference and private cache-aligned storage");
+      s = session_alloc (i);
+      s->listener_handle = tcp_listener;
+      s->session_type = session_type_from_proto_and_ip (TRANSPORT_PROTO_TCP, 1);
+      s->tx_fifo = fifo;
+      vec_add1 (connections, session_handle (s));
+      METADATA_TEST (!callbacks.session_accept_callback (s), "HTTP connection accepted");
+      s = session_get_from_handle (connections[i]);
+      hc = pool_elt_at_index (hm->wrk[i].ctx_pool, ((http_conn_handle_t) s->opaque).conn_index);
+      METADATA_TEST (hc->hc_listener_metadata == metadata[i] && metadata[i]->refcnt == 2 &&
+		       hc->app_name == metadata[i]->app_name,
+		     "accepted connection references its worker's metadata");
+    }
+
+  ti = vec_len (hm->wrk) - 1;
+  saved_stats = hm->wrk[ti].stats;
+  stats_saved = 1;
+  parent_handle = connections[ti];
+  s = session_get_from_handle (parent_handle);
+  /* Reuse the accepted context as a QUIC parent; unidirectional stream
+   * acceptance needs no app session or QUIC handshake. */
+  s->session_type = session_type_from_proto_and_ip (TRANSPORT_PROTO_QUIC, 1);
+  hc = pool_elt_at_index (hm->wrk[ti].ctx_pool, ((http_conn_handle_t) s->opaque).conn_index);
+  hc->version = HTTP_VERSION_3;
+  hc->hc_parent_req_index = SESSION_INVALID_INDEX;
+  for (u32 i = 0; i < ARRAY_LEN (streams); i++)
+    {
+      s = session_alloc (ti);
+      s->listener_handle = parent_handle;
+      s->session_type = session_type_from_proto_and_ip (TRANSPORT_PROTO_QUIC, 1);
+      s->flags = SESSION_F_STREAM | SESSION_F_UNIDIRECTIONAL;
+      s->tx_fifo = fifo;
+      streams[i] = session_handle (s);
+      METADATA_TEST (!callbacks.session_accept_callback (s), "HTTP/3 stream accepted");
+      METADATA_TEST (metadata[ti]->refcnt == 3, "HTTP/3 stream owns an independent reference");
+      if (!i)
+	{
+	  METADATA_TEST (!vft->stop_listen (lhc_index),
+			 "HTTP listener stopped with live connections");
+	  lhc_index = SESSION_INVALID_INDEX;
+	  METADATA_TEST (metadata[ti]->refcnt == 2, "unlisten drops only the listener reference");
+	}
+    }
+
+  callbacks.session_cleanup_callback (session_get_from_handle (parent_handle),
+				      SESSION_CLEANUP_SESSION);
+  session_free (session_get_from_handle (parent_handle));
+  connections[ti] = SESSION_INVALID_HANDLE;
+  METADATA_TEST (metadata[ti]->refcnt == 2, "streams retain metadata after parent cleanup");
+  for (u32 i = 0; i < ARRAY_LEN (streams); i++)
+    {
+      s = session_get_from_handle (streams[i]);
+      hc = pool_elt_at_index (hm->wrk[ti].ctx_pool, ((http_conn_handle_t) s->opaque).conn_index);
+      METADATA_TEST (
+	vec_is_equal (hc->app_name, application_get (hm->app_index)->name) &&
+	  vec_len (hc->hc_h3_alt_svc_port) == sizeof ("h3=\":8443\"") - 1 &&
+	  !memcmp (hc->hc_h3_alt_svc_port, "h3=\":8443\"", sizeof ("h3=\":8443\"") - 1),
+	"server name and Alt-Svc remain valid after unlisten and parent cleanup");
+      callbacks.session_cleanup_callback (s, SESSION_CLEANUP_SESSION);
+      session_free (session_get_from_handle (streams[i]));
+      streams[i] = SESSION_INVALID_HANDLE;
+    }
+  result = 0;
+
+done:
+  for (u32 i = 0; i < ARRAY_LEN (streams); i++)
+    if (streams[i] != SESSION_INVALID_HANDLE)
+      {
+	s = session_get_from_handle (streams[i]);
+	/* coverity[forward_null] - streams are only set after callbacks is initialized */
+	callbacks.session_cleanup_callback (s, SESSION_CLEANUP_SESSION);
+	session_free (session_get_from_handle (streams[i]));
+      }
+  for (u32 i = 0; i < vec_len (connections); i++)
+    if (connections[i] != SESSION_INVALID_HANDLE)
+      {
+	s = session_get_from_handle (connections[i]);
+	callbacks.session_cleanup_callback (s, SESSION_CLEANUP_SESSION);
+	session_free (session_get_from_handle (connections[i]));
+      }
+  if (lhc_index != SESSION_INVALID_INDEX)
+    vft->stop_listen (lhc_index);
+  if (listener != SESSION_INVALID_HANDLE)
+    listen_session_free (session_get_from_handle (listener));
+  if (stats_saved)
+    hm->wrk[ti].stats = saved_stats;
+  if (barrier)
+    vlib_worker_thread_barrier_release (vm);
+  if (fifo)
+    fifo_segment_free_fifo (fs, fifo);
+  if (fs)
+    fifo_segment_delete (&fsm, fs);
+  session_endpoint_free_ext_cfgs (&sep);
+  vec_free (args.new_segment_indices);
+  vec_free (connections);
+  vec_free (metadata);
+  return result;
+#undef METADATA_TEST
+}
+
+static int
+http_test_reply_framing (vlib_main_t *vm)
+{
+  const struct
+  {
+    const char *name;
+    http_req_method_t method;
+    http_status_code_t status;
+    http_msg_data_type_t type;
+    u64 body_len;
+    http_req_flags_t flags;
+    u8 valid;
+    http_reply_framing_t expected;
+  } cases[] = {
+    { "fixed GET", HTTP_REQ_GET, HTTP_STATUS_OK, HTTP_MSG_DATA_INLINE, 42, 0, 1, { 1, 0, 1 } },
+    { "empty GET", HTTP_REQ_GET, HTTP_STATUS_OK, HTTP_MSG_DATA_INLINE, 0, 0, 1, { 0, 0, 1 } },
+    { "streamed GET", HTTP_REQ_GET, HTTP_STATUS_OK, HTTP_MSG_DATA_STREAMING, 0, 0, 1, { 1, 1, 0 } },
+    { "pointer GET", HTTP_REQ_GET, HTTP_STATUS_OK, HTTP_MSG_DATA_PTR, 42, 0, 1, { 1, 0, 1 } },
+    { "fixed HEAD", HTTP_REQ_HEAD, HTTP_STATUS_OK, HTTP_MSG_DATA_INLINE, 42, 0, 1, { 0, 0, 1 } },
+    { "empty HEAD", HTTP_REQ_HEAD, HTTP_STATUS_OK, HTTP_MSG_DATA_INLINE, 0, 0, 1, { 0, 0, 1 } },
+    { "pointer HEAD", HTTP_REQ_HEAD, HTTP_STATUS_OK, HTTP_MSG_DATA_PTR, 42, 0, 1, { 0, 0, 1 } },
+    { "large HEAD",
+      HTTP_REQ_HEAD,
+      HTTP_STATUS_OK,
+      HTTP_MSG_DATA_PTR,
+      CLIB_U64_MAX - 1,
+      0,
+      1,
+      { 0, 0, 1 } },
+    { "maximum HEAD",
+      HTTP_REQ_HEAD,
+      HTTP_STATUS_OK,
+      HTTP_MSG_DATA_INLINE,
+      CLIB_U64_MAX,
+      0,
+      1,
+      { 0, 0, 1 } },
+    { "maximum pointer HEAD 304",
+      HTTP_REQ_HEAD,
+      HTTP_STATUS_NOT_MODIFIED,
+      HTTP_MSG_DATA_PTR,
+      CLIB_U64_MAX,
+      0,
+      1,
+      { 0, 0, 1 } },
+    { "unknown HEAD",
+      HTTP_REQ_HEAD,
+      HTTP_STATUS_OK,
+      HTTP_MSG_DATA_STREAMING,
+      0,
+      0,
+      1,
+      { 0, 0, 0 } },
+    { "unknown HEAD 304",
+      HTTP_REQ_HEAD,
+      HTTP_STATUS_NOT_MODIFIED,
+      HTTP_MSG_DATA_STREAMING,
+      0,
+      0,
+      1,
+      { 0, 0, 0 } },
+    { "fixed HEAD 304",
+      HTTP_REQ_HEAD,
+      HTTP_STATUS_NOT_MODIFIED,
+      HTTP_MSG_DATA_INLINE,
+      42,
+      0,
+      1,
+      { 0, 0, 1 } },
+    { "pointer HEAD 304",
+      HTTP_REQ_HEAD,
+      HTTP_STATUS_NOT_MODIFIED,
+      HTTP_MSG_DATA_PTR,
+      42,
+      0,
+      1,
+      { 0, 0, 1 } },
+    { "fixed GET 304",
+      HTTP_REQ_GET,
+      HTTP_STATUS_NOT_MODIFIED,
+      HTTP_MSG_DATA_INLINE,
+      42,
+      0,
+      1,
+      { 0, 0, 1 } },
+    { "streamed GET 304",
+      HTTP_REQ_GET,
+      HTTP_STATUS_NOT_MODIFIED,
+      HTTP_MSG_DATA_STREAMING,
+      0,
+      0,
+      0,
+      {} },
+    { "HEAD 204",
+      HTTP_REQ_HEAD,
+      HTTP_STATUS_NO_CONTENT,
+      HTTP_MSG_DATA_INLINE,
+      0,
+      0,
+      1,
+      { 0, 0, 0 } },
+    { "unknown HEAD 204",
+      HTTP_REQ_HEAD,
+      HTTP_STATUS_NO_CONTENT,
+      HTTP_MSG_DATA_STREAMING,
+      0,
+      0,
+      1,
+      { 0, 0, 0 } },
+    { "GET 204", HTTP_REQ_GET, HTTP_STATUS_NO_CONTENT, HTTP_MSG_DATA_INLINE, 0, 0, 1, { 0, 0, 0 } },
+    { "nonempty GET 204",
+      HTTP_REQ_GET,
+      HTTP_STATUS_NO_CONTENT,
+      HTTP_MSG_DATA_INLINE,
+      42,
+      0,
+      0,
+      {} },
+    { "nonempty HEAD 204",
+      HTTP_REQ_HEAD,
+      HTTP_STATUS_NO_CONTENT,
+      HTTP_MSG_DATA_INLINE,
+      42,
+      0,
+      0,
+      {} },
+    { "streamed GET 204",
+      HTTP_REQ_GET,
+      HTTP_STATUS_NO_CONTENT,
+      HTTP_MSG_DATA_STREAMING,
+      0,
+      0,
+      0,
+      {} },
+    { "GET 205",
+      HTTP_REQ_GET,
+      HTTP_STATUS_RESET_CONTENT,
+      HTTP_MSG_DATA_INLINE,
+      0,
+      0,
+      1,
+      { 0, 0, 1 } },
+    { "nonempty GET 205",
+      HTTP_REQ_GET,
+      HTTP_STATUS_RESET_CONTENT,
+      HTTP_MSG_DATA_INLINE,
+      42,
+      0,
+      0,
+      {} },
+    { "streamed GET 205",
+      HTTP_REQ_GET,
+      HTTP_STATUS_RESET_CONTENT,
+      HTTP_MSG_DATA_STREAMING,
+      0,
+      0,
+      0,
+      {} },
+    { "informational",
+      HTTP_REQ_GET,
+      HTTP_STATUS_EARLY_HINTS,
+      HTTP_MSG_DATA_INLINE,
+      0,
+      0,
+      1,
+      { 0, 0, 0 } },
+    { "nonempty informational",
+      HTTP_REQ_HEAD,
+      HTTP_STATUS_EARLY_HINTS,
+      HTTP_MSG_DATA_INLINE,
+      42,
+      0,
+      0,
+      {} },
+    { "streamed informational",
+      HTTP_REQ_HEAD,
+      HTTP_STATUS_EARLY_HINTS,
+      HTTP_MSG_DATA_STREAMING,
+      0,
+      0,
+      0,
+      {} },
+    { "nonzero unknown length",
+      HTTP_REQ_HEAD,
+      HTTP_STATUS_OK,
+      HTTP_MSG_DATA_STREAMING,
+      42,
+      0,
+      0,
+      {} },
+    { "CONNECT",
+      HTTP_REQ_CONNECT,
+      HTTP_STATUS_OK,
+      HTTP_MSG_DATA_INLINE,
+      0,
+      HTTP_REQ_F_IS_TUNNEL,
+      1,
+      { 0, 0, 0 } },
+    { "CONNECT 201",
+      HTTP_REQ_CONNECT,
+      HTTP_STATUS_CREATED,
+      HTTP_MSG_DATA_PTR,
+      0,
+      HTTP_REQ_F_IS_TUNNEL,
+      1,
+      { 0, 0, 0 } },
+    { "CONNECT-UDP",
+      HTTP_REQ_CONNECT_UDP,
+      HTTP_STATUS_SWITCHING_PROTOCOLS,
+      HTTP_MSG_DATA_INLINE,
+      0,
+      HTTP_REQ_F_IS_TUNNEL,
+      1,
+      { 0, 0, 0 } },
+    { "streamed CONNECT",
+      HTTP_REQ_CONNECT,
+      HTTP_STATUS_OK,
+      HTTP_MSG_DATA_STREAMING,
+      0,
+      HTTP_REQ_F_IS_TUNNEL,
+      0,
+      {} },
+    { "nonempty CONNECT",
+      HTTP_REQ_CONNECT,
+      HTTP_STATUS_OK,
+      HTTP_MSG_DATA_INLINE,
+      42,
+      HTTP_REQ_F_IS_TUNNEL,
+      0,
+      {} },
+    { "failed CONNECT",
+      HTTP_REQ_CONNECT,
+      HTTP_STATUS_BAD_GATEWAY,
+      HTTP_MSG_DATA_INLINE,
+      42,
+      HTTP_REQ_F_IS_TUNNEL,
+      1,
+      { 1, 0, 1 } },
+    { "streamed failed CONNECT",
+      HTTP_REQ_CONNECT,
+      HTTP_STATUS_BAD_GATEWAY,
+      HTTP_MSG_DATA_STREAMING,
+      0,
+      HTTP_REQ_F_IS_TUNNEL,
+      1,
+      { 1, 1, 0 } },
+  };
+
+  void (*serialize[2]) (u8 *, u32, hpack_response_control_data_t *, u8 **);
+  http2_error_t (*parse_h2) (u8 *, u32, u8 *, u32, hpack_response_control_data_t *,
+			     http_field_line_t **, hpack_dynamic_table_t *);
+  http3_error_t (*parse_h3) (u8 *, u32, u8 *, u32, hpack_response_control_data_t *,
+			     http_field_line_t **, qpack_decoder_ctx_t *);
+  void (*table_init) (hpack_dynamic_table_t *, u32);
+  void (*table_free) (hpack_dynamic_table_t *);
+  serialize[0] = vlib_get_plugin_symbol ("http_plugin.so", "hpack_serialize_response");
+  serialize[1] = vlib_get_plugin_symbol ("http_plugin.so", "qpack_serialize_response");
+  parse_h2 = vlib_get_plugin_symbol ("http_plugin.so", "hpack_parse_response");
+  parse_h3 = vlib_get_plugin_symbol ("http_plugin.so", "qpack_parse_response");
+  table_init = vlib_get_plugin_symbol ("http_plugin.so", "hpack_dynamic_table_init");
+  table_free = vlib_get_plugin_symbol ("http_plugin.so", "hpack_dynamic_table_free");
+
+  for (u32 i = 0; i < ARRAY_LEN (cases); i++)
+    {
+      http_ctx_t req = { .method = cases[i].method, .req_flags = cases[i].flags };
+      http_msg_t msg = {
+	.type = HTTP_MSG_REPLY,
+	.code = cases[i].status,
+	.data = { .type = cases[i].type, .body_len = cases[i].body_len },
+      };
+      http_reply_framing_t framing;
+      int rv = http_reply_get_framing (&req, &msg, &framing);
+
+      HTTP_TEST ((rv == 0) == cases[i].valid, "%s: validity", cases[i].name);
+      if (cases[i].valid)
+	HTTP_TEST (framing.has_body == cases[i].expected.has_body &&
+		     framing.streaming == cases[i].expected.streaming &&
+		     framing.send_content_length == cases[i].expected.send_content_length,
+		   "%s: payload and Content-Length framing", cases[i].name);
+      HTTP_TEST (msg.data.body_len == cases[i].body_len && msg.data.type == cases[i].type &&
+		   msg.code == cases[i].status,
+		 "%s: message metadata preserved", cases[i].name);
+
+      if (cases[i].valid && cases[i].method == HTTP_REQ_HEAD)
+	for (u32 qpack = 0; qpack < 2; qpack++)
+	  {
+	    u8 *encoded = 0, *expected = format (0, "%llu", msg.data.body_len);
+	    u8 decoded_headers[512];
+	    http_field_line_t *headers = 0;
+	    hpack_response_control_data_t decoded;
+	    hpack_response_control_data_t control_data = {
+	      .sc = msg.code,
+	      .content_len = msg.data.body_len,
+	      .send_content_length = framing.send_content_length,
+	      .server_name = (u8 *) "http unit tests",
+	      .server_name_len = sizeof ("http unit tests") - 1,
+	      .date = (u8 *) "Mon, 21 Oct 2013 20:13:21 GMT",
+	      .date_len = sizeof ("Mon, 21 Oct 2013 20:13:21 GMT") - 1,
+	    };
+	    hpack_dynamic_table_t table;
+	    qpack_decoder_ctx_t decoder = {};
+	    table_init (&table, 4096);
+	    serialize[qpack](0, 0, &control_data, &encoded);
+	    u32 parse_rv = qpack ?
+			     parse_h3 (encoded, vec_len (encoded), decoded_headers,
+				       sizeof (decoded_headers), &decoded, &headers, &decoder) :
+			     parse_h2 (encoded, vec_len (encoded), decoded_headers,
+				       sizeof (decoded_headers), &decoded, &headers, &table);
+	    u8 ok = parse_rv == (qpack ? HTTP3_ERROR_NO_ERROR : HTTP2_ERROR_NO_ERROR) &&
+		    decoded.sc == msg.code &&
+		    (decoded.content_len_header_index != (uword) ~0) == framing.send_content_length;
+	    if (ok && framing.send_content_length)
+	      {
+		http_field_line_t *field =
+		  vec_elt_at_index (headers, decoded.content_len_header_index);
+		ok = field->value_len == vec_len (expected) &&
+		     !memcmp (decoded.headers + field->value_offset, expected, vec_len (expected));
+	      }
+	    table_free (&table);
+	    vec_free (encoded);
+	    vec_free (expected);
+	    vec_free (headers);
+	    HTTP_TEST (ok, "%s: %s serializes Content-Length presence and full u64 value",
+		       cases[i].name, qpack ? "QPACK" : "HPACK");
+	  }
+    }
+  return 0;
+}
+
 static clib_error_t *
 test_http_command_fn (vlib_main_t *vm, unformat_input_t *input,
 		      vlib_cli_command_t *cmd)
@@ -4722,8 +5972,12 @@ test_http_command_fn (vlib_main_t *vm, unformat_input_t *input,
   int res = 0;
   while (unformat_check_input (input) != UNFORMAT_END_OF_INPUT)
     {
-      if (unformat (input, "parse-authority"))
+      if (unformat (input, "reply-framing"))
+	res = http_test_reply_framing (vm);
+      else if (unformat (input, "parse-authority"))
 	res = http_test_parse_authority (vm);
+      else if (unformat (input, "path-iter"))
+	res = http_test_path_iter (vm);
       else if (unformat (input, "parse-masque-host-port"))
 	res = http_test_parse_masque_host_port (vm);
       else if (unformat (input, "udp-payload-datagram"))
@@ -4766,8 +6020,14 @@ test_http_command_fn (vlib_main_t *vm, unformat_input_t *input,
 	res = http_test_streaming_lifecycle (vm);
       else if (unformat (input, "decode-varint"))
 	res = http_test_decode_varint (vm);
+      else if (unformat (input, "listener-metadata"))
+	res = http_test_listener_metadata (vm);
       else if (unformat (input, "all"))
 	{
+	  if ((res = http_test_reply_framing (vm)))
+	    goto done;
+	  if ((res = http_test_listener_metadata (vm)))
+	    goto done;
 	  if ((res = http_test_rx_publication (vm)))
 	    goto done;
 	  if ((res = http_test_streaming_lifecycle (vm)))
@@ -4775,6 +6035,8 @@ test_http_command_fn (vlib_main_t *vm, unformat_input_t *input,
 	  if ((res = http_test_decode_varint (vm)))
 	    goto done;
 	  if ((res = http_test_parse_authority (vm)))
+	    goto done;
+	  if ((res = http_test_path_iter (vm)))
 	    goto done;
 	  if ((res = http_test_parse_masque_host_port (vm)))
 	    goto done;

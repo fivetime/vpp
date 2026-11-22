@@ -104,14 +104,6 @@ typedef enum http_req_state_ : u8
     HTTP_REQ_N_STATES
 } http_req_state_t;
 
-typedef enum http_target_form_ : u8
-{
-  HTTP_TARGET_ORIGIN_FORM,
-  HTTP_TARGET_ABSOLUTE_FORM,
-  HTTP_TARGET_AUTHORITY_FORM,
-  HTTP_TARGET_ASTERISK_FORM
-} http_target_form_t;
-
 #define foreach_http_req_flags                                                                     \
   _ (APP_CLOSED, "app-closed")                                                                     \
   _ (SHUTDOWN_TUNNEL, "shutdown-tunnel")                                                           \
@@ -128,7 +120,8 @@ typedef enum http_target_form_ : u8
   _ (RX_PROCESSING, "rx-processing")                                                               \
   _ (RX_HEADERS_RECEIVED, "rx-headers-received")                                                   \
   _ (RX_TRAILERS, "rx-trailers")                                                                   \
-  _ (TX_CANCELLED, "tx-cancelled")
+  _ (TX_CANCELLED, "tx-cancelled")                                                                 \
+  _ (RX_REPLY_PENDING, "rx-reply-pending")
 
 typedef enum http_req_flags_bit_
 {
@@ -138,7 +131,7 @@ typedef enum http_req_flags_bit_
     HTTP_REQ_N_F_BITS
 } http_req_flags_bit_t;
 
-typedef enum http_req_flags_ : u16
+typedef enum http_req_flags_ : u32
 {
 #define _(sym, str) HTTP_REQ_F_##sym = 1 << HTTP_REQ_F_BIT_##sym,
   foreach_http_req_flags
@@ -326,6 +319,15 @@ typedef enum
 
 STATIC_ASSERT (HTTP2_RX_EXPECT_STATE_NUM <= 4, "no more than 4 http2 rx expect states allowed");
 
+typedef struct
+{
+  CLIB_CACHE_LINE_ALIGN_MARK (cacheline0);
+  /* Each worker owns its count, listener references are dropped under the barrier. */
+  u32 refcnt;
+  u8 *app_name;
+  u8 *h3_alt_svc_port;
+} http_listener_metadata_t;
+
 typedef struct http_ctx_
 {
   union
@@ -360,7 +362,14 @@ typedef struct http_ctx_
       u32 timer_handle;
       u8 *app_name;
       u8 *host;
-      u8 *h3_alt_svc_port;
+      union
+      {
+	http_listener_metadata_t *metadata;
+	http_listener_metadata_t **metadata_by_thread;
+      } listener_data;
+#define hc_listener_metadata  listener_data.metadata
+#define hl_metadata_by_thread listener_data.metadata_by_thread
+#define hc_h3_alt_svc_port    listener_data.metadata->h3_alt_svc_port
       http_conn_settings_t peer_settings;
       http_conn_settings_t settings;
       union
@@ -395,6 +404,7 @@ typedef struct http_ctx_
 	  u32 http_req_index;
 	  qpack_decoder_ctx_t qpack_decoder_ctx;
 	  u64 peer_max_push_id; /* HTTP_INVALID_VARINT until MAX_PUSH_ID is received */
+	  u64 peer_goaway_id;	/* HTTP_INVALID_VARINT until GOAWAY is received */
 	};
       };
     };
@@ -409,11 +419,8 @@ typedef struct http_ctx_
 	u64 to_recv; /* remaining bytes of body to receive from transport */
 	http_capsule_rx_ctx_t capsule_ctx_rx;
       };
-      union
-      {
-	http_status_code_t status_code;
-	http_req_method_t method;
-      };
+      http_status_code_t status_code;
+      http_req_method_t method;
       http_req_state_t req_state; /* state-machine state */
       http_req_flags_t req_flags;
       http_upgrade_proto_t upgrade_proto;
@@ -484,6 +491,44 @@ typedef struct http_ctx_
     };
   };
 } http_ctx_t;
+
+typedef struct
+{
+  u8 has_body;
+  u8 streaming;
+  u8 send_content_length;
+} http_reply_framing_t;
+
+/* Representation length is independent of payload buffering and EOF handling. */
+always_inline int
+http_reply_get_framing (const http_ctx_t *req, const http_msg_t *msg, http_reply_framing_t *f)
+{
+  const u8 head = req->method == HTTP_REQ_HEAD;
+  const u8 unknown_length = msg->data.type == HTTP_MSG_DATA_STREAMING;
+  const u8 informational = msg->code < HTTP_STATUS_OK;
+  const u8 no_content = msg->code == HTTP_STATUS_NO_CONTENT;
+  const u8 reset_content = msg->code == HTTP_STATUS_RESET_CONTENT;
+  const u8 not_modified = msg->code == HTTP_STATUS_NOT_MODIFIED;
+  const u8 bodyless_status = informational || no_content || reset_content || not_modified;
+  const u8 tunnel = (req->req_flags & HTTP_REQ_F_IS_TUNNEL) &&
+		    ((msg->code >= HTTP_STATUS_OK && msg->code < HTTP_STATUS_MULTIPLE_CHOICES) ||
+		     msg->code == HTTP_STATUS_SWITCHING_PROTOCOLS);
+
+  *f = (http_reply_framing_t) {};
+  if (tunnel)
+    return unknown_length || msg->data.body_len ? -1 : 0;
+
+  if ((unknown_length || informational || no_content || reset_content) && msg->data.body_len)
+    return -1;
+  /* Unknown-length HEAD responses carry no payload, including status 304. */
+  if (unknown_length && bodyless_status && (!head || informational))
+    return -1;
+
+  f->streaming = unknown_length && !head;
+  f->has_body = !head && !bodyless_status && (f->streaming || msg->data.body_len);
+  f->send_content_length = !unknown_length && !informational && !no_content;
+  return 0;
+}
 
 #define http_ctx_is_stream(_hc)                                                                    \
   ((_hc)->flags & (HTTP_CONN_F_UNIDIRECTIONAL_STREAM | HTTP_CONN_F_BIDIRECTIONAL_STREAM))
@@ -573,6 +618,7 @@ typedef struct http_engine_vft_
   void (*transport_conn_reschedule_callback) (http_ctx_t *hc);
   int (*transport_stream_accept_callback) (http_ctx_t *stream, http_ctx_t *hc);
   void (*transport_stream_close_callback) (http_ctx_t *stream);
+  void (*transport_stream_closed_callback) (http_ctx_t *stream);
   void (*transport_stream_reset_callback) (http_ctx_t *stream);
   void (*conn_accept_callback) (http_ctx_t *hc);
   int (*conn_connect_stream_callback) (http_ctx_t *hc, u32 *req_index); /* optional */
@@ -881,23 +927,106 @@ http_get_app_msg (http_ctx_t *req, http_msg_t *msg, u8 peek)
   ASSERT (rv == sizeof (*msg));
 }
 
-always_inline void
-http_identify_optional_query (http_ctx_t *req, u8 *rx_buf)
+typedef struct
 {
-  int i;
-  for (i = req->target_path_offset;
-       i < (req->target_path_offset + req->target_path_len); i++)
+  u8 *host;
+  u32 host_len;
+  u32 port;
+  u8 has_port;
+  u8 is_ip6;
+  ip6_address_t ip6;
+} http_target_authority_t;
+
+/* Validate the authority on the wire and retain its components for comparison. */
+always_inline u8
+http_target_authority_parse (u8 *value, u32 len, u8 require_port, u8 allow_userinfo,
+			     http_target_authority_t *out)
+{
+  u8 *p, *end, *host = value;
+  clib_memset (out, 0, sizeof (*out));
+  if (!len)
+    return 0;
+  end = value + len;
+  p = memchr (value, '@', len);
+  if (p)
     {
-      if (rx_buf[i] == '?')
+      if (!allow_userinfo ||
+	  http_validate_uri_component (value, p - value, HTTP_URI_COMPONENT_USERINFO, 0))
+	return 0;
+      host = p + 1;
+    }
+  if (host == end)
+    return 0;
+  if (*host == '[')
+    {
+      u8 *close = memchr (host, ']', end - host);
+      if (!close || close - host < 3)
+	return 0;
+      p = host + 1;
+      if (*p == 'v' || *p == 'V')
 	{
-	  req->target_query_offset = i + 1;
-	  req->target_query_len = req->target_path_offset +
-				  req->target_path_len -
-				  req->target_query_offset;
-	  req->target_path_len =
-	    req->target_path_len - req->target_query_len - 1;
-	  break;
+	  /* IPvFuture = 'v' 1*HEXDIG '.' 1*(unreserved / sub-delims / ':') */
+	  u8 *version = ++p;
+	  while (p < close && isxdigit (*p))
+	    p++;
+	  if (p == version || p == close || *p++ != '.' || p == close)
+	    return 0;
+	  for (; p < close; p++)
+	    if (!http_uri_reg_name_char_is_valid (*p) && *p != ':')
+	      return 0;
 	}
+      else
+	{
+	  if (_http_parse_ip6 (&p, close, &out->ip6) || p != close)
+	    return 0;
+	  out->is_ip6 = 1;
+	}
+      out->host_len = close + 1 - host;
+      p = close + 1;
+    }
+  else
+    {
+      p = memchr (host, ':', end - host);
+      if (!p)
+	p = end;
+      out->host_len = p - host;
+      if (!out->host_len ||
+	  http_validate_uri_component (host, out->host_len, HTTP_URI_COMPONENT_REG_NAME, 0))
+	return 0;
+    }
+  out->host = host;
+  if (p != end)
+    {
+      if (*p++ != ':')
+	return 0;
+      out->has_port = p != end;
+      if (out->has_port)
+	{
+	  u16 port;
+	  if (_http_parse_port (&p, end, &port) || p != end)
+	    return 0;
+	  out->port = clib_net_to_host_u16 (port);
+	}
+    }
+  return !require_port || out->has_port;
+}
+
+always_inline void
+http_set_target_path (http_ctx_t *req, const u8 *rx_buf, const u8 *path, u32 len, u32 query_offset)
+{
+  req->target_path_offset = req->target_path_len = 0;
+  req->target_query_offset = req->target_query_len = 0;
+  if (!len)
+    return;
+
+  u32 path_offset = path - rx_buf;
+  u8 leading_slash = path[0] == '/';
+  req->target_path_offset = path_offset + leading_slash;
+  req->target_path_len = query_offset - leading_slash;
+  if (query_offset < len)
+    {
+      req->target_query_offset = path_offset + query_offset + 1;
+      req->target_query_len = len - query_offset - 1;
     }
 }
 
@@ -1059,6 +1188,53 @@ http_io_as_rx_publish (http_ctx_t *req, const http_msg_t *msg, u32 len)
 	}
     }
   svm_fifo_enqueue_nocopy (as->rx_fifo, sizeof (*msg) + len);
+  return 0;
+}
+
+/* Stage bodyless reply headers until END_STREAM/FIN has been handled. */
+always_inline int
+http_stage_bodyless_reply (http_ctx_t *req, const u8 *headers)
+{
+  svm_fifo_seg_t segs[2];
+  u32 copied = 0;
+  int n_segs;
+
+  if (http_io_as_max_write (req) < sizeof (http_msg_t) + req->control_data_len)
+    return -1;
+  while (copied < req->control_data_len)
+    {
+      n_segs = http_io_as_rx_provision (req, sizeof (http_msg_t) + copied, segs, ARRAY_LEN (segs),
+					req->control_data_len - copied);
+      if (n_segs <= 0)
+	return -1;
+      for (int i = 0; i < n_segs; i++)
+	{
+	  clib_memcpy_fast (segs[i].data, headers + copied, segs[i].len);
+	  copied += segs[i].len;
+	}
+    }
+  req->req_flags |= HTTP_REQ_F_RX_REPLY_PENDING;
+  return 0;
+}
+
+always_inline int
+http_publish_bodyless_reply (http_ctx_t *req)
+{
+  http_msg_t msg = {};
+
+  ASSERT (req->req_flags & HTTP_REQ_F_RX_REPLY_PENDING);
+  msg.type = HTTP_MSG_REPLY;
+  msg.code = req->status_code;
+  msg.data.type = HTTP_MSG_DATA_INLINE;
+  msg.data.len = req->control_data_len;
+  msg.data.headers_offset = req->headers_offset;
+  msg.data.headers_len = req->headers_len;
+  msg.data.headers_ctx = pointer_to_uword (req->headers);
+  msg.data.body_offset = req->control_data_len;
+  msg.data.body_len = req->body_len;
+  if (http_io_as_rx_publish (req, &msg, req->control_data_len))
+    return -1;
+  req->req_flags &= ~HTTP_REQ_F_RX_REPLY_PENDING;
   return 0;
 }
 

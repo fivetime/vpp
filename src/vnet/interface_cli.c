@@ -61,7 +61,16 @@ show_or_clear_hw_interfaces (vlib_main_t * vm,
 
       /* See if user wants to show an interface with a specific hw_if_index. */
       else if (unformat (line_input, "%u", &hw_if_index))
-	vec_add1 (hw_if_indices, hw_if_index);
+	{
+	  /* validate here: the name sort and the clear path index directly */
+	  if (!vnet_get_hw_interface_or_null (vnm, hw_if_index))
+	    {
+	      error = clib_error_return (0, "unknown interface index %u", hw_if_index);
+	      unformat_free (line_input);
+	      goto done;
+	    }
+	  vec_add1 (hw_if_indices, hw_if_index);
+	}
 
       else if (unformat (line_input, "verbose"))
 	verbose = 1;		/* this is also the default */
@@ -107,24 +116,30 @@ skip_unformat:
       vlib_cli_output (vm, "%U\n", format_vnet_hw_interface, vnm, 0, verbose);
       for (i = 0; i < vec_len (hw_if_indices); i++)
 	{
-	  hi = vnet_get_hw_interface (vnm, hw_if_indices[i]);
+	  /* not under the barrier: re-validate each index */
+	  hi = vnet_get_hw_interface_or_null (vnm, hw_if_indices[i]);
+	  if (!hi)
+	    continue;
 	  if (show_bond == 0)	/* show all interfaces */
 	    vlib_cli_output (vm, "%U\n", format_vnet_hw_interface, vnm,
 			     hi, verbose);
 	  else if ((hi->bond_info) &&
 		   (hi->bond_info != VNET_HW_INTERFACE_BOND_INFO_SLAVE))
 	    {			/* show only bonded interface and all its slave interfaces */
+	      /* snapshot: hi may not survive a CLI output (pager) */
+	      uword *bond_info = clib_bitmap_dup (hi->bond_info);
 	      int hw_idx;
 	      vnet_hw_interface_t *shi;
 	      vlib_cli_output (vm, "%U\n", format_vnet_hw_interface, vnm,
 			       hi, verbose);
 
-	      clib_bitmap_foreach (hw_idx, hi->bond_info)
-               {
-                shi = vnet_get_hw_interface(vnm, hw_idx);
-                vlib_cli_output (vm, "%U\n",
-                                 format_vnet_hw_interface, vnm, shi, verbose);
-              }
+	      clib_bitmap_foreach (hw_idx, bond_info)
+		{
+		  shi = vnet_get_hw_interface_or_null (vnm, hw_idx);
+		  if (shi)
+		    vlib_cli_output (vm, "%U\n", format_vnet_hw_interface, vnm, shi, verbose);
+		}
+	      clib_bitmap_free (bond_info);
 	    }
 	}
     }
@@ -221,10 +236,12 @@ clear_hw_interfaces (vlib_main_t * vm,
 VLIB_CLI_COMMAND (show_hw_interfaces_command, static) = {
   .path = "show hardware-interfaces",
   .short_help = "show hardware-interfaces [brief|verbose|detail] [bond] "
-    "[<interface> [<interface> [..]]] [<sw_idx> [<sw_idx> [..]]]",
+		"[<interface> [<interface> [..]]] [<sw_idx> [<sw_idx> [..]]]",
   .function = show_hw_interfaces,
+  /* read-only; device format functions only do control-path queries that
+   * device processes already run on the main thread without the barrier */
+  .is_mp_safe = 1,
 };
-
 
 /*?
  * Clear the extended statistics for all or a list of given interfaces
@@ -2685,6 +2702,7 @@ show_interface_transceiver_output (vlib_main_t *vm, vnet_hw_interface_t *hi,
   vnet_interface_main_t *im = &vnm->interface_main;
   vnet_device_class_t *dc =
     vec_elt_at_index (im->device_classes, hi->dev_class_index);
+  u32 hw_if_index;
 
   if (!dc->eeprom_read_function)
     {
@@ -2693,8 +2711,14 @@ show_interface_transceiver_output (vlib_main_t *vm, vnet_hw_interface_t *hi,
       goto done;
     }
 
+  hw_if_index = hi->hw_if_index;
   error = dc->eeprom_read_function (vnm, hi, &eeprom);
   if (error)
+    goto done;
+
+  /* the read may have suspended this process */
+  hi = vnet_get_hw_interface_or_null (vnm, hw_if_index);
+  if (!hi)
     goto done;
 
   if (!eeprom)
@@ -2763,17 +2787,22 @@ show_interface_transceiver_output (vlib_main_t *vm, vnet_hw_interface_t *hi,
 		     format_sfp_eeprom_diagnostics, eeprom, is_terse);
 
 done:
+  if (error)
+    {
+      vlib_cli_output (vm, "%U", format_clib_error, error);
+      clib_error_free (error);
+    }
   if (eeprom)
     clib_mem_free (eeprom);
 }
 
 static clib_error_t *
-show_interface_transceiver (vlib_main_t *vm, unformat_input_t *input,
-			    vlib_cli_command_t *cmd)
+show_interface_transceiver (vlib_main_t *vm, unformat_input_t *input, vlib_cli_command_t *cmd)
 {
   vnet_main_t *vnm = vnet_get_main ();
   vnet_interface_main_t *im = &vnm->interface_main;
   u32 hw_if_index = (u32) ~0;
+  u32 *hw_if_indices = 0, *idx;
   vnet_hw_interface_t *hi;
   u8 is_terse = 1;
   u8 show_diag = 0;
@@ -2795,19 +2824,32 @@ show_interface_transceiver (vlib_main_t *vm, unformat_input_t *input,
 	;
       else
 	{
-	  return clib_error_return (0, "parse error: '%U'",
-				    format_unformat_error, input);
+	  return clib_error_return (0, "parse error: '%U'", format_unformat_error, input);
 	}
     }
 
-  pool_foreach (hi, im->hw_interfaces)
+  /*
+   * This command is mp-safe and the EEPROM read may suspend this process
+   * (slow I2C on some NICs), so interfaces may be created or deleted
+   * meanwhile: snapshot the indices and re-validate each one.
+   */
+  if (hw_if_index != ~0)
+    vec_add1 (hw_if_indices, hw_if_index);
+  else
+    pool_foreach (hi, im->hw_interfaces)
+      {
+	vnet_device_class_t *dc = vec_elt_at_index (im->device_classes, hi->dev_class_index);
+	if (dc->eeprom_read_function)
+	  vec_add1 (hw_if_indices, hi->hw_if_index);
+      }
+
+  vec_foreach (idx, hw_if_indices)
     {
-      if (hw_if_index == ~0 || hw_if_index == hi->hw_if_index)
-	{
-	  show_interface_transceiver_output (vm, hi, show_module, show_diag,
-					     show_eeprom, is_terse);
-	}
+      hi = vnet_get_hw_interface_or_null (vnm, *idx);
+      if (hi)
+	show_interface_transceiver_output (vm, hi, show_module, show_diag, show_eeprom, is_terse);
     }
+  vec_free (hw_if_indices);
   return 0;
 }
 
@@ -2825,6 +2867,9 @@ VLIB_CLI_COMMAND (cmd_show_interface_transceiver, static) = {
   .short_help = "show interface transceiver [<interface>] [module] [diag] "
 		"[eeprom] [verbose]",
   .function = show_interface_transceiver,
+  /* drivers must not block the main thread or need the barrier; dpdk
+   * reads asynchronously and suspends this process instead */
+  .is_mp_safe = 1,
 };
 
 static clib_error_t *

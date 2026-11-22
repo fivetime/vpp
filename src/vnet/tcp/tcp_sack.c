@@ -83,7 +83,6 @@ typedef enum
 {
   TCP_SB_SACK_OOO,
   TCP_SB_SACK_RXT,
-  TCP_SB_SACK_RXT_RESCUED,
 } tcp_sb_sack_mode_e;
 
 always_inline void
@@ -91,10 +90,10 @@ scoreboard_update_sacked (sack_scoreboard_t *sb, tcp_ack_ctx_t *ac, u32 start, u
 			  tcp_sb_sack_mode_e mode, u16 snd_mss)
 {
   /* A newly sacked segment below the sack frontier arrived out of order. Use it to grow the reorder
-   * estimate when its late arrival is unambiguous reordering. Segments below high_rxt (or after
-   * rescue has fired) are excluded because they're ambiguous */
+   * estimate when its late arrival is unambiguous reordering. In recovery, segments below the
+   * highest one retransmitted are excluded, as the sack may be for a copy */
   if (seq_lt (start, sb->high_sacked) &&
-      (mode == TCP_SB_SACK_OOO || (mode == TCP_SB_SACK_RXT && seq_geq (start, sb->high_rxt))))
+      (mode == TCP_SB_SACK_OOO || seq_geq (start, sb->rxt_frontier)))
     {
       u32 reord = (sb->high_sacked - start + snd_mss - 1) / snd_mss;
       reord = clib_min (reord, TCP_MAX_SACK_REORDER);
@@ -136,9 +135,13 @@ scoreboard_update_loss (sack_scoreboard_t *sb, u32 ack, u32 snd_mss, u8 clear_lo
 
   sb->lost_bytes = 0;
 
+  /* Without holes, bytes above ack are sacked only while reneging. Otherwise high_sacked can be
+   * stale, never set or left by an earlier sack episode, and may read above ack */
   right = scoreboard_last_hole (sb);
   if (!right)
-    return seq_gt (sb->high_sacked, ack) ? sb->high_sacked - ack : 0;
+    return tcp_scoreboard_is_reneging (sb) && seq_gt (sb->high_sacked, ack) ?
+	     sb->high_sacked - ack :
+	     0;
 
   if (seq_gt (sb->high_sacked, right->end))
     {
@@ -239,8 +242,9 @@ scoreboard_next_rxt_hole (sack_scoreboard_t * sb,
       return 0;
     }
 
-  /* Rule (1): if higher than rxt, less than high_sacked and lost */
-  if (hole->is_lost && seq_lt (hole->start, sb->high_sacked))
+  /* Rule (1): if higher than rxt and lost. SACK loss detection marks only
+   * holes below high_sacked lost, an rto or reneging also those above it */
+  if (hole->is_lost)
     {
       sb->cur_rxt_hole = scoreboard_hole_index (sb, hole);
     }
@@ -292,7 +296,9 @@ scoreboard_init_rxt (sack_scoreboard_t *sb, u32 snd_una)
       sb->cur_rxt_hole = sb->head;
     }
   sb->high_rxt = snd_una;
-  sb->rescue_rxt = snd_una - 1;
+  sb->rxt_frontier = snd_una;
+  /* No rescue before an ack passes the first retransmit (RFC 6675, 4.3) */
+  sb->rescue_rxt = snd_una;
 }
 
 static void
@@ -316,12 +322,25 @@ scoreboard_rxt_mark_lost (sack_scoreboard_t *sb, u32 snd_una, u32 snd_nxt)
       sb->tail = scoreboard_hole_index (sb, hole);
       sb->high_sacked = snd_una;
     }
+  else
+    {
+      /* The tail hole ends at snd_nxt as of the last ack. Cover data sent since */
+      hole = scoreboard_last_hole (sb);
+      if (seq_geq (hole->start, sb->high_sacked))
+	hole->end = snd_nxt;
+      else if (seq_lt (sb->high_sacked, snd_nxt))
+	scoreboard_insert_hole (sb, sb->tail, sb->high_sacked, snd_nxt);
+    }
 
-  if (hole->is_lost)
-    return;
-
-  hole->is_lost = 1;
-  sb->lost_bytes += scoreboard_hole_bytes (hole);
+  /* Every unsacked byte is lost */
+  sb->lost_bytes = 0;
+  hole = scoreboard_first_hole (sb);
+  while (hole)
+    {
+      hole->is_lost = 1;
+      sb->lost_bytes += scoreboard_hole_bytes (hole);
+      hole = scoreboard_next_hole (sb, hole);
+    }
 }
 
 void
@@ -403,6 +422,41 @@ tcp_sack_init_rxt (tcp_connection_t *tc, u32 snd_una)
     scoreboard_init_rxt (&tc->sack_sb, snd_una);
 }
 
+void
+tcp_sack_rxt_rewind (tcp_connection_t *tc)
+{
+  sack_scoreboard_t *sb = &tc->sack_sb;
+  u32 rescue_rxt = sb->rescue_rxt, rxt_frontier = sb->rxt_frontier;
+
+  /* Retransmit again from the first hole. A rescue already sent in this
+   * recovery stays sent. The frontier stays too, so sacks of the earlier
+   * copies still don't grow the reordering estimate */
+  scoreboard_init_rxt (sb, tc->snd_una);
+  sb->rescue_rxt = rescue_rxt;
+  sb->rxt_frontier = rxt_frontier;
+}
+
+u32
+tcp_sack_bytes_above (tcp_connection_t *tc, u32 seq)
+{
+  sack_scoreboard_t *sb = &tc->sack_sb;
+  sack_scoreboard_hole_t *hole = scoreboard_last_hole (sb);
+  u32 start, sacked = 0, end = sb->high_sacked;
+
+  /* Each sacked block ends at high_sacked or where a hole starts */
+  while (seq_gt (end, seq))
+    {
+      start = hole && seq_gt (hole->end, seq) ? hole->end : seq;
+      if (seq_lt (start, end))
+	sacked += end - start;
+      if (!hole)
+	break;
+      end = hole->start;
+      hole = scoreboard_prev_hole (sb, hole);
+    }
+  return sacked;
+}
+
 static u32
 scoreboard_rxt_head_bytes (sack_scoreboard_t *sb, u32 snd_una, u32 max_bytes)
 {
@@ -412,7 +466,8 @@ scoreboard_rxt_head_bytes (sack_scoreboard_t *sb, u32 snd_una, u32 max_bytes)
   hole = scoreboard_first_hole (sb);
   ASSERT (hole && hole->start == snd_una && seq_gt (hole->end, snd_una));
 
-  /* A lost hole ends where the hole for data sent after its rto starts */
+  /* Adjacent holes are one unsacked run, e.g., a lost hole and the one for
+   * data sent after its rto */
   while ((next = scoreboard_next_hole (sb, hole)) && next->start == hole->end)
     hole = next;
 
@@ -542,8 +597,12 @@ tcp_track_rxt (tcp_connection_t *tc, u32 start, u32 end)
 
   ASSERT (seq_lt (start, end));
 
+  /* The byte tracker marks the retransmitted samples. For the scoreboard, this copy makes later
+   * sacks of data up to its end ambiguous for reordering, see scoreboard_update_sacked */
   if (tc->cfg_flags & TCP_CFG_F_BYTE_TRACKER)
     tcp_bt_track_rxt (tc, start, end);
+  else
+    tc->sack_sb.rxt_frontier = seq_max (tc->sack_sb.rxt_frontier, end);
 
   /* All retransmissions add to the report budget, regardless of undo eligibility. */
   undo = &tc->dsack_undo;
@@ -795,9 +854,7 @@ tcp_scoreboard_apply_sacks (tcp_connection_t *tc, u32 ack, u32 high_sacked, tcp_
   sack_scoreboard_hole_t *hole, *next_hole;
   sack_scoreboard_t *sb = &tc->sack_sb;
   sack_block_t *blk, *rcv_sacks = tc->rcv_opts.sacks;
-  tcp_sb_sack_mode_e mode = !tcp_in_cong_recovery (tc)		  ? TCP_SB_SACK_OOO :
-			    seq_geq (sb->rescue_rxt, tc->snd_una) ? TCP_SB_SACK_RXT_RESCUED :
-								    TCP_SB_SACK_RXT;
+  tcp_sb_sack_mode_e mode = tcp_in_cong_recovery (tc) ? TCP_SB_SACK_RXT : TCP_SB_SACK_OOO;
   u32 blk_index = 0;
 
   if (sb->head == TCP_INVALID_SACK_HOLE_INDEX)
@@ -1010,174 +1067,84 @@ tcp_ack_handle_full_feedback (tcp_connection_t *tc, u32 packet_ack, u32 ack, tcp
     tcp_scoreboard_apply_ack (tc, ack, high_sacked, ac);
 }
 
-static u8
-tcp_sack_vector_is_sane (sack_block_t * sacks)
+void
+tcp_sack_add_slow (tcp_connection_t *tc, sack_block_t blk)
 {
-  int i;
-  for (i = 1; i < vec_len (sacks); i++)
-    {
-      if (sacks[i - 1].end == sacks[i].start)
-	return 0;
-    }
-  return 1;
-}
+  sack_block_t *kept = tcp_snd_kept_sacks (tc), next[TCP_OPTS_MAX_SACK_BLOCKS];
+  u32 i, n = 1;
 
-/* Queue [start, end), received again. A duplicate that touches the last one
- * extends it, others are reported in separate acks. Callers check that
- * reporting is enabled and that the range is not empty. */
-static __clib_noinline void
-tcp_dsack_add (tcp_connection_t *tc, u32 start, u32 end)
-{
-  sack_block_t *last;
+  /* The newest becomes an older block, unless blk grew from it */
+  if (tc->n_snd_sacks && !tcp_sack_block_contains (blk, kept[0]))
+    tc->snd_sack_changes += tc->snd_sack_changes < CLIB_U8_MAX;
+  else
+    tc->snd_sack_changes = clib_max (tc->snd_sack_changes, 1);
 
-  if (tcp_dsack_is_pending (tc))
-    {
-      last = vec_end (tc->snd_dsacks) - 1;
-      if (seq_leq (start, last->end) && seq_leq (last->start, end))
-	{
-	  last->start = seq_min (last->start, start);
-	  last->end = seq_max (last->end, end);
-	  return;
-	}
-    }
+  /* blk, then the most recent blocks it did not join, as many as fit in an ack */
+  next[0] = blk;
+  for (i = 0; i < tc->n_snd_sacks && n < TCP_OPTS_MAX_SACK_BLOCKS; i++)
+    if (!tcp_sack_block_contains (blk, kept[i]))
+      next[n++] = kept[i];
 
-  /* Keep the most recent ones */
-  if (vec_len (tc->snd_dsacks) >= TCP_MAX_DSACK_BLOCKS)
-    vec_delete (tc->snd_dsacks, 1, 0);
-
-  vec_add2 (tc->snd_dsacks, last, 1);
-  last->start = start;
-  last->end = end;
+  clib_memcpy_fast (kept, next, n * sizeof (sack_block_t));
+  tc->n_snd_sacks = n;
 }
 
 void
-tcp_dsack_report (tcp_connection_t *tc, u32 start, u32 end)
+tcp_sack_delivered (tcp_connection_t *tc)
 {
-  if (tcp_dsack_report_enabled (tc) && seq_lt (start, end))
-    tcp_dsack_add (tc, start, end);
+  sack_block_t *kept = tcp_snd_kept_sacks (tc);
+  u32 i, n = 0;
+
+  /* The fifo delivers whole segments, so delivered blocks start at or below rcv_nxt. The most
+   * recent left is the newest. Blocks pushed out earlier that the fifo still has are reported
+   * again once a segment lands in them */
+  for (i = 0; i < tc->n_snd_sacks; i++)
+    if (seq_gt (kept[i].start, tc->rcv_nxt))
+      kept[n++] = kept[i];
+
+  if (n)
+    tc->n_snd_sacks = n;
+  else
+    tcp_sack_clear_blocks (tc);
 }
 
 u32
 tcp_dsack_make_sacks (tcp_connection_t *tc, sack_block_t *blks)
 {
-  sack_block_t *sacks = tc->snd_sacks, dsack;
-  u32 i, n = 0, n_sacks = vec_len (sacks), contains = ~0;
+  sack_block_t *kept = tcp_snd_kept_sacks (tc), *dsack = tcp_snd_dsack (tc);
+  sack_block_t *dsack_blk = tcp_snd_dsack_blk (tc);
+  u32 i, n = 0, n_kept = tc->n_snd_sacks, contains = ~0, changed, sent = 0;
 
   ASSERT (tcp_dsack_is_pending (tc));
-  dsack = tc->snd_dsacks[0];
-  vec_delete (tc->snd_dsacks, 1, 0);
-  blks[n++] = dsack;
+  blks[n++] = *dsack;
+  dsack->end = dsack->start;
 
-  /* Sack blocks are above rcv_nxt, so only out-of-order duplicates have one */
-  for (i = 0; seq_geq (dsack.start, tc->rcv_nxt) && i < n_sacks; i++)
-    if (seq_leq (sacks[i].start, dsack.start) && seq_leq (dsack.end, sacks[i].end))
+  /* Out-of-order duplicates are followed by the block that holds them: a kept one, else the
+   * one recorded when they arrived, which the fifo holds until rcv_nxt passes it */
+  for (i = 0; i < n_kept; i++)
+    if (tcp_sack_block_contains (kept[i], blks[0]))
       {
-	blks[n++] = sacks[i];
+	blks[n++] = kept[i];
 	contains = i;
+	sent |= 1 << i;
 	break;
       }
+  if (contains == ~0 && dsack_blk->start != dsack_blk->end &&
+      seq_gt (dsack_blk->start, tc->rcv_nxt))
+    blks[n++] = *dsack_blk;
 
-  if (tc->snd_sack_pos >= n_sacks)
-    tc->snd_sack_pos = 0;
-
-  for (i = tc->snd_sack_pos; i < n_sacks && n < TCP_OPTS_MAX_SACK_BLOCKS; i++)
+  for (i = 0; i < n_kept && n < TCP_OPTS_MAX_SACK_BLOCKS; i++)
     if (i != contains)
-      blks[n++] = sacks[i];
+      {
+	blks[n++] = kept[i];
+	sent |= 1 << i;
+      }
 
-  tc->snd_sack_pos = i;
+  /* The changed blocks are the most recent ones. If the ack does not hold them all,
+   * tcp_send_acks follows with one that does */
+  changed = (1 << clib_min (tc->snd_sack_changes, n_kept)) - 1;
+  if ((sent & changed) == changed)
+    tc->snd_sack_changes = 0;
+
   return n;
-}
-
-/* Report what the segment repeated of a block it delivered or merged with.
- * Duplicates are rare, so check the overlap before calling */
-static_always_inline void
-tcp_dsack_report_overlap (tcp_connection_t *tc, sack_block_t *blk, u32 seg_start, u32 seg_end)
-{
-  u32 start = seq_max (seg_start, blk->start), end = seq_min (seg_end, blk->end);
-
-  if (PREDICT_FALSE (seq_lt (start, end)))
-    tcp_dsack_add (tc, start, end);
-}
-
-/**
- * Build SACK list as per RFC2018.
- *
- * Makes sure the first block contains the segment that generated the current
- * ACK and the following ones are the ones most recently reported in SACK
- * blocks.
- *
- * [start, end) is the newest out-of-order block, empty if the segment the
- * receiver got last, [seg_start, seg_end), was enqueued in order. What the
- * segment overlaps of the blocks it delivered or merged with was received
- * twice and is reported as a dsack.
- *
- * @param tc TCP connection for which the SACK list is updated
- * @param start Start sequence number of the newest out-of-order block
- * @param end End sequence number of the newest out-of-order block
- * @param seg_start Start sequence number of the segment received last
- * @param seg_end End sequence number of the segment received last
- */
-void
-tcp_update_sack_list (tcp_connection_t *tc, u32 start, u32 end, u32 seg_start, u32 seg_end)
-{
-  sack_block_t *new_list = tc->snd_sacks_fl, *block = 0;
-  u8 dsack_report = tcp_dsack_report_enabled (tc);
-  int i;
-
-  /* If the first segment is ooo add it to the list. Last write might've moved
-   * rcv_nxt over the first segment. */
-  if (seq_lt (tc->rcv_nxt, start))
-    {
-      vec_add2 (new_list, block, 1);
-      block->start = start;
-      block->end = end;
-    }
-
-  /* Find the blocks still worth keeping. */
-  for (i = 0; i < vec_len (tc->snd_sacks); i++)
-    {
-      /* Discard if rcv_nxt advanced beyond current block */
-      if (seq_leq (tc->snd_sacks[i].start, tc->rcv_nxt))
-	{
-	  if (dsack_report)
-	    tcp_dsack_report_overlap (tc, &tc->snd_sacks[i], seg_start, seg_end);
-	  continue;
-	}
-
-      /* Merge or drop if segment overlapped by the new segment */
-      if (block && (seq_geq (tc->snd_sacks[i].end, new_list[0].start)
-		    && seq_leq (tc->snd_sacks[i].start, new_list[0].end)))
-	{
-	  if (dsack_report)
-	    tcp_dsack_report_overlap (tc, &tc->snd_sacks[i], seg_start, seg_end);
-	  if (seq_lt (tc->snd_sacks[i].start, new_list[0].start))
-	    new_list[0].start = tc->snd_sacks[i].start;
-	  if (seq_lt (new_list[0].end, tc->snd_sacks[i].end))
-	    new_list[0].end = tc->snd_sacks[i].end;
-	  continue;
-	}
-
-      /* Save to new SACK list if we have space. */
-      if (vec_len (new_list) < TCP_MAX_SACK_BLOCKS)
-	vec_add1 (new_list, tc->snd_sacks[i]);
-    }
-
-  ASSERT (vec_len (new_list) <= TCP_MAX_SACK_BLOCKS);
-
-  /* Replace old vector with new one */
-  vec_reset_length (tc->snd_sacks);
-  tc->snd_sacks_fl = tc->snd_sacks;
-  tc->snd_sacks = new_list;
-
-  /* Segments should not 'touch' */
-  ASSERT (tcp_sack_vector_is_sane (tc->snd_sacks));
-}
-
-u32
-tcp_sack_list_bytes (tcp_connection_t * tc)
-{
-  u32 bytes = 0, i;
-  for (i = 0; i < vec_len (tc->snd_sacks); i++)
-    bytes += tc->snd_sacks[i].end - tc->snd_sacks[i].start;
-  return bytes;
 }

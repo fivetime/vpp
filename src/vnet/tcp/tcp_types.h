@@ -120,7 +120,7 @@ typedef enum tcp_cfg_flag_
   _ (DEQ_PENDING, "Dequeue pending ")                                                              \
   _ (PSH_PENDING, "PSH pending")                                                                   \
   _ (FINRCVD, "FIN received")                                                                      \
-  _ (ZERO_RWND_SENT, "Zero RWND sent")                                                             \
+  _ (SMALL_RWND_SENT, "Small RWND sent")                                                           \
   _ (TLP_PENDING, "TLP outcome pending")
 
 typedef enum tcp_connection_flag_bits_
@@ -139,11 +139,19 @@ typedef enum tcp_connection_flag_
   TCP_CONN_N_FLAGS
 } tcp_connection_flags_e;
 
-#define TCP_SCOREBOARD_TRACE (0)
-#define TCP_MAX_SACK_BLOCKS	    255 /**< Max number of SACK blocks stored */
-#define TCP_MAX_DSACK_BLOCKS	    8	/**< Max number of dsack blocks pending */
+#define TCP_SCOREBOARD_TRACE	    (0)
+/* snd_sacks layout: the pending dsack, the kept blocks newest first and the block that held the
+ * dsack. Use tcp_snd_dsack, tcp_snd_kept_sacks and tcp_snd_dsack_blk */
+#define TCP_SND_SACKS_DSACK	    0
+#define TCP_SND_SACKS_KEPT	    1
+#define TCP_SND_SACKS_DSACK_BLK	    (TCP_SND_SACKS_KEPT + TCP_OPTS_MAX_SACK_BLOCKS)
+#define TCP_SND_SACKS_LEN	    (TCP_SND_SACKS_DSACK_BLK + 1)
+#define TCP_MAX_POSTPONED_ACKS	    16	 /**< Default max postponed acks per connection */
+#define TCP_POSTPONED_ACKS_PER_WRK  2048 /**< Default postponed acks per worker */
+#define TCP_INVALID_POSTPONED_ACK   ((u16) ~0)
 #define TCP_INVALID_SACK_HOLE_INDEX ((u32)~0)
 #define TCP_MAX_SACK_REORDER 300
+STATIC_ASSERT (TCP_MAX_SACK_REORDER <= CLIB_U16_MAX, "reorder estimate must fit its u16");
 #define TCP_SEQ_HALF_SPACE	    (1ULL << 31) /**< Half the 32-bit TCP sequence space */
 
 typedef struct _scoreboard_trace_elt
@@ -161,6 +169,17 @@ typedef struct tcp_rxt_range_
   u32 end;    /**< End sequence number */
   u8 is_lost; /**< Range is considered lost */
 } tcp_rxt_range_t;
+
+/** The sack blocks of an ack postponed until the session layer schedules the connection. If
+ * is_dsack, the first is a dsack. Each is in a connection's circular list or the worker's free
+ * list */
+typedef struct
+{
+  sack_block_t blks[TCP_OPTS_MAX_SACK_BLOCKS];
+  u16 next;
+  u8 n_blks;
+  u8 is_dsack;
+} tcp_postponed_ack_t;
 
 typedef struct _sack_scoreboard_hole
 {
@@ -211,8 +230,9 @@ typedef struct _sack_scoreboard
   u32 rescue_rxt;			/**< Rescue sequence number */
   u32 lost_bytes;			/**< Bytes lost as per RFC6675 */
   u32 cur_rxt_hole;			/**< Retransmitting from this hole */
-  u32 reorder;				/**< Estimate of segment reordering */
+  u16 reorder;				/**< Estimate of segment reordering */
   tcp_scoreboard_flag_t flags;		/**< Scoreboard and D-SACK state */
+  u32 rxt_frontier;			/**< Highest sequence retransmitted in this recovery */
 
 #if TCP_SCOREBOARD_TRACE
   scoreboard_trace_elt_t *trace;
@@ -432,7 +452,8 @@ typedef struct _tcp_connection
 
   /* Options */
   u8 snd_opts_len;		/**< Tx options len */
-  u8 snd_sack_pos;		/**< Position in vec of first block to send */
+  u8 snd_sack_changes;		/**< Changed blocks, those with arrivals since an ack last reported
+				  them, are all among this many newest kept ones. 0 once reported */
   u8 rcv_wscale;		/**< Window scale to advertise to peer */
   u8 snd_wscale;		/**< Window scale to use when sending */
   u32 tsval_recent;		/**< Last timestamp received */
@@ -442,13 +463,16 @@ typedef struct _tcp_connection
   tcp_options_t snd_opts;	/**< Tx options for connection */
   tcp_options_t rcv_opts;	/**< Rx options for connection */
 
-  sack_block_t *snd_sacks;	/**< Vector of SACKs to send. XXX Fixed size? */
-  sack_block_t *snd_sacks_fl;	/**< Vector for building new list */
+  sack_block_t *snd_sacks;	/**< Pending dsack and kept sack blocks, see TCP_SND_SACKS_LEN */
+  u8 n_snd_sacks;		/**< Kept sack blocks, see tcp_snd_kept_sacks */
+  u8 n_postponed_acks;		/**< Postponed acks, see tcp_postpone_ack */
+  u16 postponed_acks_tail;	/**< Last postponed ack, it links to the first */
   sack_scoreboard_t sack_sb;	/**< SACK "scoreboard" that tracks holes */
 
   u16 rcv_dupacks;	/**< Number of recent DUPACKs received */
   u32 dupacks_in;	/**< RFC4898 tcpEStatsStackDupAcksIn*/
-  u8 pending_dupacks;	/**< Number of DUPACKs to be sent */
+  u8 pending_dupacks;	/**< A dupack is owed, it reports the kept blocks once scheduled */
+  u8 rcv_nxt_dupacks;	/**< Acks that signaled the hole at rcv_nxt, see tcp_program_sack_ack */
   u32 dupacks_out;	/**< RFC4898 tcpEStatsPathDupAcksOut */
 
   /* Congestion control */
@@ -489,7 +513,7 @@ typedef struct _tcp_connection
   u32 psh_seq;		/**< Add psh header for seg that includes this */
   u32 next_node_index;	/**< Can be used to control next node in output */
   u32 next_node_opaque;	/**< Opaque to pass to next node */
-  u32 unused;		/**< Unused, keeps the layout */
+  u32 rxt_snd_nxt;	/**< snd_nxt when the last retransmit was sent */
   u32 sw_if_index;	/**< Interface for the connection */
 
   /* Delivery rate estimation */
@@ -503,7 +527,8 @@ typedef struct _tcp_connection
   tcp_errors_t errors;	/**< Soft connection errors */
 
   tcp_dsack_undo_t dsack_undo; /**< Retransmit budget for D-SACK undo */
-  sack_block_t *snd_dsacks;    /**< Duplicates to report, one per ack */
+  u32 unused1;		       /**< Unused, keeps the layout */
+  u32 unused2;		       /**< Unused, keeps the layout */
 
   u32 iss;		/**< initial sent sequence */
   u32 irs;		/**< initial remote sequence */
@@ -561,9 +586,9 @@ tcp_cong_recovery_off (tcp_connection_t * tc)
 
 #define tcp_csum_offload(tc) (!((tc)->cfg_flags & TCP_CFG_F_NO_CSUM_OFFLOAD))
 
-#define tcp_zero_rwnd_sent(tc) ((tc)->flags & TCP_CONN_ZERO_RWND_SENT)
-#define tcp_zero_rwnd_sent_on(tc) (tc)->flags |= TCP_CONN_ZERO_RWND_SENT
-#define tcp_zero_rwnd_sent_off(tc) (tc)->flags &= ~TCP_CONN_ZERO_RWND_SENT
+#define tcp_small_rwnd_sent(tc)	    ((tc)->flags & TCP_CONN_SMALL_RWND_SENT)
+#define tcp_small_rwnd_sent_on(tc)  (tc)->flags |= TCP_CONN_SMALL_RWND_SENT
+#define tcp_small_rwnd_sent_off(tc) (tc)->flags &= ~TCP_CONN_SMALL_RWND_SENT
 
 #define tcp_dsack_has_undo(tc) (((tc)->sack_sb.flags & TCP_DSACK_RXT_SEEN) != 0)
 

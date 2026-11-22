@@ -233,6 +233,7 @@ typedef struct
   u32 lifetime_jitter;
   u32 handover;
   u16 ipsec_over_udp_port;
+  u32 anti_replay_window_size;
 
   u32 tun_itf;
   u8 udp_encap;
@@ -502,6 +503,14 @@ ikev2_ts_t *ikev2_parse_ts_payload (ike_payload_header_t * ikep, u32 rlen);
 ikev2_delete_t *ikev2_parse_delete_payload (ike_payload_header_t * ikep,
 					    u32 rlen);
 ikev2_notify_t *ikev2_parse_notify_payload (ike_payload_header_t *ikep, u32 rlen);
+
+static_always_inline void
+ikev2_notify_free (ikev2_notify_t **n)
+{
+  if (*n)
+    vec_free (n[0]->data);
+  vec_free (*n);
+}
 u8 *ikev2_find_ike_notify_payload (ike_header_t * ike, u32 msg_type);
 void ikev2_disable_dpd (void);
 clib_error_t *ikev2_profile_natt_disable (u8 * name);

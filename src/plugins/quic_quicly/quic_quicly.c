@@ -382,12 +382,40 @@ quic_quicly_stream_shutdown_tx (quic_ctx_t *ctx, session_t *stream_session)
 }
 
 static void
+quic_quicly_stream_cleanup (transport_connection_t *tc)
+{
+  quic_ctx_t *sctx = quic_quicly_get_quic_ctx (tc->c_index, tc->thread_index);
+
+  quic_ctx_free (quic_quicly_main.qm, sctx);
+}
+
+static void
+quic_quicly_stream_delete (quic_ctx_t *ctx)
+{
+  /* close/reset confirmation can arrive while cleanup is already queued */
+  if (ctx->flags & QUIC_F_STREAM_DELETING)
+    return;
+
+  session_transport_closed_notify (&ctx->connection);
+  if (session_get (ctx->c_s_index, ctx->c_thread_index)->session_state ==
+      SESSION_STATE_TRANSPORT_DELETED)
+    quic_ctx_free (quic_quicly_main.qm, ctx);
+  else
+    {
+      ctx->flags |= QUIC_F_STREAM_DELETING;
+      session_transport_delete_request (&ctx->connection, quic_quicly_stream_cleanup);
+    }
+}
+
+static void
 quic_quicly_on_stream_destroy (quicly_stream_t *stream, quicly_error_t err)
 {
   quic_stream_data_t *stream_data = (quic_stream_data_t *) stream->data;
   quic_quicly_get_worker_stats (stream_data->thread_index)->n_streams--;
   quic_ctx_t *sctx =
     quic_quicly_get_quic_ctx (stream_data->ctx_id, stream_data->thread_index);
+  app_worker_t *app_wrk =
+    app_worker_get_if_valid (session_get (sctx->c_s_index, sctx->c_thread_index)->app_wrk_index);
 
   QUIC_DBG (2,
 	    "DESTROYED_STREAM: stream_session handle 0x%lx, sctx_index %u, "
@@ -399,15 +427,15 @@ quic_quicly_on_stream_destroy (quicly_stream_t *stream, quicly_error_t err)
   sctx->stream = 0;
   sctx->udp_session_handle = SESSION_INVALID_HANDLE;
 
-  /* free stream only when app already closed, otherwise it might has unread
-   * data, or if we have unsend data (we receive stop sending) */
+  /* A peer reset after receive FIN must still report full closure and release
+   * the transport. A half-closed sender can retain unacknowledged TX bytes after
+   * STOP_SENDING; preserve its receive side until the app acknowledges full close. */
   if ((sctx->flags & QUIC_F_APP_CLOSED) ||
-      svm_fifo_max_dequeue_cons (get_stream_session_and_ctx_from_stream (stream, &sctx)->tx_fifo))
-    {
-      session_transport_closed_notify (&sctx->connection);
-      session_transport_delete_notify (&sctx->connection);
-      quic_ctx_free (quic_quicly_main.qm, sctx);
-    }
+      ((sctx->c_flags & TRANSPORT_CONNECTION_F_ERROR) &&
+       (!app_wrk || app_worker_application_is_builtin (app_wrk))) ||
+      (!(sctx->flags & QUIC_F_APP_CLOSED_TX) &&
+       svm_fifo_max_dequeue_cons (get_stream_session_and_ctx_from_stream (stream, &sctx)->tx_fifo)))
+    quic_quicly_stream_delete (sctx);
   else
     session_transport_closing_notify (&sctx->connection);
 
@@ -522,9 +550,12 @@ quic_quicly_on_stop_sending (quicly_stream_t *stream, quicly_error_t quicly_erro
 	    session_handle (session_get (sctx->c_s_index, sctx->c_thread_index)), sctx->c_c_index,
 	    sctx->c_thread_index, sctx->flags, quic_quicly_format_err, quicly_error);
 
-  if (!(sctx->flags & QUIC_F_APP_CLOSED))
+  /* The application has already ended TX, but can still be awaiting RX. A peer
+   * cancelling that send side must not turn its response into a stream reset. */
+  if (!(sctx->flags & (QUIC_F_APP_CLOSED | QUIC_F_APP_CLOSED_TX)))
     {
       sctx->app_err_code = QUICLY_ERROR_GET_ERROR_CODE (quicly_error);
+      sctx->c_flags |= TRANSPORT_CONNECTION_F_ERROR;
       session_transport_reset_notify (&sctx->connection);
     }
 }
@@ -704,6 +735,7 @@ quic_quicly_on_receive_reset (quicly_stream_t *stream, quicly_error_t quicly_err
   if (!(sctx->flags & (QUIC_F_APP_CLOSED | QUIC_F_APP_CLOSED_RX)))
     {
       sctx->app_err_code = QUICLY_ERROR_GET_ERROR_CODE (quicly_error);
+      sctx->c_flags |= TRANSPORT_CONNECTION_F_ERROR;
       session_transport_reset_notify (&sctx->connection);
     }
 }
@@ -911,7 +943,19 @@ quic_quicly_on_stream_open (quicly_stream_open_t *self, quicly_stream_t *stream)
   if ((rv = app_worker_init_connected (app_wrk, stream_session)))
     {
       QUIC_ERR ("failed to allocate fifos");
-      return -1; /* close connection */
+      /* App never saw the stream, so release it and reject it. Failing the
+       * open would leave quicly's stream counts inconsistent */
+      session_free (stream_session);
+      quic_ctx_free (quic_quicly_main.qm, sctx);
+      clib_mem_free (stream->data);
+      stream->data = 0;
+      stream->callbacks = &quicly_stream_noop_callbacks;
+      quic_quicly_get_worker_stats (thread_index)->n_streams--;
+      if (quicly_stream_has_receive_side (quicly_is_client (stream->conn), stream->stream_id))
+	quicly_request_stop (stream, QUICLY_ERROR_FROM_APPLICATION_ERROR_CODE (0));
+      if (quicly_stream_has_send_side (quicly_is_client (stream->conn), stream->stream_id))
+	quicly_reset_stream (stream, QUICLY_ERROR_FROM_APPLICATION_ERROR_CODE (0));
+      return 0;
     }
   svm_fifo_add_want_deq_ntf (stream_session->rx_fifo,
 			     SVM_FIFO_WANT_DEQ_NOTIF_IF_FULL |
@@ -1158,9 +1202,7 @@ quic_quicly_on_app_closed (u32 ctx_index, clib_thread_index_t thread_index)
 	    "thread_index %u",
 	    session_handle (session_get (ctx->c_s_index, ctx->c_thread_index)), ctx->c_c_index,
 	    ctx->c_thread_index);
-	  session_transport_closed_notify (&ctx->connection);
-	  session_transport_delete_notify (&ctx->connection);
-	  quic_ctx_free (quic_quicly_main.qm, ctx);
+	  quic_quicly_stream_delete (ctx);
 	  return;
 	}
       quicly_stream_t *stream = ctx->stream;
@@ -1301,9 +1343,7 @@ quic_quicly_on_app_reset (u32 ctx_index, clib_thread_index_t thread_index)
   /* stream might get destroyed by quicly meanwhile */
   if (!ctx->stream)
     {
-      session_transport_closed_notify (&ctx->connection);
-      session_transport_delete_notify (&ctx->connection);
-      quic_ctx_free (quic_quicly_main.qm, ctx);
+      quic_quicly_stream_delete (ctx);
       return;
     }
   stream = ctx->stream;
@@ -1764,6 +1804,9 @@ quic_quicly_connect_stream (void *quic_conn, void **quic_stream,
   quicly_conn_t *conn = quic_conn;
   quicly_stream_t *quicly_stream;
   quicly_error_t rv;
+
+  if (quicly_get_state (conn) >= QUICLY_STATE_CLOSING)
+    return SESSION_E_NOSESSION;
 
   rv = quicly_open_stream (conn, (quicly_stream_t **) quic_stream, is_unidir);
   if (rv)

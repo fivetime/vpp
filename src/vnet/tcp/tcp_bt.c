@@ -1488,7 +1488,8 @@ tcp_bt_init_rxt (tcp_connection_t *tc, u32 snd_una)
 
   tc->sack_sb.high_rxt = snd_una;
   bt->cur_rxt_end = snd_una;
-  tc->sack_sb.rescue_rxt = snd_una - 1;
+  /* No rescue before an ack passes the first retransmit (RFC 6675, 4.3) */
+  tc->sack_sb.rescue_rxt = snd_una;
 }
 
 u32
@@ -1522,13 +1523,11 @@ tcp_bt_rxt_mark_lost (tcp_connection_t *tc)
 
   bt->cur_rxt_end = sb->high_rxt;
 
+  /* Every unsacked byte is lost */
   cur = bt_get_sample (bt, bt->head);
-  while (cur && (cur->flags & TCP_BTS_IS_SACKED))
-    cur = bt_next_sample (bt, cur);
-
-  while (cur && !(cur->flags & TCP_BTS_IS_SACKED))
+  while (cur)
     {
-      if (!(cur->flags & TCP_BTS_IS_LOST))
+      if (!(cur->flags & (TCP_BTS_IS_SACKED | TCP_BTS_IS_LOST)))
 	{
 	  cur->flags |= TCP_BTS_IS_LOST;
 	  sb->lost_bytes += cur->max_seq - cur->min_seq;
@@ -1707,9 +1706,10 @@ tcp_bt_next_rxt_range (tcp_connection_t *tc, u8 have_unsent, u8 *can_rescue, u8 
       return 0;
     }
   /* Apply the RFC 6675 Section 4 NextSeg rules to the range derived from
-   * byte-tracker samples. Rule (1), a lost range below HighACK, takes
-   * precedence. If it does not apply, evaluate Rules (2)-(4). */
-  if (!(range->is_lost && seq_lt (range->start, sb->high_sacked)))
+   * byte-tracker samples. Rule (1), a lost range, takes precedence. SACK loss
+   * detection marks only ranges below HighACK lost, an rto or reneging also
+   * those above it. If Rule (1) does not apply, evaluate Rules (2)-(4). */
+  if (!range->is_lost)
     {
       /* Rule (2): prefer available unsent data. */
       if (have_unsent)

@@ -2,6 +2,7 @@
 
 import unittest
 import socket
+import subprocess
 from ipaddress import ip_address, ip_interface
 
 from scapy.layers.inet import IP, UDP
@@ -37,7 +38,8 @@ from template_ipsec import (
 )
 from test_ipsec_tun_if_esp import TemplateIpsecItf4
 from config import config
-from vpp_ip_route import FibPathType, VppIpTable
+from vpp_ip_route import FibPathType, VppIpTable, find_mroute, find_mroute_path
+from vpp_papi import VppEnum
 from vpp_qemu_utils import (
     add_namespace_route,
     add_namespace_multipath_route,
@@ -46,6 +48,9 @@ from vpp_qemu_utils import (
     del_namespace_address,
     add_namespace_neighbor,
     del_namespace_neighbor,
+    add_namespace_vlan,
+    add_namespace_qinq,
+    del_namespace_link,
     NextHop,
     create_namespace,
     delete_all_namespaces,
@@ -1409,6 +1414,31 @@ class TestLinuxCPLinuxToVPP(TestLinuxCPNetNSBase):
                     return True
         return False
 
+    def test_linux_to_vpp_mpls_route_delete(self):
+        """Linux MPLS route delete releases the lcp MPLS table"""
+        ns = ["ip", "netns", "exec", self.ns_name]
+        r = subprocess.run(
+            ns + ["sysctl", "-w", "net.mpls.platform_labels=1100"], capture_output=True
+        )
+        if r.returncode:
+            self.skipTest("kernel MPLS (mpls_router) not available")
+        route = ["1001", "via", "inet", "10.10.1.1", "dev", "hloop0"]
+        subprocess.run(ns + ["ip", "-f", "mpls", "route", "add"] + route, check=True)
+        self.poll_for(
+            "MPLS route synced to VPP",
+            lambda: "1001:neos" in self.vapi.cli("show mpls fib 1001"),
+            True,
+        )
+
+        # The last lcp route in the MPLS table drops the table reference;
+        # MPLS has no mfib to unlock.
+        subprocess.run(ns + ["ip", "-f", "mpls", "route", "del", "1001"], check=True)
+        self.poll_for(
+            "MPLS route removed from VPP",
+            lambda: "1001:neos" in self.vapi.cli("show mpls fib 1001"),
+            False,
+        )
+
     def test_linux_to_vpp_neighbor_ipv4(self):
         """Linux ARP neighbor entries sync to VPP"""
         lo0_idx = self.lo_interfaces[0].sw_if_index
@@ -1521,6 +1551,164 @@ class TestLinuxCPLinuxToVPP(TestLinuxCPNetNSBase):
                 for a in self.vapi.ip_address_dump(lo0_idx, is_ipv6=True)
             ),
             False,
+        )
+
+    def _subif_matches(self, name, n_tags, outer_vlan, inner_vlan, sup_sw_if_index):
+        """Check the VPP sub-interface with the given exact name exists and
+        carries the expected number of tags, tag ids and parent.
+        """
+        dump = self.vapi.sw_interface_dump(name_filter_valid=True, name_filter=name)
+        for swif in dump:
+            if swif.interface_name.rstrip(" \t\r\n\0") == name:
+                return (
+                    swif.sub_number_of_tags == n_tags
+                    and swif.sub_outer_vlan_id == outer_vlan
+                    and swif.sub_inner_vlan_id == inner_vlan
+                    and swif.sup_sw_if_index == sup_sw_if_index
+                )
+        return False
+
+    def test_linux_to_vpp_vlan_qinq(self):
+        """Linux VLAN and QinQ links sync to VPP sub-interfaces"""
+        lo0 = self.lo_interfaces[0]
+
+        # Enable auto sub-interface creation and create the parent pair
+        self.vapi.cli("lcp lcp-auto-subint on")
+        try:
+            # Create a VLAN link on the host side
+            add_namespace_vlan(self.ns_name, "hloop0", "hloop0.100", 100)
+            self.poll_for(
+                "loop0.100 single-tag sub-interface in VPP",
+                lambda: self._subif_matches("loop0.100", 1, 100, 0, lo0.sw_if_index),
+                True,
+            )
+
+            # Create a QinQ link on the host side
+            add_namespace_qinq(self.ns_name, "hloop0.100", "hloop0.100.200", 200)
+            self.poll_for(
+                "loop0.1000200 QinQ sub-interface in VPP",
+                lambda: self._subif_matches(
+                    "loop0.1000200", 2, 100, 200, lo0.sw_if_index
+                ),
+                True,
+            )
+
+            # Delete the QinQ link
+            del_namespace_link(self.ns_name, "hloop0.100.200")
+            self.poll_for(
+                "loop0.1000200 QinQ sub-interface removed from VPP",
+                lambda: not self.vapi.sw_interface_dump(
+                    name_filter_valid=True, name_filter="loop0.1000200"
+                ),
+                True,
+            )
+
+            # Delete the VLAN link
+            del_namespace_link(self.ns_name, "hloop0.100")
+            self.poll_for(
+                "loop0.100 sub-interface removed from VPP",
+                lambda: not self.vapi.sw_interface_dump(
+                    name_filter_valid=True, name_filter="loop0.100"
+                ),
+                True,
+            )
+        finally:
+            self.vapi.cli("lcp lcp-auto-subint off")
+
+
+@unittest.skipIf(config.skip_netns_tests, "netns not available or disabled from cli")
+class TestLinuxCPMcastRoute(TestLinuxCPNetNSBase):
+    """Deleting a Linux multicast route removes it from the VPP MFIB"""
+
+    mcast_group = "239.1.1.1"
+    mcast_prefix = mcast_group + "/32"
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.create_pg_interfaces(range(1))
+        cls.phy = cls.pg_interfaces[0]
+        cls.vapi.lcp_itf_pair_add_del_v3(
+            is_add=True,
+            sw_if_index=cls.phy.sw_if_index,
+            host_if_name="hmcast",
+            netns=cls.ns_name,
+        )
+        cls.phy.admin_up()
+        set_interface_up(cls.ns_name, "hmcast")
+
+    def _mfib_entry_present(self):
+        return find_mroute(self, self.mcast_group, "0.0.0.0", 32)
+
+    def test_linux_to_vpp_mcast_route_delete(self):
+        """Linux multicast route delete is synced to the MFIB"""
+        add_namespace_route(
+            self.ns_name, self.mcast_prefix, dev="hmcast", route_type="multicast"
+        )
+        self.poll_for(
+            "multicast route present in VPP MFIB", self._mfib_entry_present, True
+        )
+
+        del_namespace_route(self.ns_name, self.mcast_prefix)
+        self.poll_for(
+            "multicast route removed from VPP MFIB", self._mfib_entry_present, False
+        )
+
+
+@unittest.skipIf(config.skip_netns_tests, "netns not available or disabled from cli")
+class TestLinuxCPPreExistingRoutes(TestLinuxCPNetNSBase):
+    """Deleting routes linux-nl never installed must not remove the LCP table
+
+    Routes can exist in the host netns before lcp opens its netlink socket
+    (i.e. before the first LCP pair is created). Such routes are never
+    installed into the VPP FIB, so only their RTM_DELROUTE notifications reach
+    the plugin. They must not release table references or flush the interface's
+    mcast Accept paths.
+    """
+
+    # Blackhole routes created in the host netns before the first LCP pair
+    pre_existing_routes = [f"192.0.2.{i}/32" for i in range(1, 5)]
+    host_prefix = "10.0.0.1/24"
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.create_pg_interfaces(range(1))
+        cls.phy = cls.pg_interfaces[0]
+
+        for prefix in cls.pre_existing_routes:
+            add_namespace_route(cls.ns_name, prefix, route_type="blackhole")
+
+        cls.vapi.cli(f"lcp create {cls.phy.name} host-if hroute netns {cls.ns_name}")
+        cls.phy.admin_up()
+
+        add_namespace_address(cls.ns_name, "hroute", cls.host_prefix)
+        set_interface_up(cls.ns_name, "hroute")
+
+    def _accept_path_present(self):
+        accept = VppEnum.vl_api_mfib_itf_flags_t.MFIB_API_ITF_FLAG_ACCEPT
+        return find_mroute_path(
+            self, "0.0.0.0", "224.0.0.0", 24, self.phy.sw_if_index, accept
+        )
+
+    def test_delete_preexisting_routes(self):
+        """Deletes of routes not installed by linux-cp keep Accept paths"""
+        self.poll_for("Accept path installed", self._accept_path_present, True)
+
+        for prefix in self.pre_existing_routes:
+            del_namespace_route(self.ns_name, prefix)
+
+        # We cannot tell if the removed routes were processed, so add a fake
+        # route to be sure that lcp got all the netlink events
+        barrier = "192.0.2.100/32"
+        add_namespace_route(self.ns_name, barrier, route_type="blackhole")
+        self.verify_paths(barrier, dict(type=FibPathType.FIB_PATH_TYPE_DROP))
+        del_namespace_route(self.ns_name, barrier)
+
+        self.assertTrue(
+            self._accept_path_present(),
+            "per-interface Accept path on (*,224.0.0.0/24) was flushed by "
+            "deletes of routes linux-cp never installed",
         )
 
 

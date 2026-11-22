@@ -17,6 +17,8 @@ from cryptography.hazmat.primitives.asymmetric.x448 import (
 )
 from cryptography.hazmat.primitives.serialization import load_pem_private_key
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+from cryptography.hazmat.primitives.serialization import NoEncryption, PrivateFormat
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.ciphers import (
     Cipher,
     algorithms,
@@ -42,6 +44,7 @@ from vpp_ipsec import VppIpsecSA
 from vpp_gre_interface import VppGreInterface
 from vpp_ip_route import VppIpRoute, VppRoutePath
 from vpp_papi import VppEnum
+from vpp_papi_exceptions import CliFailedCommandError
 
 try:
     text_type = unicode
@@ -930,8 +933,10 @@ class IkePeer(VppTestCase):
         node_name = "/err/ikev2-%s/" % version + name
         self.assertEqual(count, self.statistics.get_err_counter(node_name))
 
-    def create_rekey_request(self, kex=False):
-        sa, first_payload = self.generate_auth_payload(is_rekey=True, kex=kex)
+    def create_rekey_request(self, kex=False, rekey_notify=True, rekey_spi=None):
+        sa, first_payload = self.generate_auth_payload(
+            is_rekey=True, kex=kex, rekey_notify=rekey_notify, rekey_spi=rekey_spi
+        )
         header = ikev2.IKEv2(
             init_SPI=self.sa.ispi,
             resp_SPI=self.sa.rspi,
@@ -964,7 +969,7 @@ class IkePeer(VppTestCase):
             init_SPI=self.sa.ispi,
             resp_SPI=self.sa.rspi,
             id=self.sa.new_msg_id(),
-            flags="Initiator",
+            flags="Initiator" if self.sa.is_initiator else 0,
             exch_type="INFORMATIONAL",
             next_payload="Encrypted",
         )
@@ -1787,7 +1792,14 @@ class TemplateResponder(IkePeer):
         capture = self.pg0.get_capture(1)
         self.verify_sa_init(capture[0])
 
-    def generate_auth_payload(self, last_payload=None, is_rekey=False, kex=False):
+    def generate_auth_payload(
+        self,
+        last_payload=None,
+        is_rekey=False,
+        kex=False,
+        rekey_notify=True,
+        rekey_spi=None,
+    ):
         tr_attr = self.sa.esp_crypto_attr()
         last_payload = last_payload or "Notify"
         trans_nb = 3
@@ -1851,18 +1863,16 @@ class TemplateResponder(IkePeer):
                 )
             # RFC 7296 section 1.3: a CREATE_CHILD_SA request has no AUTH payload.
             # Left in, it sits where the chain announces the SA payload.
-            plain = (
-                head
-                / plain[ikev2.IKEv2_payload_SA]
-                / ikev2.IKEv2_payload_Notify(
+            plain = head / plain[ikev2.IKEv2_payload_SA]
+            if rekey_notify:
+                plain /= ikev2.IKEv2_payload_Notify(
                     type="REKEY_SA",
                     proto="ESP",
-                    SPI=c.ispi,
-                    length=8 + len(c.ispi),
+                    SPI=rekey_spi or c.ispi,
+                    length=8 + len(rekey_spi or c.ispi),
                     next_payload="Notify",
                 )
-                / self.last_notify("ESP_TFC_PADDING_NOT_SUPPORTED")
-            )
+            plain /= self.last_notify("ESP_TFC_PADDING_NOT_SUPPORTED")
         else:
             first_payload = "IDi"
             if self.no_idr_auth:
@@ -2658,6 +2668,207 @@ class TestInitiatorGreTunnelMode(TestInitiatorPsk):
     gre_tunnel = True
 
 
+class TestInitiatorPeerRekey(TestInitiatorPsk):
+    """An original IKE responder can initiate a Child SA rekey."""
+
+    pfs_group = 0
+
+    def test_initiator(self):
+        super().test_initiator()
+        old_spi = self.sa.child_sas[0].rspi
+        original_nonces = self.sa.i_nonce, self.sa.r_nonce
+        new_spi = os.urandom(4)
+        self.sa.r_nonce = os.urandom(32)
+        if self.pfs_group:
+            self.sa.ike_dh = DH_GROUP_IDS[self.pfs_group]
+            self.sa.ike_dh_id = DH_TRANSFORM_IDS.get(self.sa.ike_dh, self.sa.ike_dh)
+            self.sa.generate_dh_data()
+        payload, _ = TemplateResponder.generate_auth_payload(
+            self, kex=bool(self.pfs_group)
+        )
+        proposal = payload[ikev2.IKEv2_payload_Proposal].copy()
+        proposal.SPI = new_spi
+        tsi, tsr = self.sa.generate_ts(self.p.ts_is_ip4)
+        plain = ikev2.IKEv2_payload_Nonce(
+            load=self.sa.r_nonce, next_payload="KE" if self.pfs_group else "SA"
+        )
+        if self.pfs_group:
+            plain /= ikev2.IKEv2_payload_KE(
+                group=self.pfs_group, load=self.sa.my_dh_pub_key, next_payload="SA"
+            )
+        plain /= (
+            ikev2.IKEv2_payload_SA(prop=proposal, next_payload="TSi")
+            / ikev2.IKEv2_payload_TSi(
+                number_of_TSs=len(tsr), traffic_selector=tsr, next_payload="TSr"
+            )
+            / ikev2.IKEv2_payload_TSr(
+                number_of_TSs=len(tsi), traffic_selector=tsi, next_payload="Notify"
+            )
+            / ikev2.IKEv2_payload_Notify(type="REKEY_SA", proto="ESP", SPI=old_spi)
+        )
+        header = ikev2.IKEv2(
+            init_SPI=self.sa.ispi,
+            resp_SPI=self.sa.rspi,
+            id=self.sa.new_msg_id(),
+            flags=0,
+            exch_type="CREATE_CHILD_SA",
+        )
+        bad_ts = plain.copy()
+        bad_ts[ikev2.IKEv2_payload_TSi].traffic_selector = [
+            ts.copy() for ts in bad_ts[ikev2.IKEv2_payload_TSi].traffic_selector
+        ]
+        bad_ts[ikev2.IKEv2_payload_TSi].traffic_selector[
+            0
+        ].starting_address_v4 = "10.1.0.0"
+        rejected = [(bad_ts, 38)]  # TS_UNACCEPTABLE
+        if self.pfs_group:
+            bad_ke = plain.copy()
+            bad_ke[ikev2.IKEv2_payload_KE].load = self.sa.my_dh_pub_key[:-1]
+            invalid_point = plain.copy()
+            invalid_point[ikev2.IKEv2_payload_KE].load = bytes(
+                len(self.sa.my_dh_pub_key)
+            )
+            missing_ke = plain.copy()
+            missing_ke[ikev2.IKEv2_payload_Nonce].payload = missing_ke[
+                ikev2.IKEv2_payload_KE
+            ].payload
+            missing_ke[ikev2.IKEv2_payload_Nonce].next_payload = "SA"
+            rejected.extend(
+                [(bad_ke, 17), (missing_ke, 17), (invalid_point, 17)]
+            )  # INVALID_KE_PAYLOAD
+        for invalid, expected in rejected:
+            packet = self.create_packet(
+                self.pg0, self.encrypt_ike_msg(header, invalid, "Nonce")
+            )
+            reply = self.get_ike_header(
+                self.send_and_expect(self.pg0, packet, self.pg0)[0]
+            )
+            notify = ikev2.IKEv2_payload_Notify(self.sa.hmac_and_decrypt(reply))
+            self.assertEqual(notify.type, expected)
+            if expected == 17:
+                self.assertEqual(int.from_bytes(notify.load, "big"), self.pfs_group)
+            self.assertEqual(len(self.vapi.ipsec_sa_dump()), 2)
+            header.id = self.sa.new_msg_id()
+        unsupported = proposal.copy()
+        unsupported.SPI = os.urandom(4)
+        unsupported.trans_nb = 1
+        unsupported.trans = ikev2.IKEv2_payload_Transform(
+            transform_type="Encryption", transform_id=65535
+        )
+        unsupported.next_payload = 2
+        proposal.proposal = 2
+        proposal.trans = (
+            ikev2.IKEv2_payload_Transform(
+                transform_type="Encryption", transform_id=65535, next_payload=3
+            )
+            / proposal.trans
+        )
+        proposal.trans_nb += 1
+        plain[ikev2.IKEv2_payload_SA].prop = unsupported / proposal
+        request = self.create_packet(
+            self.pg0, self.encrypt_ike_msg(header, plain, "Nonce")
+        )
+        self.pg0.add_stream(request)
+        self.pg0.enable_capture()
+        self.pg_start()
+        response = self.get_ike_header(self.pg0.get_capture(1)[0])
+        self.assertEqual(response.id, header.id)
+        self.assertEqual(response.exch_type, 36)
+        self.assertIn("Initiator", response.flags)
+        self.assertIn("Response", response.flags)
+        replay = self.get_ike_header(
+            self.send_and_expect(self.pg0, request, self.pg0)[0]
+        )
+        self.assertEqual(bytes(replay), bytes(response))
+        payload = ikev2.IKEv2_payload_SA(self.sa.hmac_and_decrypt(response))
+        self.assertEqual(payload[ikev2.IKEv2_payload_Proposal].proposal, 2)
+        child = self.sa.child_sas[0]
+        child.ispi = payload[ikev2.IKEv2_payload_Proposal].SPI
+        child.rspi = new_spi
+        self.assertNotEqual(child.rspi, old_spi)
+        self.sa.i_nonce, self.sa.r_nonce = (
+            self.sa.r_nonce,
+            payload[ikev2.IKEv2_payload_Nonce].load,
+        )
+        if self.pfs_group:
+            ke = payload[ikev2.IKEv2_payload_KE]
+            self.assertEqual(ke.group, self.pfs_group)
+            self.sa.i_dh_data = ke.load
+            self.sa.complete_dh_data()
+        self.sa.calc_child_keys(kex=bool(self.pfs_group))
+        child.sk_ei, child.sk_er = child.sk_er, child.sk_ei
+        child.sk_ai, child.sk_ar = child.sk_ar, child.sk_ai
+        self.sa.i_nonce, self.sa.r_nonce = original_nonces
+        self.verify_ike_sas()
+        self.verify_ipsec_sas(is_rekey=True)
+        self.check_esp(child)
+        self.vapi.ikev2_plugin_set_sleep_interval(timeout=0.1)
+        for _ in range(50):
+            if len(self.vapi.ipsec_sa_dump()) == 2:
+                break
+            time.sleep(0.1)
+        self.assertEqual(len(self.vapi.ipsec_sa_dump()), 2)
+
+    def check_esp(self, child):
+        protection = self.vapi.ipsec_tunnel_protect_dump(sw_if_index=0xFFFFFFFF)[0].tun
+        self.vapi.sw_interface_set_flags(sw_if_index=protection.sw_if_index, flags=1)
+        self.vapi.sw_interface_set_unnumbered(
+            self.pg0.sw_if_index, protection.sw_if_index
+        )
+        VppIpRoute(
+            self,
+            "10.0.0.0",
+            24,
+            [VppRoutePath("0.0.0.0", protection.sw_if_index)],
+        ).add_vpp_config()
+        inbound = SecurityAssociation(
+            ESP,
+            spi=int.from_bytes(child.ispi, "big"),
+            crypt_algo="AES-CBC",
+            crypt_key=child.sk_er,
+            auth_algo="SHA2-256-128",
+            auth_key=child.sk_ar,
+        )
+        inner = (
+            IP(src="10.0.0.1", dst=self.pg1.remote_ip4)
+            / UDP(sport=44444, dport=44445)
+            / Raw(b"peer-rekey")
+        )
+        encrypted = inbound.encrypt(
+            IP(src=self.pg0.remote_ip4, dst=self.pg0.local_ip4) / inner
+        )
+        result = self.send_and_expect(
+            self.pg0,
+            Ether(src=self.pg0.remote_mac, dst=self.pg0.local_mac) / encrypted,
+            self.pg1,
+        )[0]
+        self.assertEqual(result[IP].src, inner.src)
+        self.assertEqual(result[Raw].load, b"peer-rekey")
+        outbound = SecurityAssociation(
+            ESP,
+            spi=int.from_bytes(child.rspi, "big"),
+            crypt_algo="AES-CBC",
+            crypt_key=child.sk_ei,
+            auth_algo="SHA2-256-128",
+            auth_key=child.sk_ai,
+        )
+        result = self.send_and_expect(
+            self.pg1,
+            Ether(src=self.pg1.remote_mac, dst=self.pg1.local_mac)
+            / IP(src=self.pg1.remote_ip4, dst="10.0.0.1")
+            / UDP(sport=44444, dport=44445)
+            / Raw(b"peer-rekey"),
+            self.pg0,
+        )[0]
+        self.assertEqual(outbound.decrypt(result[IP])[Raw].load, b"peer-rekey")
+
+
+class TestInitiatorPeerPfsRekey(TestInitiatorPeerRekey):
+    """Peer-initiated Child SA rekey with ECP-384 PFS."""
+
+    pfs_group = 20
+
+
 class TestInitiatorDelSAFromResponder(TemplateInitiator, Ikev2Params):
     """test ikev2 initiator - delete IKE SA from responder"""
 
@@ -2781,6 +2992,32 @@ class TestResponderPskIntegAesCmac(TestResponderPsk):
         self.config_params({"ike-integ": "AES-CMAC-96"})
 
 
+class TestResponderEmptyNatDetection(TemplateResponder, Ikev2Params):
+    """An IKE_SA_INIT request with a NAT detection notify without data is dropped."""
+
+    def config_tc(self):
+        self.config_params()
+
+    def tearDown(self):
+        super(IkePeer, self).tearDown()
+        self.p.remove_vpp_config()
+
+    def test_responder(self):
+        for notify in ("NAT_DETECTION_SOURCE_IP", "NAT_DETECTION_DESTINATION_IP"):
+            msg = (
+                ikev2.IKEv2(
+                    init_SPI=self.sa.ispi, flags="Initiator", exch_type="IKE_SA_INIT"
+                )
+                / self.generate_sa_init_payload(next_payload="Notify")
+                / ikev2.IKEv2_payload_Notify(type=notify)
+            )
+            packet = self.create_packet(
+                self.pg0, msg, self.sa.sport, self.sa.dport, self.sa.natt, self.ip6
+            )
+            self.send_and_assert_no_replies(self.pg0, packet)
+            self.assertEqual(len(self.vapi.ikev2_sa_dump()), 0)
+
+
 class TestResponderDpd(TestResponderPsk):
     """
     Dead peer detection test
@@ -2859,6 +3096,24 @@ class TestResponderRekey(TestResponderPsk):
         self.assertEqual(r[0].sa.stats.n_rekey_req, 1)
         r = self.vapi.ikev2_sa_v2_dump()
         self.assertEqual(r[0].sa.stats.n_rekey_req, 1)
+
+
+class TestResponderReplayWindow(TestResponderRekey):
+    """IKEv2 profile replay window applies to inbound SAs after rekey."""
+
+    def setUp(self):
+        super().setUp()
+        self.vapi.cli("ikev2 profile set pr1 anti-replay-window 4096")
+        with self.assertRaisesRegex(CliFailedCommandError, "64 to 4096"):
+            self.vapi.cli("ikev2 profile set pr1 anti-replay-window 8192")
+        self.vapi.cli("ikev2 profile set pr1 anti-replay-window 1024")
+
+    def test_responder(self):
+        super().test_responder()
+        sizes = [
+            sa.entry.anti_replay_window_size for sa in self.vapi.ipsec_sa_v5_dump()
+        ]
+        self.assertCountEqual(sizes, [64, 1024, 1024])
 
 
 class TestResponderTransportMode(TestResponderRekey):
@@ -2961,6 +3216,250 @@ class TestResponderGreAutoNATT(TestResponderRekey):
         self.process_rekey_response(self.send_rekey_from_initiator())
         self.verify_ipsec_sas(is_rekey=True)
         self.verify_esp()
+
+
+class TestResponderChildSaExhaustion(TestResponderPsk):
+    """Reject exhausted Child SA IDs and reuse a slot released by Delete."""
+
+    def test_responder(self):
+        super().test_responder()
+        child = self.sa.child_sas[0]
+        for first in range(1, 2048, 32):
+            packets = []
+            for slot in range(first, min(first + 32, 2048)):
+                child.ispi = (0x10000000 + slot).to_bytes(4, "big")
+                packets.append(self.create_rekey_request(rekey_notify=False))
+            self.send_and_expect(
+                self.pg0, packets, self.pg0, trace=False, log_packets=False
+            )
+
+        sa_index = self.vapi.ikev2_sa_dump()[0].sa.sa_index
+        self.assertEqual(len(self.vapi.ikev2_child_sa_dump(sa_index=sa_index)), 2048)
+        self.assertEqual(len(self.vapi.ipsec_sa_dump()), 4096)
+        child.ispi = (0x10000800).to_bytes(4, "big")
+        request = self.create_rekey_request(rekey_notify=False)
+        for _ in range(2):
+            reply = self.send_and_expect(self.pg0, [request], self.pg0)[0]
+            ih = self.get_ike_header(reply)
+            self.assertIn("Response", ih.flags)
+            self.assertEqual(ih.id, self.get_ike_header(request).id)
+            self.assertEqual(ih.exch_type, 36)
+            self.assertEqual(ih[ikev2.IKEv2_payload_Encrypted].next_payload, 41)
+            notify = ikev2.IKEv2_payload_Notify(self.sa.hmac_and_decrypt(ih))
+            self.assertEqual(notify.type, 35)  # NO_ADDITIONAL_SAS
+            self.assertEqual(notify.next_payload, 0)
+            self.assertEqual(
+                len(self.vapi.ikev2_child_sa_dump(sa_index=sa_index)), 2048
+            )
+            self.assertEqual(len(self.vapi.ipsec_sa_dump()), 4096)
+
+        header = ikev2.IKEv2(
+            init_SPI=self.sa.ispi,
+            resp_SPI=self.sa.rspi,
+            id=self.sa.new_msg_id(),
+            flags="Initiator",
+            exch_type="INFORMATIONAL",
+        )
+        delete = ikev2.IKEv2_payload_Delete(
+            proto="ESP", SPIsize=4, SPInum=1, SPIs=(0x10000400).to_bytes(4, "big")
+        )
+        packet = self.create_packet(
+            self.pg0,
+            self.encrypt_ike_msg(header, delete, "Delete"),
+            self.sa.sport,
+            self.sa.dport,
+            self.sa.natt,
+            self.ip6,
+        )
+        self.send_and_expect(self.pg0, [packet], self.pg0)
+        self.assertEqual(len(self.vapi.ipsec_sa_dump()), 4094)
+        reply = self.send_and_expect(
+            self.pg0, [self.create_rekey_request(rekey_notify=False)], self.pg0
+        )[0]
+        ih = self.get_ike_header(reply)
+        self.assertEqual(ih[ikev2.IKEv2_payload_Encrypted].next_payload, 33)  # SA
+        self.assertEqual(len(self.vapi.ikev2_child_sa_dump(sa_index=sa_index)), 2048)
+        self.assertEqual(len(self.vapi.ipsec_sa_dump()), 4096)
+
+
+class TestResponderRekeySiblingChild(TestResponderPsk):
+    """A rekey replaces its Child only; the SA IDs of a live sibling stay unique."""
+
+    def test_responder(self):
+        super().test_responder()
+        child = self.sa.child_sas[0]
+        first_ispi = child.ispi
+        sa_index = self.vapi.ikev2_sa_dump()[0].sa.sa_index
+
+        # a second Child next to the first one
+        child.ispi = (0x10000001).to_bytes(4, "big")
+        request = self.create_rekey_request(rekey_notify=False)
+        reply = self.send_and_expect(self.pg0, [request], self.pg0)[0]
+        ih = self.get_ike_header(reply)
+        self.assertEqual(ih[ikev2.IKEv2_payload_Encrypted].next_payload, 33)  # SA
+        self.assertEqual(len(self.vapi.ikev2_child_sa_dump(sa_index=sa_index)), 2)
+        before = {sa.entry.sad_id for sa in self.vapi.ipsec_sa_dump()}
+        self.assertEqual(len(before), 4)
+
+        # rekey the first Child while the second one stays installed
+        child.ispi = first_ispi
+        request = self.create_rekey_request()
+        reply = self.send_and_expect(self.pg0, [request], self.pg0)[0]
+        ih = self.get_ike_header(reply)
+        self.assertEqual(ih[ikev2.IKEv2_payload_Encrypted].next_payload, 33)  # SA
+        self.assertEqual(len(self.vapi.ikev2_child_sa_dump(sa_index=sa_index)), 2)
+        after = {sa.entry.sad_id for sa in self.vapi.ipsec_sa_dump()}
+        # the sibling keeps its two SAs and the rekeyed Child gets new IDs
+        self.assertGreaterEqual(len(after), 4)
+        self.assertTrue(after - before, after)
+        self.assertGreaterEqual(len(before & after), 2)
+
+
+@unittest.skipIf(
+    "gre" in config.excluded_plugins, "Exclude tests depending on GRE plugin"
+)
+class TestResponderGreNewChildDeleteOld(TestResponderPsk):
+    """Deleting an old Child SA must preserve GRE protected by a newer one."""
+
+    use_transport_mode = True
+    gre_tunnel = True
+
+    def setUp(self):
+        super().setUp()
+        self.gre_if.config_ip4()
+
+    def tearDown(self):
+        self.gre_if.unconfig_ip4()
+        super().tearDown()
+
+    def test_responder(self):
+        super().test_responder()
+        VppIpRoute(
+            self,
+            "1.1.1.2",
+            32,
+            [VppRoutePath(self.pg0.remote_ip4, self.gre_if.sw_if_index)],
+        ).add_vpp_config()
+        old_protect = self.vapi.ipsec_tunnel_protect_dump(sw_if_index=self.p.tun_itf)[
+            0
+        ].tun
+        self.assertEqual(len(self.vapi.ipsec_sa_dump()), 2)
+        for _ in range(2):
+            old_child = self.sa.child_sas[0]
+            self.sa.child_sas[0] = IKEv2ChildSA(
+                old_child.local_ts, old_child.remote_ts, True
+            )
+            self.sa.i_nonce = os.urandom(32)
+            self.pg0.add_stream(self.create_rekey_request(rekey_notify=False))
+            self.pg0.enable_capture()
+            self.pg_start()
+            reply = self.pg0.get_capture(1)[0]
+            self.assertEqual(self.get_ike_header(reply).exch_type, 36)
+            sa_payload = ikev2.IKEv2_payload_SA(
+                self.sa.hmac_and_decrypt(self.get_ike_header(reply))
+            )
+            self.sa.r_nonce = sa_payload[ikev2.IKEv2_payload_Nonce].load
+            self.sa.child_sas[0].rspi = sa_payload[ikev2.IKEv2_payload_Proposal].SPI
+            self.sa.calc_child_keys()
+            self.assertEqual(len(self.vapi.ikev2_sa_dump()), 1)
+            new_protect = self.vapi.ipsec_tunnel_protect_dump(
+                sw_if_index=self.p.tun_itf
+            )[0].tun
+            self.assertNotEqual(new_protect.sa_out, old_protect.sa_out)
+            self.assertEqual(len(self.vapi.ipsec_sa_dump()), 4)
+
+            header = ikev2.IKEv2(
+                init_SPI=self.sa.ispi,
+                resp_SPI=self.sa.rspi,
+                id=self.sa.new_msg_id(),
+                flags="Initiator",
+                exch_type="INFORMATIONAL",
+            )
+            delete = ikev2.IKEv2_payload_Delete(
+                proto="ESP", SPIsize=4, SPInum=1, SPIs=old_child.ispi
+            )
+            packet = self.create_packet(
+                self.pg0,
+                self.encrypt_ike_msg(header, delete, "Delete"),
+                self.sa.sport,
+                self.sa.dport,
+                self.sa.natt,
+                self.ip6,
+            )
+            self.pg0.add_stream(packet)
+            self.pg0.enable_capture()
+            self.pg_start()
+            self.pg0.get_capture(1)
+            self.assertEqual(
+                self.vapi.ipsec_tunnel_protect_dump(sw_if_index=self.p.tun_itf)[
+                    0
+                ].tun.sa_out,
+                new_protect.sa_out,
+            )
+            self.assertEqual(len(self.vapi.ipsec_sa_dump()), 2)
+            self.assertEqual(
+                self.vapi.sw_interface_dump(sw_if_index=self.p.tun_itf)[0].flags & 1,
+                1,
+            )
+            outbound = (
+                Ether(src=self.pg1.remote_mac, dst=self.pg1.local_mac)
+                / IP(src=self.pg1.remote_ip4, dst="1.1.1.2")
+                / UDP(sport=2233, dport=1144)
+                / Raw(b"GRE replacement")
+            )
+            received = self.send_and_expect(self.pg1, [outbound], self.pg0)[0]
+            self.assertEqual(
+                received[ESP].spi, int.from_bytes(self.sa.child_sas[0].ispi, "big")
+            )
+            child = self.sa.child_sas[0]
+            peer_to_vpp = SecurityAssociation(
+                ESP,
+                spi=int.from_bytes(child.rspi, "big"),
+                crypt_algo=self.sa.esp_crypto,
+                crypt_key=child.sk_ei,
+                auth_algo=self.sa.esp_integ,
+                auth_key=child.sk_ai,
+            )
+            inbound = Ether(src=self.pg0.remote_mac, dst=self.pg0.local_mac) / (
+                peer_to_vpp.encrypt(
+                    IP(src=self.pg0.remote_ip4, dst=self.pg0.local_ip4)
+                    / GRE()
+                    / IP(src=self.pg1.local_ip4, dst=self.pg1.remote_ip4)
+                    / UDP(sport=1144, dport=2233)
+                    / Raw(b"GRE replacement")
+                )
+            )
+            received = self.send_and_expect(self.pg0, [inbound], self.pg1)[0]
+            self.assertEqual(received[IP].dst, self.pg1.remote_ip4)
+            old_protect = new_protect
+
+        # The next lifetime rekey must also replace the protected outbound SA.
+        current_child = self.sa.child_sas[0]
+        self.sa.child_sas[0] = IKEv2ChildSA(
+            current_child.local_ts, current_child.remote_ts, True
+        )
+        self.sa.i_nonce = os.urandom(32)
+        self.pg0.add_stream(self.create_rekey_request(rekey_spi=current_child.ispi))
+        self.pg0.enable_capture()
+        self.pg_start()
+        reply = self.pg0.get_capture(1)[0]
+        self.assertEqual(self.get_ike_header(reply).exch_type, 36)
+        renewed_protect = self.vapi.ipsec_tunnel_protect_dump(
+            sw_if_index=self.p.tun_itf
+        )[0].tun
+        self.assertNotEqual(renewed_protect.sa_out, new_protect.sa_out)
+        self.vapi.ikev2_plugin_set_sleep_interval(timeout=0.1)
+        for _ in range(50):
+            if len(self.vapi.ipsec_sa_dump()) == 2:
+                break
+            time.sleep(0.1)
+        self.assertEqual(len(self.vapi.ipsec_sa_dump()), 2)
+        self.assertEqual(
+            self.vapi.ipsec_tunnel_protect_dump(sw_if_index=self.p.tun_itf)[
+                0
+            ].tun.sa_out,
+            renewed_protect.sa_out,
+        )
 
 
 @unittest.skipIf(
@@ -3416,6 +3915,94 @@ class TestInitiatorInvalidModp(TestInitiatorPsk):
         self.assertEqual(len(self.vapi.ipsec_sa_dump()), 0)
 
 
+class TestInitiatorUnusableSigningKey(TemplateInitiator, Ikev2Params):
+    """A local key that cannot sign must not cause an IKE_AUTH request."""
+
+    def config_tc(self):
+        self.config_params(
+            {
+                "is_initiator": False,  # seen from test case perspective
+                # thus vpp is initiator
+                "auth": "rsa-sig",
+                "server-key": "server-key.pem",
+                "client-key": "client-key.pem",
+                "client-cert": "client-cert.pem",
+                "server-cert": "server-cert.pem",
+                "ike-crypto": ("AES-GCM-16ICV", 32),
+                "ike-integ": "NULL",
+                "ike-dh": "3072MODPgr",
+                "ike_transforms": {
+                    "crypto_alg": 20,  # "aes-gcm-16"
+                    "crypto_key_size": 256,
+                    "dh_group": 15,  # "modp-3072"
+                },
+                "esp_transforms": {
+                    "crypto_alg": 12,  # "aes-cbc"
+                    "crypto_key_size": 256,
+                    # "hmac-sha2-256-128"
+                    "integ_alg": 12,
+                },
+                "responder_hostname": {
+                    "hostname": "vpp.responder.org",
+                    "sw_if_index": self.pg0.sw_if_index,
+                },
+            }
+        )
+
+    def tearDown(self):
+        super(IkePeer, self).tearDown()
+        self.p.remove_vpp_config()
+
+    def test_initiator(self):
+        # An Ed25519 key cannot produce the digest-then-sign signature of the
+        # RSA digital signature method, so signing the AUTH payload fails.
+        key_file = os.path.join(self.tempdir, "ed25519-key.pem")
+        with open(key_file, "wb") as f:
+            f.write(
+                Ed25519PrivateKey.generate().private_bytes(
+                    Encoding.PEM, PrivateFormat.PKCS8, NoEncryption()
+                )
+            )
+        self.vapi.ikev2_set_local_key(key_file=key_file)
+
+        self.pg0.enable_capture()
+        self.pg_start()
+        self.vapi.ikev2_initiate_sa_init(name=self.p.profile_name)
+        self.verify_sa_init_request(self.pg0.get_capture(1)[0])
+        self.send_and_assert_no_replies(self.pg0, self.create_init_response())
+        self.assertEqual(len(self.vapi.ipsec_sa_dump()), 0)
+
+
+class TestResponderUnusableSigningKey(TestResponderRsaSign):
+    """A local key that cannot sign makes the responder fail authentication."""
+
+    def tearDown(self):
+        super(IkePeer, self).tearDown()
+        self.p.remove_vpp_config()
+
+    def verify_sa_auth_resp(self, packet):
+        ih = self.get_ike_header(packet)
+        self.assertEqual(ih.exch_type, 35)  # IKE_AUTH
+        self.assertIn("Response", ih.flags)
+        notify = ikev2.IKEv2_payload_Notify(self.sa.hmac_and_decrypt(ih))
+        self.assertEqual(notify.type, 24)  # AUTHENTICATION_FAILED
+        self.assertFalse(notify.haslayer(ikev2.IKEv2_payload_AUTH))
+
+    def test_responder(self):
+        key_file = os.path.join(self.tempdir, "ed25519-key.pem")
+        with open(key_file, "wb") as f:
+            f.write(
+                Ed25519PrivateKey.generate().private_bytes(
+                    Encoding.PEM, PrivateFormat.PKCS8, NoEncryption()
+                )
+            )
+        self.vapi.ikev2_set_local_key(key_file=key_file)
+
+        self.send_sa_init_req()
+        self.send_sa_auth()
+        self.assertEqual(len(self.vapi.ipsec_sa_dump()), 0)
+
+
 class TestResponderTruncatedPskAuth(TemplateResponder, Ikev2Params):
     """A shared-key AUTH payload shorter than the PRF output is rejected."""
 
@@ -3446,6 +4033,100 @@ class TestResponderEmptyPskAuth(TestResponderTruncatedPskAuth):
     """A shared-key AUTH payload without data is rejected."""
 
     auth_len = 0
+
+
+class TestResponderBadNonceSize(TemplateResponder, Ikev2Params):
+    """An IKE_SA_INIT request with a nonce of a wrong size is dropped."""
+
+    def config_tc(self):
+        self.config_params()
+
+    def tearDown(self):
+        super(IkePeer, self).tearDown()
+        self.p.remove_vpp_config()
+
+    def test_responder(self):
+        # RFC 7296, 3.9: a nonce is 16 to 256 octets long
+        for size in (0, 15, 257):
+            msg = ikev2.IKEv2(
+                init_SPI=self.sa.ispi, flags="Initiator", exch_type="IKE_SA_INIT"
+            ) / ikev2.IKEv2_payload_Nonce(load=bytes(size))
+            packet = self.create_packet(
+                self.pg0, msg, self.sa.sport, self.sa.dport, self.sa.natt, self.ip6
+            )
+            self.send_and_assert_no_replies(self.pg0, packet)
+            self.assertEqual(len(self.vapi.ikev2_sa_dump()), 0)
+
+
+class TestResponderShortAuthPayload(TemplateResponder, Ikev2Params):
+    """An AUTH payload shorter than its own header is rejected."""
+
+    def config_tc(self):
+        self.config_params()
+
+    def tearDown(self):
+        super(IkePeer, self).tearDown()
+        self.p.remove_vpp_config()
+
+    def test_responder(self):
+        self.send_sa_init_req()
+        # A generic payload header only: no method, no reserved bytes, no data.
+        plain = ikev2.IKEv2_payload_IDi(
+            next_payload="AUTH", IDtype=self.sa.id_type, load=self.sa.i_id
+        ) / Raw(b"\x00\x00\x00\x04")
+        header = ikev2.IKEv2(
+            init_SPI=self.sa.ispi,
+            resp_SPI=self.sa.rspi,
+            id=self.sa.new_msg_id(),
+            flags="Initiator",
+            exch_type="IKE_AUTH",
+        )
+        packet = self.create_packet(
+            self.pg0,
+            self.encrypt_ike_msg(header, plain, "IDi"),
+            self.sa.sport,
+            self.sa.dport,
+            self.sa.natt,
+            self.ip6,
+        )
+        self.send_and_assert_no_replies(self.pg0, packet)
+        self.assertEqual(len(self.vapi.ikev2_sa_dump()), 0)
+        self.assertEqual(len(self.vapi.ipsec_sa_dump()), 0)
+
+
+class TestResponderInitRetransmit(TemplateResponder, Ikev2Params):
+    """Only a request with the same nonce is answered as a retransmission."""
+
+    def config_tc(self):
+        self.config_params()
+
+    def tearDown(self):
+        super(IkePeer, self).tearDown()
+        self.p.remove_vpp_config()
+
+    def send_init(self, nonce):
+        msg = ikev2.IKEv2(
+            init_SPI=self.sa.ispi, flags="Initiator", exch_type="IKE_SA_INIT"
+        ) / ikev2.IKEv2_payload_Nonce(load=nonce)
+        packet = self.create_packet(
+            self.pg0, msg, self.sa.sport, self.sa.dport, self.sa.natt, self.ip6
+        )
+        self.pg0.add_stream(packet)
+        self.pg0.enable_capture()
+        self.pg_start()
+
+    def n_init_retransmit(self):
+        return sum(s.sa.stats.n_init_sa_retransmit for s in self.vapi.ikev2_sa_dump())
+
+    def test_responder(self):
+        self.send_sa_init_req()
+        self.assertEqual(self.n_init_retransmit(), 0)
+        # no nonce, a prefix of the nonce, the nonce followed by more data
+        for nonce in (b"", self.sa.i_nonce[:1], self.sa.i_nonce + b"\x00"):
+            self.send_init(nonce)
+            self.assertEqual(self.n_init_retransmit(), 0)
+        self.send_init(self.sa.i_nonce)
+        self.assertEqual(self.n_init_retransmit(), 1)
 
 
 class TestResponderInvalidNewChildModp(TestResponderPsk):
@@ -3569,6 +4250,33 @@ class TestResponderLongEcp256(TestResponderShortEcp256):
     """An ECP-256 request with a trailing byte must be rejected."""
 
     append_ke_byte = True
+
+
+class TestInitiatorResponseCache(TestInitiatorPsk):
+    """Local requests must not replace the cached response to a peer request."""
+
+    def test_initiator(self):
+        super().test_initiator()
+        request = self.create_empty_request()
+        invalid = request.copy()
+        encrypted = bytes(invalid[UDP].payload)
+        invalid[UDP].remove_payload()
+        invalid /= Raw(encrypted[:-1] + bytes([encrypted[-1] ^ 1]))
+        self.send_and_assert_no_replies(self.pg0, invalid)
+        self.pg0.add_stream(request)
+        self.pg0.enable_capture()
+        self.pg_start()
+        response = self.get_ike_header(self.pg0.get_capture(1)[0])
+        self.assertEqual(response.exch_type, 37)
+        ispi = int.from_bytes(self.sa.child_sas[0].ispi, "little")
+        self.pg0.enable_capture()
+        self.vapi.ikev2_initiate_rekey_child_sa(ispi=ispi)
+        self.pg0.get_capture(1)
+        self.pg0.add_stream(request)
+        self.pg0.enable_capture()
+        self.pg_start()
+        replay = self.get_ike_header(self.pg0.get_capture(1)[0])
+        self.assertEqual(bytes(replay), bytes(response))
 
 
 class TestMalformedMessages(TemplateResponder, Ikev2Params):

@@ -35,20 +35,6 @@ def create_stream(self, src_if, dst_if, count):
     return packets
 
 
-def packet_info_from_capture(self, packet):
-    # Scapy may decode a random UDP source port as another protocol
-    # (WireGuard on 51820), leaving only part of the marker in Raw.
-    udp = packet[UDP]
-    payload = udp.original[8 : udp.len]
-    self.assertGreaterEqual(
-        len(payload),
-        18,
-        f"Short UDP payload on sport {udp.sport}, dport {udp.dport}: "
-        f"UDP length {udp.len}, captured {len(udp.original)} bytes",
-    )
-    return self.payload_to_info(Raw(payload))
-
-
 def verify_capture(self, src_if, dst_if, capture, reply):
     packet_info = None
     for packet in capture:
@@ -56,7 +42,7 @@ def verify_capture(self, src_if, dst_if, capture, reply):
             ip = packet[IP]
             udp = packet[UDP]
             # convert the payload to packet info object
-            payload_info = packet_info_from_capture(self, packet)
+            payload_info = self.get_info_from_packet(packet)
             # make sure the indexes match
             self.assert_equal(
                 payload_info.src, src_if.sw_if_index, "source sw_if_index"
@@ -142,6 +128,10 @@ class TestNsimCli(VppTestCase):
         self.pg0.add_stream(packets)
         self.pg1.enable_capture()
         self.pg_start()
+        # The driver shares the VPP main core and get_capture wakes on every
+        # pcap write. Sleep while nsim releases so that the polling wheel is
+        # not descheduled and the departure gaps are not stretched
+        self.sleep(0.2, "nsim release window")
         return self.pg1.get_capture(count, timeout=timeout)
 
     def send_plain_and_capture(self, count, expected_count=None, timeout=2):
@@ -300,7 +290,7 @@ class TestNsimCli(VppTestCase):
         self.enable_cross_connect()
         capture = self.send_and_capture(7)
 
-        indexes = [packet_info_from_capture(self, packet).index for packet in capture]
+        indexes = [self.get_info_from_packet(packet).index for packet in capture]
         self.assertEqual(indexes, sorted(indexes))
         self.assertLess(float(capture[5].time - capture[0].time), 0.002)
         boundary_gap = float(capture[6].time - capture[5].time)
@@ -324,7 +314,7 @@ class TestNsimCli(VppTestCase):
         self.enable_cross_connect()
         capture = self.send_and_capture(20)
 
-        indexes = [packet_info_from_capture(self, packet).index for packet in capture]
+        indexes = [self.get_info_from_packet(packet).index for packet in capture]
         self.assertEqual(indexes, sorted(indexes))
         self.assertLess(float(capture[1].time - capture[0].time), 0.002)
         self.assertGreater(float(capture[2].time - capture[1].time), 0.003)
@@ -353,7 +343,7 @@ class TestNsimCli(VppTestCase):
 
         self.enable_cross_connect()
         capture = self.send_and_capture(20)
-        indexes = [packet_info_from_capture(self, packet).index for packet in capture]
+        indexes = [self.get_info_from_packet(packet).index for packet in capture]
         self.assertEqual(indexes, sorted(indexes))
         release_gaps = [
             float(capture[index].time - capture[index - 1].time)
@@ -626,6 +616,31 @@ class TestNsimTrace(VppTestCase):
                         self.assertNotIn("NSIM:", self.vapi.cli("show trace"))
                     finally:
                         self.vapi.cli(feature + " disable")
+
+    def test_due_packets_leave_together(self):
+        """Release in one poll all the packets due by then"""
+        # Fixed delay: a frame's packets share their departure time, and more
+        # of them than a tx burst must still leave in a single poll
+        count = 200
+        self.vapi.cli("set nsim delay 10 ms bandwidth 1 gbit packet-size 128")
+        feature = "nsim cross-connect enable-disable pg0 pg1"
+        self.vapi.cli(feature)
+        try:
+            self.vapi.cli("clear trace")
+            self.vapi.cli(f"trace add pg-input {count}")
+            self.pg0.add_stream(create_stream(self, self.pg0, self.pg1, count))
+            self.pg1.enable_capture()
+            self.pg_start(trace=False)
+            self.pg1.get_capture(count, timeout=1)
+
+            trace = self.vapi.cli(f"show trace max {count}")
+            released = re.findall(r"NSIM: tx at ([0-9.]+)", trace)
+            self.assertEqual(len(released), count)
+            self.assertEqual(
+                len(set(released)), 1, f"released over {len(set(released))} polls"
+            )
+        finally:
+            self.vapi.cli(feature + " disable")
 
 
 @unittest.skipIf("nsim" in config.excluded_plugins, "Exclude NSIM plugin tests")

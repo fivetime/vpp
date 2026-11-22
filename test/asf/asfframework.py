@@ -26,7 +26,7 @@ from enum import Enum
 from abc import ABC, abstractmethod
 from vpp_running import use_running
 
-from config import config, max_vpp_cores
+from config import available_cpus, config, max_vpp_cores
 import hook as hookmodule
 from vpp_lo_interface import VppLoInterface
 from vpp_papi_provider import VppPapiProvider
@@ -1243,6 +1243,11 @@ def get_testcase_doc_name(test):
 
 
 def get_test_description(descriptions, test):
+    # parent's existence indicates that 'test' is a subtest
+    parent_test = getattr(test, "test_case", None)
+    if parent_test is not None:
+        parent = get_test_description(descriptions, parent_test)
+        return f"{parent} {test._subDescription()}"
     short_description = test.shortDescription()
     if descriptions and short_description:
         return short_description
@@ -1303,6 +1308,7 @@ class VppTestResult(unittest.TestResult):
         self.result_string = None
         self.runner = runner
         self.printed = []
+        self.subtest_failed_ids = set()
 
     def decodePcapFiles(self, test):
         if hasattr(test, "pg_interfaces") and len(test.pg_interfaces) > 0:
@@ -1415,7 +1421,7 @@ class VppTestResult(unittest.TestResult):
                     "formatted exception is:\n%s" % "".join(format_exception(*err))
                 )
 
-    def add_error(self, test, err, unittest_fn, result_code):
+    def add_error(self, test, err, result_code, subtest=None):
         self.result_code = result_code
         if result_code == TestResultCode.FAIL:
             self.log_result("addFailure", test, err=err)
@@ -1429,7 +1435,12 @@ class VppTestResult(unittest.TestResult):
         if "none" != config.decode_pcaps:
             self.decodePcapFiles(test)
 
-        unittest_fn(self, test, err)
+        if subtest is not None:
+            unittest.TestResult.addSubTest(self, test, subtest, err)
+        elif result_code == TestResultCode.FAIL:
+            unittest.TestResult.addFailure(self, test, err)
+        else:
+            unittest.TestResult.addError(self, test, err)
         if self.current_test_case_info:
             self.result_string = "%s [ temp dir used by test case: %s ]" % (
                 error_type_str,
@@ -1463,7 +1474,7 @@ class VppTestResult(unittest.TestResult):
         :param err: error message
 
         """
-        self.add_error(test, err, unittest.TestResult.addFailure, TestResultCode.FAIL)
+        self.add_error(test, err, TestResultCode.FAIL)
 
     def addError(self, test, err):
         """
@@ -1473,7 +1484,37 @@ class VppTestResult(unittest.TestResult):
         :param err: error message
 
         """
-        self.add_error(test, err, unittest.TestResult.addError, TestResultCode.ERROR)
+        self.add_error(test, err, TestResultCode.ERROR)
+
+    def addSubTest(self, test, subtest, err):
+        """
+        Record a subtest result
+
+        unittest reports a failing subtest only here: addFailure/addError
+        are not called, and the parent test gets no addSuccess. Report the
+        failure against the parent test, whose id the runner can filter on
+        and rerun, once per test even when several subtests fail. The
+        failure list keeps one entry per subtest, so each failing
+        subtest's parameters are printed.
+
+        :param test: parent test
+        :param subtest: the failing subtest
+        :param err: error info, None if the subtest passed
+
+        """
+        if err is None or err[0] is None:
+            return
+        if issubclass(err[0], test.failureException):
+            result_code = TestResultCode.FAIL
+        else:
+            result_code = TestResultCode.ERROR
+
+        if test.id() in self.subtest_failed_ids:
+            self.log_result("addSubTest", test, err=err)
+            unittest.TestResult.addSubTest(self, test, subtest, err)
+            return
+        self.subtest_failed_ids.add(test.id())
+        self.add_error(test, err, result_code, subtest)
 
     def getDescription(self, test):
         """
@@ -1800,11 +1841,12 @@ class Worker(Thread):
             # sharing that core would starve VPP. If the caller passed a
             # helper-CPU mask, pin to it (excludes VPP cores; lets the
             # OS load-balance the helper's threads within the mask).
-            # Otherwise unpin so the child can run on any CPU.
+            # Otherwise unpin so the child can run on any CPU this
+            # process was allowed at startup.
             if cpus:
                 os.sched_setaffinity(0, set(cpus))
             else:
-                os.sched_setaffinity(0, range(os.cpu_count()))
+                os.sched_setaffinity(0, available_cpus)
 
         # stdbuf injects libstdbuf.so via LD_PRELOAD. GNU stdbuf appends it
         # to the caller's LD_PRELOAD; uutils (Rust) stdbuf (Ubuntu 26.04)

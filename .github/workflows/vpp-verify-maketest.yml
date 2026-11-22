@@ -118,6 +118,7 @@ jobs:
       - fdio:workflow=${{ github.run_id }}
 
     environment: production
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
@@ -136,6 +137,10 @@ jobs:
             os: 'debian12'
           # Exclude aarch64 architecture for debug builds
           - build_type: 'debug'
+            executor_arch: 'aarch64'
+          # Run ubuntu2204 aarch64 release builds in the periodic workflow
+          - build_type: 'release'
+            os: 'ubuntu2204'
             executor_arch: 'aarch64'
 
     env:

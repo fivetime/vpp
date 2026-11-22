@@ -21,13 +21,16 @@ func init() {
 		HsiProxyLiteUdpIdleTimeoutTest, HsiProxyLiteUdpIpv6IdleTimeoutTest,
 		HsiProxyLiteDrainCacheOverflowTest,
 		HsiProxyLiteDrainTimeoutTest, HsiTrackerTcpHalfCloseTest,
+		HsiTrackerTcpHalfCloseTimeoutTest, HsiTrackerTcpIdleTimeoutTest,
+		HsiTrackerTcpIdleTrackArgTest, HsiTrackerTcpIdleDisabledTest,
 		HsiTrackerTcpInvalidRstTest,
 		HsiTrackerTcpFinDuplicateTest, HsiTrackerTcpFinRetransmitTest,
 		HsiTrackerTcpOptionRewriteTest,
 		HsiProxyLiteUdpDrainCacheOverflowTest,
 		HsiProxyLiteUdpDrainTimeoutTest, HsiProxyLiteDrainTransportClosedTest, HsiProxyLiteLossTest,
 		HsiProxyLiteDrainActiveSenderTest, HsiProxyLiteUdpDrainIcmpTest,
-		HsiTrackerTcpDrainedRstTest, HsiProxyLiteClientCloseWhileConnectingTest)
+		HsiTrackerTcpDrainedRstTest, HsiProxyLiteClientCloseWhileConnectingTest,
+		HsiProxyLiteDrainTransportDeletedTest)
 	RegisterHsiMWTests(HsiProxyLiteOffloadMWTest, HsiProxyLiteRepeatedOffloadMWTest,
 		HsiProxyLiteDrainOffloadMWTest,
 		HsiProxyLiteUdpConnectedMWTest, HsiProxyLiteUdpDrainOffloadMWTest,
@@ -704,6 +707,12 @@ func HsiProxyLiteDrainTransportClosedTest(s *HsiSuite) {
 	runHsiProxyLiteDrainTransportClosedTest(s)
 }
 
+// Use a 1 ms TCP cleanup to exercise deletion before HSI's drain scan. The
+// deleted transport must still result in both session cleanup notifications.
+func HsiProxyLiteDrainTransportDeletedTest(s *HsiSuite) {
+	runHsiProxyLiteDrainTransportClosedTest(s)
+}
+
 // Proxy target session, on another worker than the client session in MW
 // tests, is torn down while the pair is draining
 func HsiProxyLiteDrainTransportClosedMWTest(s *HsiSuite) {
@@ -716,6 +725,8 @@ func runHsiProxyLiteDrainTransportClosedTest(s *HsiSuite) {
 	s.SetupNginxServer()
 	vpp := s.Containers.Vpp.VppInstance
 	Log(vpp.Vppctl("hsi tcp drain-timeout 300"))
+	// Tcp resets the connection after one retransmit, not after 8, about 100s
+	Log(vpp.Vppctl("set tcp max-rto-backoffs 1"))
 	dropData := s.DropServerDataSegments()
 	defer dropData()
 	unblock := s.BlockServerReplies()
@@ -727,7 +738,7 @@ func runHsiProxyLiteDrainTransportClosedTest(s *HsiSuite) {
 
 	uri := fmt.Sprintf("http://%s:%d/upload/hsi-proxy-lite-transport-closed", s.ServerAddr(),
 		s.Ports.Server)
-	finished := startCurlHttpRequest(uri, s.NetNamespaces.Client, "201", 180,
+	finished := startCurlHttpRequest(uri, s.NetNamespaces.Client, "201", 20,
 		"-T", uploadFileName, "-H", "Expect:", "--limit-rate", "256k")
 
 	// First drained segment must be full size so it is dropped and never acked
@@ -738,7 +749,7 @@ func runHsiProxyLiteDrainTransportClosedTest(s *HsiSuite) {
 	reblock := s.BlockServerReplies()
 	defer reblock()
 
-	hsi := WaitHsiCounterAtLeastWithin(vpp, "tcp-drain-transport-closed", 1, 150*time.Second)
+	hsi := WaitHsiCounterAtLeastWithin(vpp, "tcp-drain-transport-closed", 1, 20*time.Second)
 	Log(hsi)
 	AssertEqual(0, HsiCounterValue(hsi, "tcp-drain-stalled"))
 	AssertNotNil(<-finished)
@@ -851,6 +862,117 @@ func HsiTrackerTcpHalfCloseTest(s *HsiSuite) {
 	hsi := WaitHsiContains(vpp, "tcp-fin-cleanup 1")
 	Log(hsi)
 	AssertProxyLiteSessionsCleaned(s)
+}
+
+// Pairs that stay half-closed, because the server never closes, are cleaned
+// up, and the app notified, once the half-close timeout passes.
+func HsiTrackerTcpHalfCloseTimeoutTest(s *HsiSuite) {
+	reply := "hsi-half-open-reply"
+	closeServer := StartHsiTcpHalfOpenServer(s.ServerAddr(), s.Ports.Server, reply)
+	defer closeServer()
+
+	vpp := s.Containers.Vpp.VppInstance
+	// Half-closed pairs are checked every fin-wait timeout
+	Log(vpp.Vppctl("hsi tcp fin-wait-timeout 0.25 tcp half-close-timeout 0.5"))
+	s.StartProxyLiteTcp4("hsi-offload")
+
+	readyPath, signalPath := HsiTempSignalPaths()
+	defer os.Remove(readyPath)
+	defer os.Remove(signalPath)
+	release := make(chan struct{})
+	defer close(release)
+
+	finished := StartHsiTcpHalfOpenClient(s.ServerAddr(), s.Ports.Server, s.NetNamespaces.Client,
+		readyPath, signalPath, reply, release)
+	WaitForFile(readyPath, 5*time.Second)
+	WaitProxyLiteTracked(vpp, func() {})
+	AssertNil(os.WriteFile(signalPath, []byte("go"), 0644))
+
+	result := <-finished
+	Log(result.Output)
+	AssertNil(result.Err, result.Output)
+
+	hsi := WaitHsiCounterAtLeast(vpp, "tcp-half-close-cleanup", 1)
+	Log(hsi)
+	AssertEqual(0, HsiCounterValue(hsi, "tcp-rst-cleanup"))
+	AssertProxyLiteSessionsCleaned(s)
+	AssertProxyLiteHsiCleanups(vpp, 2)
+}
+
+// Tracks a proxy-lite tcp pair, with hsi's default tcp idle timeout set to
+// hsiTimeout, that exchanges data once more after it's tracked and then stays
+// open and idle until release. Options are passed to proxy-lite. Returns when
+// the pair's last packet was forwarded, at the latest.
+func startHsiTrackerTcpIdle(s *HsiSuite, hsiTimeout string, release <-chan struct{},
+	options ...string) time.Time {
+	vpp := s.Containers.Vpp.VppInstance
+	Log(vpp.Vppctl("hsi tcp idle-timeout " + hsiTimeout))
+	s.StartProxyLiteTcp4(append([]string{"hsi-offload"}, options...)...)
+	want := "tcp idle-timeout " + hsiTimeout
+	if hsiTimeout == "~0" {
+		want = "tcp idle-timeout never"
+	}
+	AssertContains(vpp.Vppctl("show hsi"), want)
+
+	readyPath, signalPath := HsiTempSignalPaths()
+	defer os.Remove(readyPath)
+	defer os.Remove(signalPath)
+	finished := StartHsiTcpIdleClient(s.ServerAddr(), s.Ports.Server, s.NetNamespaces.Client,
+		readyPath, signalPath, release)
+	WaitForFile(readyPath, 5*time.Second)
+	WaitProxyLiteTracked(vpp, func() {})
+	AssertNil(os.WriteFile(signalPath, []byte("go"), 0644))
+	AssertNil((<-finished).Err)
+	return time.Now()
+}
+
+// Checks that the idle pair, with an idle timeout of 1 second, is cleaned up,
+// and the app notified, although neither side closes. Cleanup is a timeout
+// after the last packet and at most 2 wheel ticks later, see HSI_WHEEL_TICK.
+func runHsiTrackerTcpIdleCleanupTest(s *HsiSuite, hsiTimeout string, options ...string) {
+	closeServer := StartHsiTcpHalfOpenServer(s.ServerAddr(), s.Ports.Server, "")
+	defer closeServer()
+	release := make(chan struct{})
+	defer close(release)
+	last := startHsiTrackerTcpIdle(s, hsiTimeout, release, options...)
+
+	vpp := s.Containers.Vpp.VppInstance
+	time.Sleep(time.Until(last.Add(500 * time.Millisecond)))
+	AssertEqual(0, HsiCounterValue(vpp.Vppctl("show hsi"), "tcp-idle-cleanup"))
+	hsi := WaitHsiCounterAtLeastWithin(vpp, "tcp-idle-cleanup", 1,
+		time.Until(last.Add(4*time.Second)))
+	Log(hsi)
+	AssertEqual(0, HsiCounterValue(hsi, "tcp-fin-cleanup"))
+	AssertEqual(0, HsiCounterValue(hsi, "tcp-rst-cleanup"))
+	AssertProxyLiteSessionsCleaned(s)
+	AssertProxyLiteHsiCleanups(vpp, 2)
+}
+
+// Pairs tracked without their own idle timeout use hsi's default.
+func HsiTrackerTcpIdleTimeoutTest(s *HsiSuite) {
+	runHsiTrackerTcpIdleCleanupTest(s, "1")
+}
+
+// A pair's own idle timeout applies although hsi's default keeps idle pairs.
+func HsiTrackerTcpIdleTrackArgTest(s *HsiSuite) {
+	runHsiTrackerTcpIdleCleanupTest(s, "~0", "hsi-idle-timeout 1")
+}
+
+// Pairs tracked with an idle timeout of ~0 are kept, although hsi's default
+// would clean them up.
+func HsiTrackerTcpIdleDisabledTest(s *HsiSuite) {
+	closeServer := StartHsiTcpHalfOpenServer(s.ServerAddr(), s.Ports.Server, "")
+	defer closeServer()
+	release := make(chan struct{})
+	defer close(release)
+	last := startHsiTrackerTcpIdle(s, "1", release, "hsi-idle-timeout ~0")
+
+	// Past when the default would clean it up
+	time.Sleep(time.Until(last.Add(3500 * time.Millisecond)))
+	hsi := s.Containers.Vpp.VppInstance.Vppctl("show hsi")
+	Log(hsi)
+	AssertEqual(0, HsiCounterValue(hsi, "tcp-idle-cleanup"))
+	AssertContains(hsi, "tcp-tracked session")
 }
 
 func HsiTrackerTcpInvalidRstTest(s *HsiSuite) {

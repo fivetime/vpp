@@ -70,6 +70,9 @@ set_source_files_properties( cJSON.c PROPERTIES
 set(VPPINFRA_SRCS
   bitmap.c
   bihash_all_vector.c
+  cli.c
+  cli_output.c
+  cli_types.c
   cpu.c
   devicetree.c
   dlmalloc.c
@@ -83,6 +86,7 @@ set(VPPINFRA_SRCS
   hash.c
   heap.c
   interrupt.c
+  json.c
   longjmp.S
   macros.c
   maplog.c
@@ -153,6 +157,7 @@ set(VPPINFRA_HEADERS
   cJSON.h
   clib_error.h
   clib.h
+  cli.h
   cpu.h
   crc32.h
   crypto/sha2.h
@@ -179,6 +184,7 @@ set(VPPINFRA_HEADERS
   hash.h
   heap.h
   interrupt.h
+  json.h
   lb_hash_hash.h
   llist.h
   lock.h
@@ -288,6 +294,8 @@ if(VPP_BUILD_VPPINFRA_TESTS)
     hash
     heap
     interrupt
+    cli
+    json
     longjmp
     macros
     maplog
@@ -320,6 +328,11 @@ if(VPP_BUILD_VPPINFRA_TESTS)
       LINK_LIBRARIES vppinfra Threads::Threads
       )
   endforeach()
+
+  add_vpp_test(cli_hello
+    SOURCES ../examples/cli-hello/cli_hello.c
+    LINK_LIBRARIES vppinfra
+    )
 endif(VPP_BUILD_VPPINFRA_TESTS)
 
 set(test_files

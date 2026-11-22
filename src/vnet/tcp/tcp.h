@@ -37,20 +37,21 @@ typedef struct _tcp_lookup_dispatch
   u8 next, error;
 } tcp_lookup_dispatch_t;
 
-#define foreach_tcp_wrk_stat                                                  \
-  _ (timer_expirations, u64, "timer expirations")                             \
-  _ (rxt_segs, u64, "segments retransmitted")                                 \
-  _ (tr_events, u32, "timer retransmit events")                               \
-  _ (to_establish, u32, "timeout establish")                                  \
-  _ (to_persist, u32, "timeout persist")                                      \
-  _ (to_closewait, u32, "timeout close-wait")                                 \
-  _ (to_closewait2, u32, "timeout close-wait w/data")                         \
-  _ (to_finwait1, u32, "timeout fin-wait-1")                                  \
-  _ (to_finwait2, u32, "timeout fin-wait-2")                                  \
-  _ (to_lastack, u32, "timeout last-ack")                                     \
-  _ (to_closing, u32, "timeout closing")                                      \
-  _ (tr_abort, u32, "timer retransmit abort")                                 \
-  _ (rst_unread, u32, "reset on close due to unread data")                    \
+#define foreach_tcp_wrk_stat                                                                       \
+  _ (timer_expirations, u64, "timer expirations")                                                  \
+  _ (rxt_segs, u64, "segments retransmitted")                                                      \
+  _ (tr_events, u32, "timer retransmit events")                                                    \
+  _ (lost_rxt_events, u32, "lost retransmit events")                                               \
+  _ (to_establish, u32, "timeout establish")                                                       \
+  _ (to_persist, u32, "timeout persist")                                                           \
+  _ (to_closewait, u32, "timeout close-wait")                                                      \
+  _ (to_closewait2, u32, "timeout close-wait w/data")                                              \
+  _ (to_finwait1, u32, "timeout fin-wait-1")                                                       \
+  _ (to_finwait2, u32, "timeout fin-wait-2")                                                       \
+  _ (to_lastack, u32, "timeout last-ack")                                                          \
+  _ (to_closing, u32, "timeout closing")                                                           \
+  _ (tr_abort, u32, "timer retransmit abort")                                                      \
+  _ (rst_unread, u32, "reset on close due to unread data")                                         \
   _ (no_buffer, u32, "out of buffers")
 
 typedef struct tcp_wrk_stats_
@@ -121,8 +122,17 @@ typedef struct tcp_worker_ctx_
   /** worker timer wheel */
   tcp_timer_wheel_t timer_wheel;
 
-  /** Sack blocks of an ack that reports a dsack */
+  /** Sack blocks of the options being built */
   sack_block_t ack_sacks[TCP_OPTS_MAX_SACK_BLOCKS];
+
+  /** Blocks in ack_sacks while an ack of stored blocks is built, see tcp_postpone_ack, else 0 */
+  u8 n_postponed_sacks;
+
+  /** First free postponed ack */
+  u16 postponed_acks_free;
+
+  /** Postponed acks of the worker's connections, see tcp_postpone_ack */
+  tcp_postponed_ack_t *postponed_acks;
 
   CLIB_CACHE_LINE_ALIGN_MARK (cacheline2);
 
@@ -175,8 +185,8 @@ typedef struct tcp_configuration_
   /** Default congestion control algorithm type */
   tcp_cc_algorithm_type_e cc_algo;
 
-  /** Min rwnd, as number of snd_mss segments, for update ack to be sent after
-   * a zero rwnd advertisement */
+  /** Min rwnd, as number of snd_mss segments, for update ack to be sent after a rwnd smaller
+   * than an mss was advertised */
   u32 rwnd_min_update_ack;
 
   /** Timer ticks to wait for close from app */
@@ -209,8 +219,17 @@ typedef struct tcp_configuration_
   /** Time to wait (tcp ticks) for syn-sent connection to establish */
   u32 syn_sent_time;
 
+  /** Retransmit timeouts backed off before resetting the connection */
+  u32 max_rto_backoffs;
+
   /** Number of preallocated connections */
   u32 preallocated_connections;
+
+  /** Acks a connection can postpone until scheduled, see tcp_postpone_ack */
+  u32 max_postponed_acks;
+
+  /** Postponed acks per worker, shared by its connections */
+  u32 postponed_acks_per_wrk;
 
   /** Maxium allowed GSO packet size */
   u32 max_gso_size;
@@ -324,7 +343,19 @@ void tcp_send_syn (tcp_connection_t * tc);
 __clib_export void tcp_send_synack (tcp_connection_t *tc);
 void tcp_send_fin (tcp_connection_t * tc);
 __clib_export void tcp_send_ack (tcp_connection_t *tc);
-void tcp_send_window_update_ack (tcp_connection_t * tc);
+/** Keep the blocks an ack would report now for the connection's dupacks, or send them now */
+void tcp_postpone_ack (tcp_connection_t *tc, u8 is_dsack);
+/** Ack the blocks, and the pending dsack, as they are now. If signals_loss, it is one of the first
+ * acks for a hole and never folded into another */
+void tcp_ack_sacks (tcp_connection_t *tc, u8 signals_loss);
+/** Report [start, end), received again (RFC 2883), if reporting is enabled */
+__clib_export void tcp_dsack_report (tcp_connection_t *tc, u32 start, u32 end);
+/** Same, for out-of-order data in blk, which follows the dsack even if no longer kept */
+void tcp_dsack_report_ooo (tcp_connection_t *tc, u32 start, u32 end, sack_block_t blk);
+/** blk replaces the blocks it grew from or joined in the postponed acks */
+void tcp_postponed_acks_merge (tcp_connection_t *tc, sack_block_t blk);
+__clib_export void tcp_postponed_acks_free (tcp_connection_t *tc);
+__clib_export void tcp_send_window_update_ack (tcp_connection_t *tc);
 
 __clib_export void tcp_program_ack (tcp_connection_t *tc);
 void tcp_program_dupack (tcp_connection_t * tc);

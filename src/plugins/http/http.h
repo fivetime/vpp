@@ -7,6 +7,7 @@
 #define SRC_PLUGINS_HTTP_HTTP_H_
 
 #include <ctype.h>
+#include <vppinfra/vector.h>
 #include <vnet/plugin/plugin.h>
 #include <vnet/ip/format.h>
 #include <vnet/ip/ip46_address.h>
@@ -77,6 +78,10 @@ typedef struct
   _ (PUT, "PUT")                                                                                   \
   _ (CONNECT, "CONNECT")                                                                           \
   _ (CONNECT_UDP, "CONNECT-UDP")                                                                   \
+  _ (HEAD, "HEAD")                                                                                 \
+  _ (OPTIONS, "OPTIONS")                                                                           \
+  _ (DELETE, "DELETE")                                                                             \
+  _ (PATCH, "PATCH")                                                                               \
   _ (UNKNOWN, "UNKNOWN") /* for internal use */
 
 typedef enum http_req_method_ : u8
@@ -425,11 +430,20 @@ typedef enum http_uri_type_
   HTTP_URI_TYPE_ABSOLUTE,
 } http_uri_type_t;
 
+typedef enum http_target_form_ : u8
+{
+  HTTP_TARGET_ORIGIN_FORM,
+  HTTP_TARGET_ABSOLUTE_FORM,
+  HTTP_TARGET_AUTHORITY_FORM,
+  HTTP_TARGET_ASTERISK_FORM
+} http_target_form_t;
+
 typedef struct http_msg_data_
 {
   http_msg_data_type_t type;
   u64 len;
   http_url_scheme_t scheme;
+  http_target_form_t target_form;
   u32 target_authority_offset;
   u32 target_authority_len;
   u32 target_path_offset;
@@ -621,28 +635,103 @@ typedef enum
   HTTP_URI_COMPONENT_QUERY,
 } http_uri_component_t;
 
-/* Validate encoded URI components without decoding, QUERY covers combined path and query. */
+always_inline u8
+http_uri_hex_digit_is_valid (u8 c)
+{
+  return (u8) (c - '0') <= 9 || (u8) ((c | 0x20) - 'a') <= 5;
+}
+
+always_inline u8
+http_uri_escape_digits_are_valid (const u8 *value, u32 len, u32 pos)
+{
+  return len - pos >= 3 && http_uri_hex_digit_is_valid (value[pos + 1]) &&
+	 http_uri_hex_digit_is_valid (value[pos + 2]);
+}
+
+/* For a combined path and query, optionally report the first '?' or len. */
 always_inline int
-http_validate_uri_component (u8 *value, u32 len, http_uri_component_t component, int *is_encoded)
+_http_validate_uri_component (const u8 *value, u32 len, http_uri_component_t component,
+			      int *is_encoded, u32 *query_offset)
 {
   int encoded = 0;
-  for (u32 i = 0; i < len; i++)
+  u32 i = 0, query = len;
+
+#if defined(CLIB_HAVE_VEC128_UNALIGNED_LOAD_STORE) && defined(CLIB_HAVE_VEC128_MSB_MASK) &&        \
+  defined(CLIB_VEC128_DYNAMIC_SHUFFLE_DEFINED)
+  if (len >= 16)
+    {
+      /* Each low-nibble entry has one bit per allowed high nibble.
+       * Start with the reg-name alphabet and add the component delimiters. */
+      u8x16 allowed_lo = { 0xa8, 0xfc, 0xf8, 0xf8, 0xfc, 0xf8, 0xfc, 0xfc,
+			   0xfc, 0xfc, 0xf4, 0x5c, 0x54, 0x5c, 0xd4, 0x70 };
+      const u8x16 high_bit = { 1, 2, 4, 8, 16, 32, 64, 128 };
+
+      if (component != HTTP_URI_COMPONENT_REG_NAME)
+	allowed_lo[':' & 0xf] |= 1 << (':' >> 4);
+      if (component >= HTTP_URI_COMPONENT_PATH)
+	{
+	  allowed_lo['@' & 0xf] |= 1 << ('@' >> 4);
+	  allowed_lo['/' & 0xf] |= 1 << ('/' >> 4);
+	}
+      if (component == HTTP_URI_COMPONENT_QUERY)
+	allowed_lo['?' & 0xf] |= 1 << ('?' >> 4);
+
+      for (; len - i >= 16; i += 16)
+	{
+	  u8x16 bytes = u8x16_load_unaligned ((void *) (value + i));
+	  u8x16 lo = bytes & u8x16_splat (0xf), hi = bytes >> 4;
+	  u8x16 allowed =
+	    u8x16_shuffle_dynamic (allowed_lo, lo) & u8x16_shuffle_dynamic (high_bit, hi);
+	  u32 special = u8x16_msb_mask (allowed == u8x16_splat (0));
+
+	  if (query_offset && query == len)
+	    {
+	      u32 questions = u8x16_msb_mask (bytes == u8x16_splat ('?'));
+	      if (questions)
+		query = i + count_trailing_zeros (questions);
+	    }
+	  /* Hex digits are already allowed bytes, so check only the '%' lane. */
+	  for (; special; special &= special - 1)
+	    {
+	      u32 pos = i + count_trailing_zeros (special);
+	      if (value[pos] != '%' || !http_uri_escape_digits_are_valid (value, len, pos))
+		return -1;
+	      encoded = 1;
+	    }
+	}
+    }
+#endif
+
+  for (; i < len; i++)
     {
       u8 c = value[i];
       if (http_uri_reg_name_char_is_valid (c) ||
 	  (component != HTTP_URI_COMPONENT_REG_NAME && c == ':') ||
-	  (component >= HTTP_URI_COMPONENT_PATH && (c == '@' || c == '/')) ||
-	  (component == HTTP_URI_COMPONENT_QUERY && c == '?'))
+	  (component >= HTTP_URI_COMPONENT_PATH && (c == '@' || c == '/')))
 	continue;
-      /* pct-encoded = "%" HEXDIG HEXDIG */
-      if (c != '%' || i + 2 >= len || !isxdigit (value[i + 1]) || !isxdigit (value[i + 2]))
+      if (component == HTTP_URI_COMPONENT_QUERY && c == '?')
+	{
+	  if (query_offset && query == len)
+	    query = i;
+	  continue;
+	}
+      if (c != '%' || !http_uri_escape_digits_are_valid (value, len, i))
 	return -1;
       i += 2;
       encoded = 1;
     }
   if (is_encoded)
     *is_encoded = encoded;
+  if (query_offset)
+    *query_offset = query;
   return 0;
+}
+
+/* Validate encoded URI components without decoding, QUERY covers combined path and query. */
+always_inline int
+http_validate_uri_component (u8 *value, u32 len, http_uri_component_t component, int *is_encoded)
+{
+  return _http_validate_uri_component (value, len, component, is_encoded, 0);
 }
 
 always_inline int
@@ -680,10 +769,108 @@ http_validate_query_syntax (u8 *query, int *is_encoded)
   return http_validate_target_syntax (query, vec_len (query), 1, is_encoded);
 }
 
+typedef struct
+{
+  const u8 *next;
+  const u8 *end;
+  u16 slash_mask;
+  u16 percent_mask;
+  u8 block_len;
+} http_path_iter_t;
+
+typedef struct
+{
+  const u8 *data;
+  u32 len;
+  u8 is_encoded;
+} http_path_segment_t;
+
+/** Initialize an iterator over a validated, encoded path slice. */
+always_inline http_path_iter_t
+http_path_iter_init (const u8 *path, u32 len)
+{
+  if (!len)
+    return (http_path_iter_t) {};
+  return (http_path_iter_t) { .next = path, .end = path + len };
+}
+
+/**
+ * Return 1 and a borrowed segment slice, or 0 when the path is exhausted.
+ * Literal slashes delimit segments. Empty segments, including the segment
+ * after a trailing slash, are returned. An empty path has no segments.
+ */
+always_inline u8
+http_path_iter_next (http_path_iter_t *iter, http_path_segment_t *segment)
+{
+  const u8 *p = iter->next;
+  u8 is_encoded = 0;
+
+  if (!p)
+    return 0;
+
+#if defined(CLIB_HAVE_VEC128_UNALIGNED_LOAD_STORE) && defined(CLIB_HAVE_VEC128_MSB_MASK)
+  while (iter->block_len || iter->end - p >= 16)
+    {
+      if (!iter->block_len)
+	{
+	  u8x16 bytes = u8x16_load_unaligned ((void *) p);
+	  iter->slash_mask = u8x16_msb_mask (bytes == u8x16_splat ('/'));
+	  iter->percent_mask = u8x16_msb_mask (bytes == u8x16_splat ('%'));
+	  iter->block_len = 16;
+	}
+      if (iter->slash_mask)
+	{
+	  u32 slash = count_trailing_zeros (iter->slash_mask);
+	  is_encoded |= (iter->percent_mask & pow2_mask (slash)) != 0;
+	  /* Retain the masks for unread bytes after this slash. */
+	  iter->slash_mask >>= slash + 1;
+	  iter->percent_mask >>= slash + 1;
+	  iter->block_len -= slash + 1;
+	  p += slash;
+	  break;
+	}
+      is_encoded |= iter->percent_mask != 0;
+      p += iter->block_len;
+      iter->block_len = 0;
+    }
+#endif
+
+  while (p != iter->end && *p != '/')
+    is_encoded |= *p++ == '%';
+
+  *segment =
+    (http_path_segment_t) { .data = iter->next, .len = p - iter->next, .is_encoded = is_encoded };
+  iter->next = p == iter->end ? 0 : p + 1;
+  return 1;
+}
+
 #define htoi(x) (isdigit (x) ? ((x) - '0') : (tolower (x) - 'a' + 10))
 
 /**
- * Decode percent-encoded data.
+ * Decode validated percent escapes into a buffer with room for len bytes.
+ * The buffers may overlap when dst starts at or before src.
+ * Return the number of bytes written.
+ */
+always_inline u32
+http_percent_decode_to (u8 *dst, const u8 *src, u32 len)
+{
+  u32 written = 0;
+
+  for (u32 i = 0; i < len; i++)
+    {
+      u8 c = src[i];
+      if (c == '%')
+	{
+	  c = (htoi (src[i + 1]) << 4) | htoi (src[i + 2]);
+	  i += 2;
+	}
+      dst[written++] = c;
+    }
+  return written;
+}
+
+/**
+ * Decode data with validated percent escapes.
  *
  * @param src Data to decode.
  * @param len Length of data to decode.
@@ -695,20 +882,10 @@ http_validate_query_syntax (u8 *query, int *is_encoded)
 always_inline u8 *
 http_percent_decode (u8 *src, u32 len)
 {
-  u32 i;
-  u8 *decoded_uri = 0;
-
-  for (i = 0; i < len; i++)
-    {
-      if (src[i] == '%')
-	{
-	  u8 c = (htoi (src[i + 1]) << 4) | htoi (src[i + 2]);
-	  vec_add1 (decoded_uri, c);
-	  i += 2;
-	}
-      else
-	vec_add1 (decoded_uri, src[i]);
-    }
+  if (!len)
+    return 0;
+  u8 *decoded_uri = vec_new (u8, len);
+  vec_set_len (decoded_uri, http_percent_decode_to (decoded_uri, src, len));
   return decoded_uri;
 }
 
@@ -852,31 +1029,56 @@ http_tolower_word (uword x)
  * @return @c 1 if tokens are same, @c 0 otherwise.
  */
 always_inline u8
-http_token_is_case (const char *actual, uword actual_len, const char *expected,
-		    uword expected_len)
+http_token_is_case (const char *actual, uword actual_len, const char *expected, uword expected_len)
 {
-  uword i, last_a = 0, last_e = 0;
-  uword *a, *e;
+  uword i = expected_len;
   ASSERT (actual != 0);
   if (actual_len != expected_len)
     return 0;
 
-  i = expected_len;
-  a = (uword *) actual;
-  e = (uword *) expected;
+#ifdef CLIB_HAVE_VEC128_UNALIGNED_LOAD_STORE
+  if (i >= 16)
+    {
+      const u8x16 upper_a = u8x16_splat ('A'), upper_z = u8x16_splat ('Z');
+      const u8x16 case_bit = u8x16_splat (0x20);
+      for (;;)
+	{
+	  u8x16 a = u8x16_load_unaligned ((void *) actual);
+	  u8x16 e = u8x16_load_unaligned ((void *) expected);
+	  a |= ((a >= upper_a) & (a <= upper_z)) & case_bit;
+	  e |= ((e >= upper_a) & (e <= upper_z)) & case_bit;
+	  if (!u8x16_is_equal (a, e))
+	    return 0;
+	  if (i == 16)
+	    return 1;
+
+	  /* Overlap the final loads so they stay within both tokens. */
+	  uword step = clib_min (i - 16, 16);
+	  actual += step;
+	  expected += step;
+	  i -= step;
+	}
+    }
+#endif
+
+  /* Tokens may be unaligned, so use memcpy for word loads. */
   while (i >= sizeof (uword))
     {
-      if (http_tolower_word (*a) != http_tolower_word (*e))
+      uword a, e;
+      clib_memcpy_fast (&a, actual, sizeof (a));
+      clib_memcpy_fast (&e, expected, sizeof (e));
+      if (http_tolower_word (a) != http_tolower_word (e))
 	return 0;
-      a++;
-      e++;
+      actual += sizeof (uword);
+      expected += sizeof (uword);
       i -= sizeof (uword);
     }
   if (i > 0)
     {
-      clib_memcpy_fast (&last_a, a, i);
-      clib_memcpy_fast (&last_e, e, i);
-      if (http_tolower_word (last_a) != http_tolower_word (last_e))
+      uword a = 0, e = 0;
+      clib_memcpy_fast (&a, actual, i);
+      clib_memcpy_fast (&e, expected, i);
+      if (http_tolower_word (a) != http_tolower_word (e))
 	return 0;
     }
   return 1;
@@ -969,7 +1171,7 @@ _http_ht_hash_key_sum (hash_t *h, uword key)
 {
   http_token_t *name = uword_to_pointer (key, http_token_t *);
   uword last[3] = {};
-  uwordu *q = (uword *) name->base;
+  const uwordu *q = (const uwordu *) name->base;
   u64 a, b, c, n;
 
   a = b = (uword_bits == 64) ? 0x9e3779b97f4a7c13LL : 0x9e3779b9;
@@ -1132,11 +1334,12 @@ typedef struct
   u8 *buf;	   /**< start of header data */
 } http_headers_ctx_t;
 
+/* Serialized headers follow variable-length tokens without alignment padding. */
 typedef struct
 {
   u32 len;
   u8 token[0];
-} http_custom_token_t;
+} __clib_packed http_custom_token_t;
 
 typedef struct
 {
@@ -1150,13 +1353,19 @@ typedef struct
       u8 token[0];
     };
   };
-} http_app_header_name_t;
+} __clib_packed http_app_header_name_t;
 
 typedef struct
 {
   http_app_header_name_t name;
   http_custom_token_t value;
-} http_app_header_t;
+} __clib_packed http_app_header_t;
+
+STATIC_ASSERT_SIZEOF (http_custom_token_t, 4);
+STATIC_ASSERT_SIZEOF (http_app_header_name_t, 4);
+STATIC_ASSERT_OFFSET_OF (http_app_header_name_t, len, 2);
+STATIC_ASSERT_SIZEOF (http_app_header_t, 8);
+STATIC_ASSERT_OFFSET_OF (http_app_header_t, value, 4);
 
 /**
  * Initialize headers list context.
@@ -1420,6 +1629,7 @@ _http_parse_ip6 (u8 **p, u8 *end, ip6_address_t *ip6)
       for (u32 i = n_hex_quads; i > double_colon_index; i--)
 	ip6->as_u16[n_zero + i - 1] = ip6->as_u16[i - 1];
       for (u32 i = 0; i < n_zero; i++)
+	/* coverity[overflow_sink] - double_colon_index + n_zero is at most 8 */
 	ip6->as_u16[double_colon_index + i] = 0;
 
       n_hex_quads = ARRAY_LEN (ip6->as_u16);
@@ -1457,18 +1667,9 @@ _http_parse_port (u8 **pos, u8 *end, u16 *port)
   return 0;
 }
 
-/**
- * Parse authority to components.
- *
- * @param authority     Target URL to parse.
- * @param authority_len Length of URL.
- * @param parsed        Parsed authority (port is set to 0 if not present).
- *
- * @return @c 0 on success.
- */
 always_inline int
-http_parse_authority (u8 *authority, u32 authority_len,
-		      http_uri_authority_t *parsed)
+_http_parse_authority (u8 *authority, u32 authority_len, http_uri_authority_t *parsed,
+		       u8 require_port)
 {
   u8 *token_start, *p, *end;
   int rv;
@@ -1483,7 +1684,7 @@ http_parse_authority (u8 *authority, u32 authority_len,
   };
 
   /* reg-name max 255 chars + colon + port max 5 chars */
-  if (authority_len > 261)
+  if (!authority_len || authority_len > 261)
     return -1;
 
   end = authority + authority_len;
@@ -1536,6 +1737,8 @@ http_parse_authority (u8 *authority, u32 authority_len,
 	    }
 	  p++;
 	}
+      if (p == token_start)
+	return -1;
       parsed->reg_name.len = p - token_start;
       if (parsed->reg_name.len > 255)
 	{
@@ -1548,17 +1751,39 @@ http_parse_authority (u8 *authority, u32 authority_len,
     }
 
   /* parse port, if any */
-  if ((end - token_start) > 1 && *token_start == ':')
+  if (token_start != end && *token_start++ != ':')
+    return -1;
+  if (token_start == end)
+    return require_port ? -1 : 0;
+  if (_http_parse_port (&token_start, end, &parsed->port))
     {
-      token_start++;
-      if (_http_parse_port (&token_start, end, &parsed->port))
-	{
-	  clib_warning ("invalid port");
-	  return -1;
-	}
+      clib_warning ("invalid port");
+      return -1;
     }
 
   return token_start == end ? 0 : -1;
+}
+
+/**
+ * Parse authority to components.
+ *
+ * @param authority     Authority to parse.
+ * @param authority_len Length of authority.
+ * @param parsed        Parsed authority (port is 0 if omitted or empty).
+ *
+ * @return @c 0 on success.
+ */
+always_inline int
+http_parse_authority (u8 *authority, u32 authority_len, http_uri_authority_t *parsed)
+{
+  return _http_parse_authority (authority, authority_len, parsed, 0);
+}
+
+/* CONNECT requires an explicit port number (RFC 9112 section 3.2.3). */
+always_inline int
+http_parse_connect_authority (u8 *authority, u32 authority_len, http_uri_authority_t *parsed)
+{
+  return _http_parse_authority (authority, authority_len, parsed, 1);
 }
 
 typedef struct

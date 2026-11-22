@@ -154,6 +154,10 @@ class TestTCPUnitTests(VppAsfTestCase):
             "tamper dsack-early",
             "tamper strand-head",
             "tamper full-wnd",
+            "tamper lost-rxt",
+            "tamper lost-rxt-late",
+            "tamper lost-rxt-evidence",
+            "tamper rescue",
             "tamper rto",
             "tamper rto-head",
             "tamper dupack-run",
@@ -162,8 +166,10 @@ class TestTCPUnitTests(VppAsfTestCase):
             "tamper dsack-partial",
             "tamper dupack-cwnd",
             "tamper nosack-cwnd",
+            "tamper ack-cwnd",
             "tamper rcv-wnd-retract",
             "tamper snd-small-wnd",
+            "tamper rcv-wnd-update",
         )
 
         for test_case in test_cases:

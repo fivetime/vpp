@@ -629,8 +629,7 @@ proxy_http_connect (session_t *s, vnet_connect_args_t *a)
       rv = svm_fifo_peek (s->rx_fifo, msg.data.target_authority_offset,
 			  msg.data.target_authority_len, rx_buf);
       ASSERT (rv == msg.data.target_authority_len);
-      rv = http_parse_authority (rx_buf, msg.data.target_authority_len,
-				 &target_uri);
+      rv = http_parse_connect_authority (rx_buf, msg.data.target_authority_len, &target_uri);
       if (rv)
 	{
 	  PROXY_DBG ("authority parsing failed");
@@ -653,11 +652,6 @@ proxy_http_connect (session_t *s, vnet_connect_args_t *a)
       rv = svm_fifo_peek (s->rx_fifo, msg.data.target_path_offset,
 			  msg.data.target_path_len, rx_buf);
       ASSERT (rv == msg.data.target_path_len);
-      if (http_validate_target_syntax (rx_buf, msg.data.target_path_len, 0, 0))
-	{
-	  PROXY_DBG ("invalid target");
-	  goto bad_req;
-	}
       if (memcmp (rx_buf, masque_udp_uri_prefix, MASQUE_UDP_URI_PREFIX_LEN))
 	{
 	  PROXY_DBG ("uri prefix not match");

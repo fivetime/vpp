@@ -161,10 +161,10 @@ tcp_rcv_wnd_commit (tcp_connection_t *tc, u32 wnd)
   if (PREDICT_FALSE (round_down_pow2 (wnd, 1 << tc->rcv_wscale) < tc->rcv_opts.mss))
     {
       transport_rx_fifo_req_deq_ntf (&tc->connection);
-      tcp_zero_rwnd_sent_on (tc);
+      tcp_small_rwnd_sent_on (tc);
     }
   else
-    tcp_zero_rwnd_sent_off (tc);
+    tcp_small_rwnd_sent_off (tc);
 }
 
 /**
@@ -260,27 +260,35 @@ tcp_make_established_options (tcp_connection_t *tc, tcp_options_t *opts, u8 is_a
     }
   if (tcp_opts_sack_permitted (&tc->rcv_opts))
     {
-      /* Every report programs a dupack. Burst options are reused by all
-       * segments, so only acks carry dsacks */
-      if (PREDICT_FALSE (is_ack && tc->pending_dupacks && tcp_dsack_is_pending (tc)))
+      tcp_worker_ctx_t *wrk = tcp_get_worker (tc->c_thread_index);
+
+      /* An ack of stored blocks reports those, see tcp_postpone_ack */
+      if (PREDICT_FALSE (wrk->n_postponed_sacks))
 	{
-	  sack_block_t *blks = tcp_get_worker (tc->c_thread_index)->ack_sacks;
 	  opts->flags |= TCP_OPTS_FLAG_SACK;
-	  opts->sacks = blks;
-	  opts->n_sack_blocks = tcp_dsack_make_sacks (tc, blks);
+	  opts->sacks = wrk->ack_sacks;
+	  opts->n_sack_blocks = wrk->n_postponed_sacks;
 	  len += 2 + TCP_OPTION_LEN_SACK_BLOCK * opts->n_sack_blocks;
 	}
-      else if (vec_len (tc->snd_sacks))
+      /* Every report programs a dupack. Burst options are reused by all
+       * segments, so only acks carry dsacks */
+      else if (PREDICT_FALSE (is_ack && tc->pending_dupacks && tcp_dsack_is_pending (tc)))
 	{
 	  opts->flags |= TCP_OPTS_FLAG_SACK;
-	  if (tc->snd_sack_pos >= vec_len (tc->snd_sacks))
-	    tc->snd_sack_pos = 0;
-	  opts->sacks = &tc->snd_sacks[tc->snd_sack_pos];
-	  opts->n_sack_blocks = vec_len (tc->snd_sacks) - tc->snd_sack_pos;
-	  opts->n_sack_blocks = clib_min (opts->n_sack_blocks,
-					  TCP_OPTS_MAX_SACK_BLOCKS);
-	  tc->snd_sack_pos += opts->n_sack_blocks;
+	  opts->sacks = wrk->ack_sacks;
+	  opts->n_sack_blocks = tcp_dsack_make_sacks (tc, wrk->ack_sacks);
 	  len += 2 + TCP_OPTION_LEN_SACK_BLOCK * opts->n_sack_blocks;
+	}
+      else if (tcp_sack_has_blocks (tc))
+	{
+	  /* Options are written before the blocks change, so no copy */
+	  opts->flags |= TCP_OPTS_FLAG_SACK;
+	  opts->sacks = tcp_snd_kept_sacks (tc);
+	  opts->n_sack_blocks = tc->n_snd_sacks;
+	  len += 2 + TCP_OPTION_LEN_SACK_BLOCK * opts->n_sack_blocks;
+	  /* Acks, unlike burst options, are always sent, so the peer sees all kept blocks */
+	  if (is_ack)
+	    tc->snd_sack_changes = 0;
 	}
     }
 
@@ -812,7 +820,7 @@ tcp_send_fin (tcp_connection_t * tc)
     }
 
   /* If we have non-dupacks programmed, no need to send them */
-  if ((tc->flags & TCP_CONN_SNDACK) && !tc->pending_dupacks)
+  if ((tc->flags & TCP_CONN_SNDACK) && !tc->pending_dupacks && !tc->n_postponed_acks)
     tc->flags &= ~TCP_CONN_SNDACK;
 
   b = vlib_get_buffer (vm, bi);
@@ -893,7 +901,6 @@ tcp_push_hdr_i (tcp_connection_t *tc, vlib_buffer_t *b, u32 snd_nxt,
 
   if (push_hdr_flags & TCP_PUSH_HDR_F_UPDATE_SND_NXT)
     tc->snd_nxt += data_len;
-  tc->rcv_las = tc->rcv_nxt;
 
   tc->bytes_out += data_len;
   tc->data_segs_out += 1;
@@ -1010,6 +1017,259 @@ tcp_send_ack (tcp_connection_t *tc)
   tcp_enqueue_to_output (wrk, b, bi, tc->c_is_ip4);
 }
 
+/**
+ * Send the postponed acks, oldest first, until max_acks. Blocks rcv_nxt passed were delivered,
+ * so the acks leave them out, but not dsacks, which a first block below the ack signals. Blocks
+ * that merged since, see tcp_postponed_acks_merge, are reported once. An ack that finds no
+ * buffer is lost, like one lost on the wire
+ *
+ * @return number of acks sent
+ */
+static u32
+tcp_send_postponed_acks (tcp_connection_t *tc, u32 max_acks)
+{
+  tcp_worker_ctx_t *wrk = tcp_get_worker (tc->c_thread_index);
+  tcp_postponed_ack_t *tail, *pa;
+  u32 i, k, n, n_acks = 0;
+  sack_block_t blk;
+  u16 pai;
+
+  tail = &wrk->postponed_acks[tc->postponed_acks_tail];
+  while (tc->n_postponed_acks && n_acks < max_acks)
+    {
+      pai = tail->next;
+      pa = &wrk->postponed_acks[pai];
+
+      i = n = pa->is_dsack;
+      if (n)
+	wrk->ack_sacks[0] = pa->blks[0];
+      for (; i < pa->n_blks; i++)
+	{
+	  blk = pa->blks[i];
+	  if (!seq_gt (blk.start, tc->rcv_nxt))
+	    continue;
+
+	  for (k = pa->is_dsack; k < n; k++)
+	    if (wrk->ack_sacks[k].start == blk.start)
+	      break;
+	  if (k == n)
+	    wrk->ack_sacks[n++] = blk;
+	}
+
+      if (n)
+	{
+	  wrk->n_postponed_sacks = n;
+	  tcp_send_ack (tc);
+	  wrk->n_postponed_sacks = 0;
+	  n_acks += 1;
+	}
+
+      /* Move the first to the free list */
+      tail->next = pa->next;
+      pa->next = wrk->postponed_acks_free;
+      wrk->postponed_acks_free = pai;
+      tc->n_postponed_acks -= 1;
+    }
+
+  return n_acks;
+}
+
+/**
+ * Keep the blocks an ack would report now, and the pending dsack if is_dsack. The connection's
+ * dupacks send it first when the session layer schedules them, in order. Without room in the
+ * connection or the worker, the connection's oldest postponed ack leaves now to make some, or,
+ * if it has none, so does this one. So acks keep their order and none is lost
+ */
+void
+tcp_postpone_ack (tcp_connection_t *tc, u8 is_dsack)
+{
+  tcp_worker_ctx_t *wrk = tcp_get_worker (tc->c_thread_index);
+  tcp_postponed_ack_t *pa, *tail;
+  u16 pai = wrk->postponed_acks_free;
+  u8 no_room, n_blks;
+  sack_block_t *blks;
+
+  no_room = tc->n_postponed_acks >= tcp_cfg.max_postponed_acks || pai == TCP_INVALID_POSTPONED_ACK;
+  if (PREDICT_FALSE (no_room && tc->n_postponed_acks))
+    {
+      tc->dupacks_out += tcp_send_postponed_acks (tc, 1);
+      pai = wrk->postponed_acks_free;
+      ASSERT (pai != TCP_INVALID_POSTPONED_ACK);
+      no_room = 0;
+    }
+
+  /* Without room the ack leaves now with the blocks it would keep */
+  blks = PREDICT_FALSE (no_room) ? wrk->ack_sacks : wrk->postponed_acks[pai].blks;
+  n_blks = is_dsack ? tcp_dsack_make_sacks (tc, blks) : tcp_make_sacks (tc, blks);
+  if (!is_dsack)
+    tc->snd_sack_changes = 0;
+
+  if (PREDICT_FALSE (no_room))
+    {
+      wrk->n_postponed_sacks = n_blks;
+      tcp_send_ack (tc);
+      wrk->n_postponed_sacks = 0;
+      tc->dupacks_out += 1;
+      return;
+    }
+
+  pa = &wrk->postponed_acks[pai];
+  wrk->postponed_acks_free = pa->next;
+
+  /* Circular list, so the tail links to the first */
+  if (tc->n_postponed_acks)
+    {
+      tail = &wrk->postponed_acks[tc->postponed_acks_tail];
+      pa->next = tail->next;
+      tail->next = pai;
+    }
+  else
+    pa->next = pai;
+
+  tc->postponed_acks_tail = pai;
+  tc->n_postponed_acks += 1;
+  pa->is_dsack = is_dsack;
+  pa->n_blks = n_blks;
+}
+
+/** The newest postponed ack already reports the kept blocks: each is inside one of its sack
+ * blocks, which merges may have grown past the kept ones */
+static u8
+tcp_postponed_acks_report_kept (tcp_connection_t *tc)
+{
+  tcp_worker_ctx_t *wrk = tcp_get_worker (tc->c_thread_index);
+  sack_block_t *kept = tcp_snd_kept_sacks (tc);
+  tcp_postponed_ack_t *pa;
+  u32 i, j;
+
+  if (!tc->n_postponed_acks)
+    return 0;
+
+  pa = &wrk->postponed_acks[tc->postponed_acks_tail];
+  for (j = 0; j < tc->n_snd_sacks; j++)
+    {
+      for (i = pa->is_dsack; i < pa->n_blks; i++)
+	if (tcp_sack_block_contains (pa->blks[i], kept[j]))
+	  break;
+      if (i == pa->n_blks)
+	return 0;
+    }
+  return 1;
+}
+
+/**
+ * Report the kept blocks, and the pending dsack if any, as they are now, in an ack postponed until
+ * the connection is scheduled, see tcp_postpone_ack. It replaces the pending dupack of earlier
+ * arrivals, unless something is left to report: an ack with a dsack has room for only two other
+ * blocks. No ack is added if the newest postponed one already reports the blocks, unless it
+ * signals loss, as the first acks for a hole do
+ */
+void
+tcp_ack_sacks (tcp_connection_t *tc, u8 signals_loss)
+{
+  u8 is_dsack = tcp_dsack_is_pending (tc);
+
+  if (!signals_loss && !is_dsack && tcp_postponed_acks_report_kept (tc))
+    tc->snd_sack_changes = 0;
+  else
+    tcp_postpone_ack (tc, is_dsack);
+
+  tc->pending_dupacks = tc->snd_sack_changes != 0 || tcp_dsack_is_pending (tc);
+  if (tc->pending_dupacks || tc->n_postponed_acks)
+    tcp_program_ack (tc);
+  else
+    /* No postponed ack means it was sent now, without room. It reported all, so drop any ack
+     * programmed earlier */
+    tc->flags &= ~TCP_CONN_SNDACK;
+}
+
+/* Report [start, end), received again, and blk, the block that held it if it was out of order.
+ * A duplicate that touches the pending one extends it. Others replace it once its ack is
+ * postponed or, without room, sent, see tcp_postpone_ack. Callers check that reporting is enabled
+ * and that the range is not empty */
+static void
+tcp_dsack_add (tcp_connection_t *tc, u32 start, u32 end, sack_block_t blk)
+{
+  sack_block_t *dsack = tcp_snd_dsack (tc);
+
+  /* Sized at connection init, see tcp_connection_init_vars */
+  ASSERT (tc->snd_sacks);
+
+  if (tcp_dsack_is_pending (tc))
+    {
+      if (seq_leq (start, dsack->end) && seq_leq (dsack->start, end))
+	{
+	  dsack->start = seq_min (dsack->start, start);
+	  dsack->end = seq_max (dsack->end, end);
+	  if (blk.start != blk.end)
+	    *tcp_snd_dsack_blk (tc) = blk;
+	  return;
+	}
+      tcp_postpone_ack (tc, 1 /* is_dsack */);
+    }
+
+  dsack->start = start;
+  dsack->end = end;
+  *tcp_snd_dsack_blk (tc) = blk;
+}
+
+void
+tcp_dsack_report (tcp_connection_t *tc, u32 start, u32 end)
+{
+  sack_block_t none = {};
+
+  if (tcp_dsack_report_enabled (tc) && seq_lt (start, end))
+    tcp_dsack_add (tc, start, end, none);
+}
+
+void
+tcp_dsack_report_ooo (tcp_connection_t *tc, u32 start, u32 end, sack_block_t blk)
+{
+  if (tcp_dsack_report_enabled (tc) && seq_lt (start, end))
+    tcp_dsack_add (tc, start, end, blk);
+}
+
+/** blk, the block of an out-of-order arrival, replaces the blocks it grew from or joined in
+ * the postponed acks, so they report it as received */
+void
+tcp_postponed_acks_merge (tcp_connection_t *tc, sack_block_t blk)
+{
+  tcp_worker_ctx_t *wrk = tcp_get_worker (tc->c_thread_index);
+  tcp_postponed_ack_t *pa;
+  u16 pai = wrk->postponed_acks[tc->postponed_acks_tail].next;
+  u32 i, j;
+
+  for (i = 0; i < tc->n_postponed_acks; i++, pai = pa->next)
+    {
+      pa = &wrk->postponed_acks[pai];
+      for (j = pa->is_dsack; j < pa->n_blks; j++)
+	if (tcp_sack_block_contains (blk, pa->blks[j]))
+	  pa->blks[j] = blk;
+    }
+}
+
+/** Return the connection's postponed acks to the worker's free list */
+void
+tcp_postponed_acks_free (tcp_connection_t *tc)
+{
+  tcp_worker_ctx_t *wrk;
+  tcp_postponed_ack_t *tail;
+  u16 first;
+
+  if (!tc->n_postponed_acks)
+    return;
+
+  ASSERT (tc->c_thread_index == vlib_get_thread_index ());
+  wrk = tcp_get_worker (tc->c_thread_index);
+  tail = &wrk->postponed_acks[tc->postponed_acks_tail];
+
+  /* Splice the whole list, the tail links to the first */
+  first = tail->next;
+  tail->next = wrk->postponed_acks_free;
+  wrk->postponed_acks_free = first;
+  tc->n_postponed_acks = 0;
+}
+
 void
 tcp_program_ack (tcp_connection_t * tc)
 {
@@ -1028,8 +1288,7 @@ tcp_program_dupack (tcp_connection_t * tc)
       session_add_self_custom_tx_evt (&tc->connection, 1);
       tc->flags |= TCP_CONN_SNDACK;
     }
-  if (tc->pending_dupacks < 255)
-    tc->pending_dupacks += 1;
+  tc->pending_dupacks = 1;
 }
 
 void
@@ -1045,18 +1304,17 @@ tcp_program_retransmit (tcp_connection_t * tc)
 /**
  * Send window update ack
  *
- * Ensures that it will be sent only once, after a zero rwnd has been
- * advertised in a previous ack, and only if rwnd has grown beyond a
- * configurable value.
+ * Ensures that it will be sent only once, after a rwnd smaller than an mss has been advertised in
+ * a previous ack, and only if rwnd has grown beyond a configurable value.
  */
 void
 tcp_send_window_update_ack (tcp_connection_t * tc)
 {
-  if (tcp_zero_rwnd_sent (tc))
+  if (tcp_small_rwnd_sent (tc))
     {
       if (tcp_rcv_wnd_compute (tc) >= tcp_cfg.rwnd_min_update_ack * tc->snd_mss)
 	{
-	  tcp_zero_rwnd_sent_off (tc);
+	  tcp_small_rwnd_sent_off (tc);
 	  tcp_program_ack (tc);
 	}
     }
@@ -1223,6 +1481,7 @@ tcp_prepare_retransmit_segment (tcp_worker_ctx_t * wrk,
     return 0;
 
   tc->snd_rxt_bytes += n_bytes;
+  tc->rxt_snd_nxt = tc->snd_nxt;
   tcp_track_rxt (tc, start, start + n_bytes);
 
   tc->bytes_retrans += n_bytes;
@@ -1380,7 +1639,7 @@ tcp_timer_retransmit_handler (tcp_connection_t *tc)
       /* Peer is dead or network connectivity is lost. Close connection.
        * RFC 1122 section 4.2.3.5 recommends a value of at least 100s. For
        * a min rto of 0.2s we need to retry about 8 times. */
-      if (tc->rto_boff >= TCP_RTO_BOFF_MAX)
+      if (tc->rto_boff >= tcp_cfg.max_rto_backoffs)
 	{
 	  tcp_send_reset (tc);
 	  tcp_connection_set_state (tc, TCP_STATE_CLOSED);
@@ -1399,7 +1658,7 @@ tcp_timer_retransmit_handler (tcp_connection_t *tc)
       n_bytes = tcp_prepare_retransmit_segment (wrk, tc, 0, n_bytes, &b);
       if (!n_bytes)
 	{
-	  /* Allocation failed, do not re-credit again the head to rxt_delivered */
+	  /* Allocation failed. Copies below high_rxt were retired, so rewind it */
 	  tcp_loss_rto_retransmit_failed (tc);
 	  tcp_retransmit_timer_reschedule (&wrk->timer_wheel, tc, tcp_cfg.alloc_err_timeout);
 	  return;
@@ -1564,8 +1823,8 @@ tcp_send_small_wnd_data (tcp_worker_ctx_t *wrk, tcp_connection_t *tc)
   tcp_enqueue_to_output (wrk, b, vlib_get_buffer_index (wrk->vm, b), tc->c_is_ip4);
   tcp_new_data_sent (tc);
 
-  /* The segment carries the ack, if one is programmed */
-  if ((tc->flags & TCP_CONN_SNDACK) && !tc->pending_dupacks)
+  /* The segment carries the ack, if one is programmed, but not postponed ones */
+  if ((tc->flags & TCP_CONN_SNDACK) && !tc->pending_dupacks && !tc->n_postponed_acks)
     tc->flags &= ~TCP_CONN_SNDACK;
 
   return n_bytes;
@@ -1756,13 +2015,6 @@ tcp_cc_recovery_snd_space (tcp_connection_t *tc)
   return (u32) tcp_fastrecovery_prr_snd_space (tc);
 }
 
-static inline u8
-tcp_max_tx_deq (tcp_connection_t * tc)
-{
-  return (transport_max_tx_dequeue (&tc->connection)
-	  - (tc->snd_nxt - tc->snd_una));
-}
-
 #define scoreboard_rescue_rxt_valid(_sb, _tc)			\
     (seq_geq (_sb->rescue_rxt, _tc->snd_una) 			\
 	&& seq_leq (_sb->rescue_rxt, _tc->snd_congestion))
@@ -1894,10 +2146,10 @@ tcp_retransmit_sack_inline (tcp_worker_ctx_t *wrk, tcp_connection_t *tc, u32 bur
 	  if (!can_rescue || scoreboard_rescue_rxt_valid (sb, tc))
 	    break;
 
-	  /* If rescue rxt undefined or less than snd_una then one segment of
-	   * up to SMSS octets that MUST include the highest outstanding
-	   * unSACKed sequence number SHOULD be returned, and RescueRxt set to
-	   * RecoveryPoint. HighRxt MUST NOT be updated.
+	  /* Once an ack passed RescueRxt, one segment of up to SMSS octets
+	   * that MUST include the highest outstanding unSACKed sequence number
+	   * SHOULD be returned, and RescueRxt set to RecoveryPoint. HighRxt
+	   * MUST NOT be updated.
 	   */
 	  range = tcp_rxt_last_range (tc, backend, &cursor);
 	  if (!range)
@@ -1941,6 +2193,11 @@ tcp_retransmit_sack_inline (tcp_worker_ctx_t *wrk, tcp_connection_t *tc, u32 bur
 
       sb->high_rxt += n_written;
       ASSERT (seq_leq (sb->high_rxt, tc->snd_nxt));
+
+      /* The recovery's first retransmit holds off the rescue until an ack
+       * passes its end (RFC 6675, 4.3) */
+      if (tc->snd_rxt_bytes == n_written)
+	sb->rescue_rxt = sb->high_rxt;
 
       snd_space -= n_written;
       n_segs += 1;
@@ -2078,16 +2335,40 @@ done:
   return n_segs;
 }
 
+/**
+ * Send the programmed acks: the postponed ones first, oldest first, each with its stored blocks,
+ * then the pending dupack, with the kept blocks as they are now, or a plain ack
+ */
 static int
 tcp_send_acks (tcp_connection_t * tc, u32 max_burst_size)
 {
-  int j, n_acks;
+  int n_acks, n_post = 0;
+
+  /* Postponed acks are the oldest, so they go first */
+  if (PREDICT_FALSE (tc->n_postponed_acks))
+    {
+      n_post = tcp_send_postponed_acks (tc, max_burst_size);
+      tc->dupacks_out += n_post;
+
+      /* Constrained by burst size, send the rest, and the pending dupack, later */
+      if (tc->n_postponed_acks || (n_post == max_burst_size && tc->pending_dupacks))
+	{
+	  tcp_program_ack (tc);
+	  return n_post;
+	}
+
+      max_burst_size -= n_post;
+    }
 
   if (!tc->pending_dupacks)
     {
-      /* Data, if any, carries the ack, unless the peer's window is too small to send into */
-      if (tcp_in_cong_recovery (tc) || !tcp_max_tx_deq (tc) || tc->state != TCP_STATE_ESTABLISHED ||
-	  (tc->snd_wnd < tc->snd_mss && !tcp_snd_space (tc)))
+      /* The postponed acks acked all data */
+      if (n_post)
+	return n_post;
+
+      /* Data, if any, carries the ack, unless it cannot be sent now */
+      if (tcp_in_cong_recovery (tc) || !tcp_unsent_bytes (tc) ||
+	  tc->state != TCP_STATE_ESTABLISHED || !tcp_snd_space (tc))
 	{
 	  tcp_send_ack (tc);
 	  return 1;
@@ -2095,51 +2376,35 @@ tcp_send_acks (tcp_connection_t * tc, u32 max_burst_size)
       return 0;
     }
 
-  /* If we're supposed to send dupacks but have no ooo data send only one
-   * ack, or one per duplicate to report */
-  if (!vec_len (tc->snd_sacks))
-    {
-      n_acks = clib_min (clib_max (vec_len (tc->snd_dsacks), 1), max_burst_size);
-      for (j = 0; j < n_acks; j++)
-	tcp_send_ack (tc);
-
-      tc->dupacks_out += n_acks;
-      tc->pending_dupacks = 0;
-      if (tcp_dsack_is_pending (tc))
-	tcp_program_dupack (tc);
-
-      return n_acks;
-    }
-
-  /* Start with first sack block */
-  tc->snd_sack_pos = 0;
-
-  /* Generate enough dupacks to cover all sack blocks. Do not generate
-   * more sacks than the number of packets received. But do generate at
-   * least 3, i.e., the number needed to signal congestion, if needed. */
-  n_acks = vec_len (tc->snd_sacks) / TCP_OPTS_MAX_SACK_BLOCKS;
-  n_acks = clib_min (n_acks, tc->pending_dupacks);
-  n_acks = clib_max (n_acks, clib_min (tc->pending_dupacks, 3));
-  /* Each ack reports at most one duplicate */
-  n_acks = clib_max (n_acks, vec_len (tc->snd_dsacks));
-  for (j = 0; j < clib_min (n_acks, max_burst_size); j++)
+  /* The pending dupack reports the kept blocks, and the pending dsack, as they are now, see
+   * tcp_program_sack_ack. Without either, the postponed acks, if any, acked all data */
+  n_acks = !n_post || tcp_sack_has_blocks (tc) || tcp_dsack_is_pending (tc);
+  if (n_acks)
     tcp_send_ack (tc);
+  tc->pending_dupacks = 0;
 
-  if (n_acks < max_burst_size)
+  /* An ack with a dsack holds two other blocks. Once it is out, report the changed blocks it
+   * left out, now or once scheduled again */
+  if (tc->snd_sack_changes && !tcp_dsack_is_pending (tc))
     {
-      tc->pending_dupacks = 0;
-      tc->snd_sack_pos = 0;
-      tc->dupacks_out += n_acks;
-      return n_acks;
+      if (n_acks < max_burst_size)
+	{
+	  tcp_send_ack (tc);
+	  n_acks += 1;
+	}
+      else
+	{
+	  tc->pending_dupacks = 1;
+	  tcp_program_ack (tc);
+	}
     }
-  else
-    {
-      TCP_DBG ("constrained by burst size");
-      tc->pending_dupacks = n_acks - max_burst_size;
-      tc->dupacks_out += max_burst_size;
-      tcp_program_dupack (tc);
-      return max_burst_size;
-    }
+  tc->dupacks_out += n_acks;
+
+  /* A dsack whose ack found no buffer */
+  if (tcp_dsack_is_pending (tc))
+    tcp_program_dupack (tc);
+
+  return n_acks + n_post;
 }
 
 static int
@@ -2189,7 +2454,7 @@ tcp_session_custom_tx (void *conn, transport_send_params_t * sp)
   tc->flags &= ~TCP_CONN_SNDACK;
 
   /* We have retransmitted packets and no dupack */
-  if (n_segs && !tc->pending_dupacks)
+  if (n_segs && !tc->pending_dupacks && !tc->n_postponed_acks)
     return n_segs;
 
   if (sp->max_burst_size <= n_segs)

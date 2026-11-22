@@ -31,6 +31,7 @@ list(APPEND VNET_SOURCES
   dev/cli.c
   dev/config.c
   dev/counters.c
+  dev/crypto.c
   dev/dev.c
   dev/dev_api.c
   dev/error.c
@@ -48,6 +49,7 @@ list(APPEND VNET_SOURCES
   handoff.c
   interface.c
   interface_api.c
+  interface/cli_types.c
   interface_cli.c
   interface_format.c
   interface_output.c
@@ -77,6 +79,7 @@ list(APPEND VNET_HEADERS
   dev/api.h
   dev/bus/pci.h
   dev/counters.h
+  dev/dev_crypto_funcs.h
   dev/dev_funcs.h
   dev/dev.h
   dev/errors.h
@@ -90,6 +93,7 @@ list(APPEND VNET_HEADERS
   interface/tx_queue_funcs.h
   interface.h
   interface_funcs.h
+  interface/cli_types.h
   interface_output.h
   ip/ip4_to_ip6.h
   ip/ip6_to_ip4.h
@@ -104,6 +108,7 @@ list(APPEND VNET_HEADERS
   ip/ip_format_fns.h
   ip/ip_sas.h
   ip/vtep.h
+  ethernet/cli_types.h
   ethernet/ethernet_format_fns.h
   ethernet/ethernet_types_api.h
 )
@@ -126,6 +131,7 @@ list(APPEND VNET_API_FILES
 ##############################################################################
 list(APPEND VNET_SOURCES
   ethernet/arp_packet.c
+  ethernet/cli_types.c
   ethernet/ethernet_types_api.c
   ethernet/format.c
   ethernet/init.c

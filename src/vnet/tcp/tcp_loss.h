@@ -11,7 +11,7 @@
 __clib_export void tcp_loss_on_ack (tcp_connection_t *tc, tcp_ack_ctx_t *ac);
 __clib_export u8 tcp_loss_old_ack_needs_full_feedback (tcp_connection_t *tc);
 /* Apply timeout loss recovery and return the head retransmission length. */
-u32 tcp_loss_on_rto (tcp_connection_t *tc);
+__clib_export u32 tcp_loss_on_rto (tcp_connection_t *tc);
 __clib_export void tcp_loss_enter_recovery (tcp_connection_t *tc);
 __clib_export void tcp_loss_exit_recovery (tcp_connection_t *tc, tcp_ack_ctx_t *ac);
 __clib_export void tcp_loss_dsack_undo (tcp_connection_t *tc);
@@ -20,6 +20,34 @@ void tcp_loss_recovery_state_sync (tcp_connection_t *tc);
 u8 tcp_loss_recovery_state_is_sane (tcp_connection_t *tc);
 u8 tcp_loss_retransmit_timer_expired (tcp_connection_t *tc);
 void tcp_loss_rto_retransmit_failed (tcp_connection_t *tc);
+void tcp_loss_check_lost_rxt_slow (tcp_connection_t *tc);
+
+/* Retransmits can be lost too. Data at or above snd_nxt as of the last
+ * retransmit was sent after all the copies in flight. Once the peer sacks more
+ * of it than the reordering estimate allows, as for loss of any segment, the
+ * copies still in flight are presumed lost. Retire them and retransmit the
+ * lost holes again, within the same recovery. Without new data sent after the
+ * last retransmit, e.g., with the receive window full, the rto still recovers.
+ * Most acks in recovery show nothing, so the cheap tests are inline */
+static inline void
+tcp_loss_check_lost_rxt (tcp_connection_t *tc)
+{
+  sack_scoreboard_t *sb = &tc->sack_sb;
+
+  /* Only with the scoreboard. The byte tracker, which rack uses, has its own */
+  if (!tcp_in_fastrecovery (tc) || (tc->cfg_flags & (TCP_CFG_F_BYTE_TRACKER | TCP_CFG_F_RACK)))
+    return;
+
+  /* The head was retransmitted this round and copies are still in flight */
+  if (!seq_gt (sb->high_rxt, tc->snd_una) || tc->snd_rxt_bytes == tc->rxt_delivered)
+    return;
+
+  /* The highest sack bounds the sacked bytes */
+  if (!seq_gt (sb->high_sacked, tc->rxt_snd_nxt + (sb->reorder - 1) * tc->snd_mss))
+    return;
+
+  tcp_loss_check_lost_rxt_slow (tc);
+}
 
 /* Eifel spurious-retransmit detection (RFC 3522 Sec. 3.2): an advancing ACK echoes a timestamp
  * older than the first retransmit. Conservatively require snd_una below snd_congestion and no

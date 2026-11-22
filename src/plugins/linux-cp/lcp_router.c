@@ -24,10 +24,12 @@
 #include <vnet/fib/fib_entry_src.h>
 #include <vnet/fib/fib_path_list.h>
 #include <vnet/fib/fib_table.h>
+#include <vnet/mfib/mfib_entry.h>
 #include <vnet/mfib/mfib_table.h>
 #include <vnet/ip/ip6_ll_table.h>
 #include <vnet/ip-neighbor/ip_neighbor.h>
 #include <vnet/ip/ip6_link.h>
+#include <vnet/interface_types.api_types.h>
 
 typedef struct lcp_router_table_t_
 {
@@ -409,21 +411,61 @@ lcp_router_link_add (struct rtnl_link *rl, void *ctx)
 	{
 	  u32 sub_phy_sw_if_index, sub_host_sw_if_index;
 	  const lcp_itf_pair_t *lip;
-	  int vlan;
-	  u8 *ns = 0; /* FIXME */
+	  u32 flags, sub_id;
+	  u16 outer_vlan = 0, inner_vlan = 0;
+	  u32 phy_parent_sw_if_index, host_parent_sw_if_index;
+	  u8 *ns = 0;
 
 	  lip = lcp_itf_pair_get (lipi);
+	  ns = lip->lip_namespace;
 
-	  vlan = rtnl_link_vlan_get_id (rl);
+	  vnet_sw_interface_t *sw = vnet_get_sw_interface (vnm, lip->lip_phy_sw_if_index);
+	  if (sw->type == VNET_SW_INTERFACE_TYPE_SUB)
+	    {
+	      /* The parent pair's phy is itself a vlan sub-interface, so this
+	       * is a QinQ (vlan-on-vlan) link. Derive both tags: the outer
+	       * tag from the parent sub-interface, the inner tag from the
+	       * new link.
+	       */
+	      outer_vlan = sw->sub.eth.outer_vlan_id;
+	      inner_vlan = (u16) rtnl_link_vlan_get_id (rl);
+
+	      flags = SUB_IF_API_FLAG_TWO_TAGS | SUB_IF_API_FLAG_EXACT_MATCH;
+	      if (sw->sub.eth.flags.dot1ad)
+		flags |= SUB_IF_API_FLAG_DOT1AD;
+
+	      /* Composite id keeps the QinQ sub-interface distinct from
+	       * single-tag sub-interfaces sharing the same HW parent.
+	       */
+	      sub_id = ((u32) outer_vlan * 10000) + inner_vlan;
+
+	      phy_parent_sw_if_index = sw->sup_sw_if_index;
+	      host_parent_sw_if_index =
+		vnet_get_sw_interface (vnm, lip->lip_host_sw_if_index)->sup_sw_if_index;
+
+	      LCP_ROUTER_INFO (
+		"create qinq: %s -> outer %u inner %u on %U", rtnl_link_get_name (rl), outer_vlan,
+		inner_vlan, format_vnet_sw_if_index_name, vnet_get_main (), phy_parent_sw_if_index);
+	    }
+	  else
+	    {
+	      outer_vlan = (u16) rtnl_link_vlan_get_id (rl);
+	      inner_vlan = 0;
+
+	      flags = SUB_IF_API_FLAG_ONE_TAG | SUB_IF_API_FLAG_EXACT_MATCH;
+	      sub_id = outer_vlan;
+
+	      phy_parent_sw_if_index = lip->lip_phy_sw_if_index;
+	      host_parent_sw_if_index = lip->lip_host_sw_if_index;
+	    }
 
 	  /* create the vlan interface on the parent phy */
-	  if (vnet_create_sub_interface (lip->lip_phy_sw_if_index, vlan, 18, 0,
-					 vlan, &sub_phy_sw_if_index))
+	  if (vnet_create_sub_interface (phy_parent_sw_if_index, sub_id, flags, inner_vlan,
+					 outer_vlan, &sub_phy_sw_if_index))
 	    {
-	      LCP_ROUTER_INFO ("failed create phy vlan: %s on %U",
-			       rtnl_link_get_name (rl),
+	      LCP_ROUTER_INFO ("failed create phy vlan: %s on %U", rtnl_link_get_name (rl),
 			       format_vnet_sw_if_index_name, vnet_get_main (),
-			       lip->lip_phy_sw_if_index);
+			       phy_parent_sw_if_index);
 	      return;
 	    }
 
@@ -431,13 +473,12 @@ lcp_router_link_add (struct rtnl_link *rl, void *ctx)
 	  lip = lcp_itf_pair_get (lipi);
 
 	  /* create the vlan interface on the parent host */
-	  if (vnet_create_sub_interface (lip->lip_host_sw_if_index, vlan, 18,
-					 0, vlan, &sub_host_sw_if_index))
+	  if (vnet_create_sub_interface (host_parent_sw_if_index, sub_id, flags, inner_vlan,
+					 outer_vlan, &sub_host_sw_if_index))
 	    {
-	      LCP_ROUTER_INFO ("failed create vlan: %s on %U",
-			       rtnl_link_get_name (rl),
+	      LCP_ROUTER_INFO ("failed create vlan: %s on %U", rtnl_link_get_name (rl),
 			       format_vnet_sw_if_index_name, vnet_get_main (),
-			       lip->lip_host_sw_if_index);
+			       host_parent_sw_if_index);
 	      return;
 	    }
 
@@ -998,8 +1039,55 @@ lcp_router_table_add_del_special_routes (lcp_router_table_t *nlt, u8 is_add)
     }
 }
 
+static u32
+lcp_router_table_owned_routes (lcp_router_table_t *nlt)
+{
+  u32 n_routes;
+
+  n_routes = fib_table_get_num_entries (nlt->nlt_fib_index, nlt->nlt_proto, lcp_rt_fib_src) +
+	     fib_table_get_num_entries (nlt->nlt_fib_index, nlt->nlt_proto, lcp_rt_fib_src_dynamic);
+
+  return n_routes;
+}
+
+static u32
+lcp_router_table_owned_mroutes (lcp_router_table_t *nlt)
+{
+  u32 n_routes;
+
+  if (nlt->nlt_proto == FIB_PROTOCOL_MPLS)
+    return 0;
+
+  n_routes =
+    mfib_table_get_num_entries (nlt->nlt_mfib_index, nlt->nlt_proto, MFIB_SOURCE_PLUGIN_LOW);
+
+  return n_routes;
+}
+
+static void
+lcp_router_table_free_if_unused (lcp_router_table_t *nlt)
+{
+  if (nlt->nlt_refs > 0)
+    return;
+
+  if (lcp_router_table_owned_routes (nlt) > 0 || lcp_router_table_owned_mroutes (nlt) > 0)
+    return;
+
+  LCP_ROUTER_DBG ("table %u removed", nlt->nlt_id);
+
+  lcp_router_table_add_del_special_routes (nlt, 0);
+
+  fib_table_unlock (nlt->nlt_fib_index, nlt->nlt_proto, lcp_rt_fib_src);
+  /* MPLS has no mfib: find_or_create_and_lock returned ~0 */
+  if (FIB_PROTOCOL_MPLS != nlt->nlt_proto)
+    mfib_table_unlock (nlt->nlt_mfib_index, nlt->nlt_proto, MFIB_SOURCE_PLUGIN_LOW);
+
+  hash_unset (lcp_router_table_db[nlt->nlt_proto], nlt->nlt_id);
+  pool_put (lcp_router_table_pool, nlt);
+}
+
 static lcp_router_table_t *
-lcp_router_table_add_or_lock (uint32_t id, fib_protocol_t fproto)
+lcp_router_table_find_or_create (uint32_t id, fib_protocol_t fproto)
 {
   lcp_router_table_t *nlt;
 
@@ -1024,6 +1112,16 @@ lcp_router_table_add_or_lock (uint32_t id, fib_protocol_t fproto)
       lcp_router_table_add_del_special_routes (nlt, 1);
     }
 
+  return (nlt);
+}
+
+static lcp_router_table_t *
+lcp_router_table_add_or_lock (uint32_t id, fib_protocol_t fproto)
+{
+  lcp_router_table_t *nlt;
+
+  nlt = lcp_router_table_find_or_create (id, fproto);
+
   nlt->nlt_refs++;
 
   return (nlt);
@@ -1035,16 +1133,7 @@ lcp_router_table_unlock (lcp_router_table_t *nlt)
   ASSERT (nlt->nlt_refs > 0);
   nlt->nlt_refs--;
 
-  if (0 == nlt->nlt_refs)
-    {
-      lcp_router_table_add_del_special_routes (nlt, 0);
-
-      fib_table_unlock (nlt->nlt_fib_index, nlt->nlt_proto, lcp_rt_fib_src);
-      mfib_table_unlock (nlt->nlt_mfib_index, nlt->nlt_proto, MFIB_SOURCE_PLUGIN_LOW);
-
-      hash_unset (lcp_router_table_db[nlt->nlt_proto], nlt->nlt_id);
-      pool_put (lcp_router_table_pool, nlt);
-    }
+  lcp_router_table_free_if_unused (nlt);
 }
 
 /*
@@ -1332,6 +1421,7 @@ lcp_router_route_del (struct rtnl_route *rr)
   fib_entry_flag_t entry_flags;
   uint32_t table_id;
   fib_prefix_t pfx;
+  mfib_prefix_t mpfx = {};
   lcp_router_table_t *nlt;
   uint8_t rtype, rproto;
 
@@ -1343,7 +1433,8 @@ lcp_router_route_del (struct rtnl_route *rr)
   if (!lcp_router_route_type_valid[rtype] || (table_id == 255))
     return;
 
-  if (!lcp_router_route_mk_prefix (rr, &pfx))
+  if (!lcp_router_route_mk_prefix (rr, &pfx) ||
+      (rtype == RTN_MULTICAST && !lcp_router_route_mk_mprefix (rr, &mpfx)))
     {
       LCP_ROUTER_ERROR ("route del: invalid destination: oversized netlink attribute");
       return;
@@ -1384,29 +1475,43 @@ lcp_router_route_del (struct rtnl_route *rr)
 
   if (0 != vec_len (np.paths))
     {
-      fib_source_t fib_src;
-
-      fib_src = lcp_router_proto_fib_source (rproto);
-
-      switch (pfx.fp_proto)
+      if (RTN_MULTICAST == rtype)
 	{
-	case FIB_PROTOCOL_IP6:
-	  fib_table_entry_delete (nlt->nlt_fib_index, &pfx, fib_src);
-	  break;
-	case FIB_PROTOCOL_MPLS:
-	  fib_table_entry_path_remove2 (nlt->nlt_fib_index, &pfx, fib_src,
-					np.paths);
-	  /* delete the EOS route in addition to NEOS - fallthrough */
-	  pfx.fp_eos = MPLS_EOS;
-	default:
-	  fib_table_entry_path_remove2 (nlt->nlt_fib_index, &pfx, fib_src,
-					np.paths);
-	}
+	  fib_node_index_t mfei;
 
-      lcp_router_table_unlock (nlt);
+	  mfib_table_entry_paths_remove (nlt->nlt_mfib_index, &mpfx, MFIB_SOURCE_PLUGIN_LOW,
+					 np.paths);
+
+	  mfei = mfib_table_lookup_exact_match (nlt->nlt_mfib_index, &mpfx);
+
+	  if (FIB_NODE_INDEX_INVALID != mfei &&
+	      mfib_entry_is_sourced (mfei, MFIB_SOURCE_PLUGIN_LOW) &&
+	      0 == mfib_entry_get_n_paths (mfei, MFIB_SOURCE_PLUGIN_LOW))
+	    mfib_table_entry_delete (nlt->nlt_mfib_index, &mpfx, MFIB_SOURCE_PLUGIN_LOW);
+	}
+      else
+	{
+	  fib_source_t fib_src;
+
+	  fib_src = lcp_router_proto_fib_source (rproto);
+
+	  switch (pfx.fp_proto)
+	    {
+	    case FIB_PROTOCOL_IP6:
+	      fib_table_entry_delete (nlt->nlt_fib_index, &pfx, fib_src);
+	      break;
+	    case FIB_PROTOCOL_MPLS:
+	      fib_table_entry_path_remove2 (nlt->nlt_fib_index, &pfx, fib_src, np.paths);
+	      /* delete the EOS route in addition to NEOS - fallthrough */
+	      pfx.fp_eos = MPLS_EOS;
+	    default:
+	      fib_table_entry_path_remove2 (nlt->nlt_fib_index, &pfx, fib_src, np.paths);
+	    }
+	}
     }
 
   vec_free (np.paths);
+  lcp_router_table_free_if_unused (nlt);
 }
 
 static fib_route_path_t *
@@ -1491,7 +1596,7 @@ lcp_router_route_add (struct rtnl_route *rr, int is_replace)
 
   if (0 != vec_len (np.paths))
     {
-      nlt = lcp_router_table_add_or_lock (table_id, pfx.fp_proto);
+      nlt = lcp_router_table_find_or_create (table_id, pfx.fp_proto);
 
       if (rtype == RTN_MULTICAST)
 	{
@@ -1577,6 +1682,8 @@ static void
 lcp_router_route_sync_end (void)
 {
   lcp_router_table_t *nlt;
+  u32 *stale = NULL;
+  u32 *nlti;
 
   pool_foreach (nlt, lcp_router_table_pool)
     {
@@ -1587,7 +1694,15 @@ lcp_router_route_sync_end (void)
       LCP_ROUTER_INFO ("End synchronization of %U routes in table %u",
 		       format_fib_protocol, nlt->nlt_proto,
 		       nlt->nlt_fib_index);
+
+      if (0 == nlt->nlt_refs)
+	vec_add1 (stale, nlt - lcp_router_table_pool);
     }
+
+  vec_foreach (nlti, stale)
+    lcp_router_table_free_if_unused (pool_elt_at_index (lcp_router_table_pool, *nlti));
+
+  vec_free (stale);
 }
 
 typedef struct lcp_router_table_flush_entry_t
@@ -1682,7 +1797,6 @@ lcp_router_table_flush (lcp_router_table_t *nlt, u32 *sw_if_index_to_bool,
       fib_table_entry_path_remove2 (nlt->nlt_fib_index, lrtfe->lrtfe_pfx,
 				    source, lrtfe->rpaths);
       vec_free (lrtfe->rpaths);
-      lcp_router_table_unlock (nlt);
     }
 
   vec_free (ctx.lrtf_entries);

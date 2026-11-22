@@ -230,7 +230,7 @@ format_tcp_vars (u8 * s, va_list * args)
 	}
       s = format (s, " stats: %U\n", format_tcp_stats, tc);
     }
-  if (vec_len (tc->snd_sacks))
+  if (tcp_sack_has_blocks (tc))
     s = format (s, " sacks tx: %U\n", format_tcp_sacks, tc);
   else if (tc->state < TCP_STATE_ESTABLISHED)
     s = format (s, "\n");
@@ -315,23 +315,17 @@ u8 *
 format_tcp_sacks (u8 * s, va_list * args)
 {
   tcp_connection_t *tc = va_arg (*args, tcp_connection_t *);
-  sack_block_t *sacks = tc->snd_sacks;
-  sack_block_t *block;
-  int i, len = 0;
 
-  len = vec_len (sacks);
-  for (i = 0; i < len - 1; i++)
-    {
-      block = &sacks[i];
-      s = format (s, " start %u end %u\n", block->start - tc->irs,
-		  block->end - tc->irs);
-    }
-  if (len)
-    {
-      block = &sacks[len - 1];
-      s = format (s, " start %u end %u", block->start - tc->irs,
-		  block->end - tc->irs);
-    }
+  sack_block_t *kept = tcp_snd_kept_sacks (tc);
+  u32 i;
+
+  /* As acks report them, newest first */
+  for (i = 0; i < tc->n_snd_sacks; i++)
+    s = format (s, "%s[%u, %u)", i ? " " : " newest ", kept[i].start - tc->irs,
+		kept[i].end - tc->irs);
+  if (tcp_dsack_is_pending (tc))
+    s = format (s, " dsack [%u, %u)", tcp_snd_dsack (tc)->start - tc->irs,
+		tcp_snd_dsack (tc)->end - tc->irs);
   return s;
 }
 
@@ -382,8 +376,9 @@ format_tcp_scoreboard (u8 * s, va_list * args)
   s = format (s, "sacked %u lost %u high_sacked %u is_reneging %u reorder %u\n", sb->sacked_bytes,
 	      sb->lost_bytes, sb->high_sacked - tc->iss, tcp_scoreboard_is_reneging (sb),
 	      sb->reorder);
-  s = format (s, "%Ucur_rxt_hole %u high_rxt %u rescue_rxt %u", format_white_space, indent,
-	      sb->cur_rxt_hole, sb->high_rxt - tc->iss, sb->rescue_rxt - tc->iss);
+  s = format (s, "%Ucur_rxt_hole %u high_rxt %u rxt_frontier %u rescue_rxt %u", format_white_space,
+	      indent, sb->cur_rxt_hole, sb->high_rxt - tc->iss, sb->rxt_frontier - tc->iss,
+	      sb->rescue_rxt - tc->iss);
 
   hole = scoreboard_first_hole (sb);
   if (hole)
@@ -907,6 +902,7 @@ format_tcp_cfg (u8 *s, va_list *args)
   s = format (s, "syn_rcvd time: %u sec\n",
 	      (u32) (tm_cfg.syn_rcvd_time * TCP_TICK));
   s = format (s, "syn_sent time: %u sec\n", (u32) (tm_cfg.syn_sent_time * TCP_TICK));
+  s = format (s, "max rto backoffs: %u\n", tm_cfg.max_rto_backoffs);
   s = format (s, "tcp allocation error cleanup time: %0.2f sec\n",
 	      (f32) (tm_cfg.alloc_err_timeout * TCP_TIMER_TICK));
   s = format (s, "connection cleanup time: %.2f sec\n", tm_cfg.cleanup_time);
@@ -969,7 +965,8 @@ tcp_set_fn (vlib_main_t *vm, unformat_input_t *input, vlib_cli_command_t *cmd)
   u8 initial_cwnd_set = 0;
   u8 rack_set = 0;
   u8 cc_algo_set = 0;
-  u32 mtu, min_mtu = 1280, initial_cwnd_multiplier;
+  u8 max_rto_backoffs_set = 0;
+  u32 mtu, min_mtu = 1280, initial_cwnd_multiplier, max_rto_backoffs;
 
   while (unformat_check_input (input) != UNFORMAT_END_OF_INPUT)
     {
@@ -1042,15 +1039,22 @@ tcp_set_fn (vlib_main_t *vm, unformat_input_t *input, vlib_cli_command_t *cmd)
 	{
 	  cc_algo_set = 1;
 	}
+      else if (unformat (input, "max-rto-backoffs %u", &max_rto_backoffs))
+	{
+	  if (!max_rto_backoffs)
+	    return clib_error_return (0, "max-rto-backoffs must be positive");
+	  tcp_cfg.max_rto_backoffs = max_rto_backoffs;
+	  max_rto_backoffs_set = 1;
+	}
       else
 	return clib_error_return (0, "unknown input `%U'", format_unformat_error, input);
     }
 
   if (!byte_tracker_set && !csum_offload_set && !dsack_set && !mtu_set && !initial_cwnd_set &&
-      !rack_set && !cc_algo_set)
+      !rack_set && !cc_algo_set && !max_rto_backoffs_set)
     return clib_error_return (0, "expected byte-tracker, csum-offload, "
-				 "dsack, mtu, initial-cwnd-multiplier, [no-]rack "
-				 "or cc-algo");
+				 "dsack, mtu, initial-cwnd-multiplier, [no-]rack, "
+				 "cc-algo or max-rto-backoffs");
 
   if (byte_tracker_set)
     vlib_cli_output (vm, "TCP byte tracker for new connections: %s",
@@ -1071,6 +1075,8 @@ tcp_set_fn (vlib_main_t *vm, unformat_input_t *input, vlib_cli_command_t *cmd)
   if (cc_algo_set)
     vlib_cli_output (vm, "TCP congestion control for new connections: %s",
 		     tcp_cc_algo_get (tcp_cfg.cc_algo)->name);
+  if (max_rto_backoffs_set)
+    vlib_cli_output (vm, "TCP max rto backoffs: %u", tcp_cfg.max_rto_backoffs);
   return 0;
 }
 
@@ -1079,7 +1085,7 @@ VLIB_CLI_COMMAND (tcp_set_command, static) = {
   .short_help = "set tcp [byte-tracker [enable|disable]] "
 		"[csum-offload [enable|disable]] [dsack [enable|disable]] "
 		"[mtu <mtu>] [initial-cwnd-multiplier <n>] [rack|no-rack] "
-		"[cc-algo <name>]",
+		"[cc-algo <name>] [max-rto-backoffs <n>]",
   .function = tcp_set_fn,
 };
 
@@ -1235,6 +1241,22 @@ tcp_config_fn (vlib_main_t * vm, unformat_input_t * input)
 	tcp_cfg.enable_dsack = 0;
       else if (unformat (input, "byte-tracker"))
 	tcp_cfg.enable_byte_tracker = 1;
+      else if (unformat (input, "postponed-acks-per-connection %u", &tmp))
+	{
+	  /* Counted by a u8, see tcp_connection_t */
+	  if (tmp > CLIB_U8_MAX)
+	    return clib_error_return (0, "postponed-acks-per-connection must not exceed %u",
+				      CLIB_U8_MAX);
+	  tcp_cfg.max_postponed_acks = tmp;
+	}
+      else if (unformat (input, "postponed-acks-per-worker %u", &tmp))
+	{
+	  /* Linked by u16 indices, see tcp_postponed_ack_t */
+	  if (tmp >= TCP_INVALID_POSTPONED_ACK)
+	    return clib_error_return (0, "postponed-acks-per-worker must be less than %u",
+				      TCP_INVALID_POSTPONED_ACK);
+	  tcp_cfg.postponed_acks_per_wrk = tmp;
+	}
       else if (unformat (input, "max-gso-size %u", &max_gso_size))
 	tcp_cfg.max_gso_size = clib_min (max_gso_size, TCP_MAX_GSO_SZ);
       else if (unformat (input, "cc-algo %U", unformat_tcp_cc_algo,
@@ -1263,6 +1285,12 @@ tcp_config_fn (vlib_main_t * vm, unformat_input_t * input)
       else if (unformat (input, "syn-sent-time %u", &tmp_time))
 	/* rto is capped so syn-sent timeout is estimated up to 2 * TCP_RTO_MAX */
 	tcp_cfg.syn_sent_time = clib_min ((u64) tmp_time * THZ, 2 * TCP_RTO_MAX);
+      else if (unformat (input, "max-rto-backoffs %u", &tmp))
+	{
+	  if (!tmp)
+	    return clib_error_return (0, "max-rto-backoffs must be positive");
+	  tcp_cfg.max_rto_backoffs = tmp;
+	}
       else
 	return clib_error_return (0, "unknown input `%U'",
 				  format_unformat_error, input);

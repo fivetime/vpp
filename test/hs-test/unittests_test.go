@@ -7,17 +7,25 @@ import (
 func init() {
 	RegisterNoTopoTests(HttpUnitTest, TcpUnitTest, UdpUnitTest, SvmUnitTest, SessionUnitTest, QuicUnitTest,
 		QuicQuiclyUnitTest)
+	RegisterNoTopoMWTests(HttpListenerMetadataMWTest)
 }
 
 func runUnitTest(s *NoTopoSuite, vppCmd string) {
 	vpp := s.Containers.Vpp.VppInstance
 	o := vpp.Vppctl(vppCmd)
 	Log(o)
+	AssertNotContains(o, "FAIL:")
 	AssertContains(o, "SUCCESS")
 }
 
 func HttpUnitTest(s *NoTopoSuite) {
 	runUnitTest(s, "test http all")
+}
+
+func HttpListenerMetadataMWTest(s *NoTopoSuite) {
+	s.CpusPerVppContainer = 3
+	s.SetupTest()
+	runUnitTest(s, "test http listener-metadata")
 }
 
 func QuicUnitTest(s *NoTopoSuite) {

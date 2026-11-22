@@ -15,7 +15,8 @@ Usage
 -----
 
 The plugin exposes following inline functions: ``http_validate_abs_path_syntax``, ``http_validate_query_syntax``,
-``http_percent_decode``, ``http_path_sanitize``, ``http_build_header_table``, ``http_get_header``,
+``http_path_iter_init``, ``http_path_iter_next``, ``http_percent_decode``, ``http_percent_decode_to``,
+``http_path_sanitize``, ``http_build_header_table``, ``http_get_header``,
 ``http_reset_header_table``, ``http_free_header_table``, ``http_init_headers_ctx``, ``http_add_header``,
 ``http_add_custom_header``, ``http_validate_target_syntax``, ``http_parse_authority``, ``http_serialize_authority``,
 ``http_parse_masque_host_port``, ``http_decap_udp_payload_datagram``, ``http_encap_udp_payload_datagram``,
@@ -124,8 +125,10 @@ the shared connection.
 
 The streaming TX interface accepts body bytes only; it does not expose an API for
 sending trailer fields. Applications that require a known body length must check
-``msg.data.type`` before interpreting ``body_len``. The HTTP static server rejects
-streamed requests with ``411 Length Required``. The CLI client and server support
+``msg.data.type`` before interpreting ``body_len``. The HTTP static server discards
+streamed GET content within the configured request body size limit and handles
+requests after message completion. Other streamed requests are rejected with
+``411 Length Required``. The CLI client and server support
 streaming; use ``http cli client ... stream`` or ``http client put ...`` to
 send an unknown-length request, and the CLI server's ``/echo-stream`` endpoint
 for a streamed response.
@@ -172,42 +175,25 @@ Now application can start reading HTTP data. First let's read the target path:
 
 .. code-block:: C
 
-  u8 *target_path;
-  if (msg.data.target_path_len == 0)
+  u8 *target_path = 0;
+  if (msg.data.target_path_len)
     {
-      /* your error handling */
-    }
-  vec_validate (target_path, msg.data.target_path_len - 1);
-  rv = svm_fifo_peek (ts->rx_fifo, msg.data.target_path_offset, msg.data.target_path_len, target_path);
-  ASSERT (rv == msg.data.target_path_len);
-
-Target path might be in some cases empty (e.g. CONNECT method), you can read more about target forms in RFC9112 section 3.2.
-In case of origin and absolute form HTTP plugin always sets ``target_path_offset`` after leading slash character.
-
-Example bellow validates "absolute-path" rule, as described in RFC9110 section 4.1, additionally application can get information if percent encoding is used and decode path:
-
-.. code-block:: C
-
-  int is_encoded = 0;
-  if (http_validate_abs_path_syntax (target_path, &is_encoded))
-    {
-      /* your error handling */
-    }
-  if (is_encoded)
-    {
-      u8 *decoded = http_percent_decode (target_path, vec_len (target_path));
-      vec_free (target_path);
-      target_path = decoded;
+      vec_validate (target_path, msg.data.target_path_len - 1);
+      rv = svm_fifo_peek (ts->rx_fifo, msg.data.target_path_offset,
+                          msg.data.target_path_len, target_path);
+      ASSERT (rv == msg.data.target_path_len);
     }
 
-More on topic when to decode in RFC3986 section 2.4.
+The HTTP transport validates the path and query syntax before delivering them
+in their encoded form. The path slice omits the leading slash when present and
+can be empty. Applications decide how to normalize the path, such as removing
+dot segments when serving files, and when to decode percent escapes.
 
-When application serves static files, it is highly recommended to sanitize target path by removing dot segments (you don't want to risk path traversal attack):
-
-.. code-block:: C
-
-  u8 *sanitized_path;
-  sanitized_path = http_path_remove_dot_segments (target_path);
+Use ``http_path_iter_init`` and ``http_path_iter_next`` to split the validated
+path on literal slashes. The iterator yields borrowed slices, including empty
+segments, and reports whether each contains percent escapes. Decode each
+encoded slice with ``http_percent_decode_to`` to preserve an escaped slash as
+data within its segment.
 
 Let's move to target query which is optional. Percent encoding might be used too, but we skip it for brevity:
 
@@ -220,10 +206,6 @@ Let's move to target query which is optional. Percent encoding might be used too
       rv = svm_fifo_peek (ts->rx_fifo, msg.data.target_query_offset,
 			  msg.data.target_query_len, target_query);
       ASSERT (rv == msg.data.target_query_len);
-      if (http_validate_query_syntax (target_query, 0))
-        {
-          /* your error handling */
-        }
     }
 
 And now for something completely different, headers.
@@ -722,5 +704,60 @@ port is always the listener's port, regardless of ``h3_alt_svc_port``.
 
 Applications that create separate listeners can set ``h3_alt_svc_port`` in
 ``transport_endpt_cfg_http_t`` on the HTTP/1 and HTTP/2 listener. The port is in
-host byte order. A nonzero value advertises the configured UDP port; zero
+host byte order. A nonzero value advertises the configured UDP port. Zero
 disables advertisement for listeners that do not combine TLS and QUIC.
+
+Request methods
+^^^^^^^^^^^^^^^
+
+GET, POST, PUT, HEAD, OPTIONS, DELETE, and PATCH are available to applications
+over HTTP/1, HTTP/2, and HTTP/3. CONNECT and the optional draft CONNECT-UDP
+method use the existing tunnel interfaces. Method names are case sensitive.
+The plugin can reject an unsupported method with 501. HTTP/1 returns 400 when
+its request-line parser classifies the method as malformed. Applications decide
+which recognized methods are permitted for each resource and generate their
+own responses, including 405 with an appropriate Allow header.
+
+OPTIONS requests are delivered to the application. An asterisk target is
+represented by a one-byte request path containing ``*``. Ordinary request
+paths retain the existing convention of omitting their leading slash. The
+received ``http_msg_data_t.target_form`` identifies the original target form.
+Applications must use ``HTTP_TARGET_ASTERISK_FORM`` to distinguish server-wide
+OPTIONS from a resource path such as ``/*`` or ``/%2A``. For HTTP/2 and HTTP/3,
+this field describes the ``:path`` form, or authority form for CONNECT without
+``:path``. Outgoing targets retain their existing wire-format path contract.
+The plugin does not generate OPTIONS responses or infer application capabilities.
+
+HEAD responses contain no wire body. On reception, ``body_len`` contains the
+representation length advertised by Content-Length, or zero when that header
+is absent. Applications use the request method to distinguish this metadata
+from body bytes. They must not wait for or dequeue ``body_len`` bytes for HEAD.
+Use the received header table to distinguish an absent Content-Length from an
+explicit zero. All three versions validate Content-Length with the same unsigned
+64-bit parser.
+
+HTTP/1 publishes the HEAD reply after parsing and validating the response
+headers. HTTP/2 publishes it after processing ``END_STREAM``, and HTTP/3 after
+processing QUIC stream ``FIN``. Until publication, staged headers remain
+unreadable in the application FIFO. HTTP/3 delivers a completed reply even if
+the application session cannot be reused. If opening a replacement stream fails,
+the receive notification precedes the session closure notification.
+
+To send a HEAD reply with a known representation length, set ``body_len`` to
+the length of the corresponding GET representation. The plugin generates
+Content-Length where the status permits it. Enqueue only the reply metadata and
+headers, without body bytes or a body pointer. For ``HTTP_MSG_DATA_PTR``, a
+header pointer is still required when headers are present.
+
+When the representation length of a final HEAD reply is unknown, use
+``HTTP_MSG_DATA_STREAMING`` with ``body_len`` set to zero. The plugin omits
+Content-Length. In both cases the reply ends after the headers, without transfer
+coding, DATA frames, or application EOF. Status 304 supports both known and
+unknown representation lengths. Set ``body_len`` to zero for statuses 1xx,
+204, and 205. The plugin omits Content-Length for 1xx and 204.
+
+The plugin consumes valid informational replies internally, except for HTTP/1
+protocol switching. The request stays active while waiting for a final reply,
+and any active request upload can continue. Automatic Expect/100-continue
+upload negotiation and forwarding informational responses to proxy applications
+are not provided.
